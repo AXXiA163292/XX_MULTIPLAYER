@@ -29,7 +29,11 @@ export type UserProfile = {
     name: string
 }
 
-export type RoomUser = { authentication: string; signature: string }
+export type RoomUser = {
+    authentication: string
+    signature: string
+}
+
 export type RoomStatus = 'selecting' | 'preparing' | 'playing'
 export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
 
@@ -40,4 +44,7 @@ export type JoinSession = {
     exp: number
 }
 
-export type AuthSession = { user: UserProfile; exp: number }
+export type AuthSession = {
+    user: UserProfile
+    exp: number
+}
