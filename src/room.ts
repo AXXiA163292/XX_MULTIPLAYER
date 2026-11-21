@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
-import { EMPTY_ROOM_TTL_MS, RESERVED_ROOM_TTL_MS, ROOM_TYPES, SCORING_MODES } from './config.ts'
+import { EMPTY_ROOM_TTL_MS, RESERVED_ROOM_TTL_MS, ROOM_TYPES, SCORING_MODES, SERVER_DESCRIPTION } from './config.ts'
 import { parseSettings, roomForms, serializeSettings, type RoomSettings } from './forms.ts'
 import { PP_CONFIGURED, compareResults, fmtDetail, fmtScore, totals, type RoundRecord } from './scoring.ts'
 import type { Env, GameplayResult, JoinSession, RoomStatus, RoomUser, Sil, UserStatus } from './types.ts'
@@ -30,7 +30,7 @@ const fresh = (): RoomState => ({
     configured: false,
     hostId: '',
     hostName: '',
-    settings: { type: 'groupStage', scoring: 'rankedMatch' },
+    settings: { type: 'groupStage', scoring: 'rankedMatch', group: 'A' },
     status: 'selecting',
     level: null,
     suggestions: [],
@@ -40,6 +40,8 @@ const fresh = (): RoomState => ({
     results: {},
     history: [],
 })
+
+const getRoomTitle = (settings: RoomSettings) => settings.type === 'groupStage' ? `Group ${settings.group || 'A'}` : `${SERVER_DESCRIPTION} Final`
 
 type Ev = Record<string, unknown>
 type Cmd = Record<string, any>
@@ -58,6 +60,7 @@ export class Room extends DurableObject<Env> {
         super(ctx, env)
         ctx.blockConcurrencyWhile(async () => {
             this.st = (await ctx.storage.get<RoomState>('st')) ?? fresh()
+this.st.settings.group ||= 'A'
         })
     }
 
@@ -91,7 +94,7 @@ export class Room extends DurableObject<Env> {
         if (!this.st.configured) return null
         return {
             name: this.st.name,
-            title: ROOM_TYPES[this.st.settings.type],
+            title: getRoomTitle(this.st.settings),
             subtitle: SCORING_MODES[this.st.settings.scoring],
             master: this.st.hostName,
         }
@@ -193,10 +196,10 @@ export class Room extends DurableObject<Env> {
                 const next = typeof cmd.optionValues === 'string' ? parseSettings(cmd.optionValues) : null
                 if (!isHost || !next) return this.resync(uid)
                 const modeChanged = next.scoring !== s.settings.scoring
-                const typeChanged = next.type !== s.settings.type
-                s.settings = next
-                this.sendAll({ type: 'updateOptionValues', optionValues: serializeSettings(next) })
-                if (typeChanged) this.sendAll({ type: 'updateTitle', title: ROOM_TYPES[next.type] })
+const titleChanged = next.type !== s.settings.type || next.group !== s.settings.group
+s.settings = next
+this.sendAll({ type: 'updateOptionValues', optionValues: serializeSettings(next) })
+if (titleChanged) this.sendAll({ type: 'updateTitle', title: getRoomTitle(next) })
                 if (modeChanged) {
                     this.sendHost({ type: 'updateScoreboardDescription', scoreboardDescription: this.description() })
                     this.pushScoreboard()
@@ -377,7 +380,7 @@ export class Room extends DurableObject<Env> {
             type: 'update',
             allowOtherServers: true,
             reportUserOptions: [],
-            title: ROOM_TYPES[s.settings.type],
+            title: getRoomTitle(s.settings),
             status: s.status,
             master,
             lead: master,
