@@ -1,4 +1,5 @@
-import { SERVER_DESCRIPTION, SERVER_TITLE } from './config.ts'
+
+import { SERVER_DESCRIPTION, SERVER_TITLE, TOURNAMENT_HOST_HANDLE } from './config.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
 import type { AuthSession, Env, JoinSession, UserProfile } from './types.ts'
@@ -326,7 +327,7 @@ export default {
             if (values.get('type') !== 'deletePost')
                 return message(400, 'Unknown post action.')
 
-            await env.POSTS_BUCKET.delete(\`posts/\${postName}/thumbnail\`)
+            await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
             await lobby(env).removePost(postName)
 
             return json({
@@ -414,7 +415,7 @@ export default {
                 return message(400, 'Image hash does not match.')
 
             await env.POSTS_BUCKET.put(
-                \`posts/\${post.item.name}/thumbnail\`,
+                `posts/${post.item.name}/thumbnail`,
                 bytes,
                 {
                     httpMetadata: {
@@ -426,7 +427,7 @@ export default {
             await lobby(env).setPostThumbnail(
                 post.item.name,
                 hash,
-                \`/sonolus/posts/\${post.item.name}/thumbnail\`,
+                `/sonolus/posts/${post.item.name}/thumbnail`,
             )
 
             return json({})
@@ -438,7 +439,7 @@ export default {
 
         if (thumbnailPath && req.method === 'GET') {
             const object = await env.POSTS_BUCKET.get(
-                \`posts/\${thumbnailPath[1]}/thumbnail\`,
+                `posts/${thumbnailPath[1]}/thumbnail`,
             )
 
             if (!object) return new Response(null, { status: 404 })
@@ -472,7 +473,7 @@ export default {
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
             const s = await sessionOf(req, env)
-            const isHost = s?.user.handle === env.HOST_HANDLE
+            const isHost = s?.user.handle === TOURNAMENT_HOST_HANDLE
 
             return json({
                 creates: s ? roomForms(isHost) : [],
@@ -554,10 +555,10 @@ export default {
                     return new Response(null, { status: 400 })
 
                 if (
-                    (user.handle !== env.HOST_HANDLE && settings.type !== 'casualRoom') ||
+                    (user.handle !== TOURNAMENT_HOST_HANDLE && settings.type !== 'casualRoom') ||
                     !(await stub.configure(key, settings, user))
                 ) {
-                    return message(403, 'You can only create Casual Rooms.')
+                    return message(403, 'You can only create Custom Rooms.')
                 }
             } else if (!(await stub.isOpen())) {
                 return new Response(null, { status: 404 })
@@ -574,7 +575,7 @@ export default {
             } satisfies JoinSession)
 
             const wsUrl =
-                addressOf(req, env).replace(/^http/, 'ws') + \`/ws/\${name}\`
+                addressOf(req, env).replace(/^http/, 'ws') + `/ws/${name}`
 
             return json({
                 url: wsUrl,
