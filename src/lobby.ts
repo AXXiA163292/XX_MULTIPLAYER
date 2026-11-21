@@ -2,6 +2,8 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from './types.ts'
 
+export type PostCategory = 'announcements' | 'news'
+
 export type LobbyRoom = {
     name: string
     title: string
@@ -10,6 +12,7 @@ export type LobbyRoom = {
 }
 
 export type LobbyPost = {
+    category?: PostCategory
     item: {
         name: string
         version: 1
@@ -51,14 +54,17 @@ export class Lobby extends DurableObject<Env> {
         )
     }
 
-    async listPosts(): Promise<LobbyPost[]> {
+    async listPosts(category?: PostCategory): Promise<LobbyPost[]> {
         const map = await this.ctx.storage.list<LobbyPost>({
             prefix: 'post:',
         })
 
-        return [...map.values()].sort(
-            (a, b) => b.item.time - a.item.time,
-        )
+        return [...map.values()]
+            .filter((post) => {
+                const postCategory = post.category ?? 'news'
+                return !category || postCategory === category
+            })
+            .sort((a, b) => b.item.time - a.item.time)
     }
 
     async findPostByUploadKey(key: string): Promise<LobbyPost | null> {
