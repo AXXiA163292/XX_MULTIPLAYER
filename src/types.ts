@@ -9,7 +9,10 @@ export interface Env {
     DEV_SKIP_SIGNATURE?: string
 }
 
-export type Sil = { address: string; name: string }
+export type Sil = {
+    address: string
+    name: string
+}
 
 export type GameplayResult = {
     grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
