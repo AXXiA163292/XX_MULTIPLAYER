@@ -255,8 +255,15 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     'Combo',
                 )
 
-                const rating = typeof item.rating === 'number'
-                    ? item.rating
+                const rawRating = item.rating
+                const parsedRating = typeof rawRating === 'number'
+                    ? rawRating
+                    : typeof rawRating === 'string'
+                        ? Number(rawRating)
+                        : NaN
+
+                const rating = Number.isFinite(parsedRating) && parsedRating > 0
+                    ? Math.round(parsedRating * 10) / 10
                     : null
 
                 const constant = getChartConstant(
@@ -601,7 +608,7 @@ export class Room extends DurableObject<Env> {
                 }
 
                 if (modeChanged) {
-                    this.sendHost({
+                    this.sendAll({
                         type: 'updateScoreboardDescription',
                         scoreboardDescription: this.description(),
                     })
@@ -818,7 +825,7 @@ export class Room extends DurableObject<Env> {
                     },
                 })
 
-                this.sendHost({
+                this.sendAll({
                     type: 'addResult',
                     result: {
                         userId: uid,
@@ -1037,20 +1044,14 @@ export class Room extends DurableObject<Env> {
             autoExit: 'off',
             isSuggestionsLocked: !isHost,
             suggestions: isHost ? s.suggestions : [],
-            scoreboardDescription: isHost
-                ? this.description()
-                : undefined,
-            scoreboardSections: isHost
-                ? this.sections()
-                : [],
-            results: isHost
-                ? Object.entries(s.results)
-                    .filter(([id]) => present.has(id))
-                    .map(([userId, result]) => ({
-                        userId,
-                        result,
-                    }))
-                : [],
+            scoreboardDescription: this.description(),
+            scoreboardSections: this.sections(),
+            results: Object.entries(s.results)
+                .filter(([id]) => present.has(id))
+                .map(([userId, result]) => ({
+                    userId,
+                    result,
+                })),
             users: s.members.map((m) => m.roomUser),
             userStatuses: s.members.map((m) => ({
                 userId: m.id,
@@ -1240,7 +1241,7 @@ export class Room extends DurableObject<Env> {
     }
 
     private pushScoreboard(): void {
-        this.sendHost({
+        this.sendAll({
             type: 'updateScoreboardSections',
             scoreboardSections: this.sections(),
         })
