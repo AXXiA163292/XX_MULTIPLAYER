@@ -1,3 +1,4 @@
+
 import { SERVER_DESCRIPTION, SERVER_TITLE } from './config.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
@@ -81,7 +82,7 @@ export default {
             return json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
-                buttons: [{ type: 'authentication' }, { type: 'room' }],
+                buttons: [{ type: 'authentication' }, { type: 'room' }, { type: 'configuration' }],
                 configuration: { options: [] },
             })
 
