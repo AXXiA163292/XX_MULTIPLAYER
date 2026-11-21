@@ -5,6 +5,8 @@ const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
 type Row = {
     id: string
     input: string
+    serverId: string
+    privacy: string
 }
 
 export type SheetChart = {
@@ -73,9 +75,9 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
 
     let lastError: unknown = null
 
-    for (const endpoint of urls) {
+    for (let i = 0; i < urls.length; i++) {
         try {
-            const response = await fetch(endpoint, {
+            const response = await fetch(urls[i]!, {
                 headers: {
                     Accept: 'text/csv,text/plain,*/*',
                     'Cache-Control': 'no-cache',
@@ -106,12 +108,17 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
                 throw new Error(`The "${tab}" tab is empty.`)
             }
 
+            if (i > 0) {
+                console.log(`[Sheets] Read tab "${tab}" using fallback URL.`)
+            }
+
             return parsed
         } catch (error) {
             lastError = error
-            console.warn(`Could not read Google Sheet tab "${tab}":`, error)
         }
     }
+
+    console.error(`[Sheets] Could not read tab "${tab}" from either Google Sheets URL.`, lastError)
 
     throw lastError instanceof Error
         ? lastError
@@ -149,7 +156,7 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
         const match = url.pathname.match(/\/levels\/([^/]+)\/?$/i)
 
         if (!match) {
-            console.warn('Sheet level URL has no /levels/{name} path:', id, raw)
+            console.warn('[Sheets] Level URL has no /levels/{name} path:', id, raw)
             return null
         }
 
@@ -164,7 +171,7 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
             name,
         }
     } catch (error) {
-        console.warn('Invalid level URL in sheet:', id, raw, error)
+        console.warn('[Sheets] Invalid level URL:', id, raw, error)
         return null
     }
 }
@@ -181,11 +188,16 @@ async function customRows(): Promise<Row[]> {
 
     const headerIndex = values.findIndex((row) => {
         const headers = row.map((cell) => normalizeId(cell).toLowerCase())
-        return headers.includes('id') && headers.includes('input')
+        return (
+            headers.includes('id') &&
+            headers.includes('input') &&
+            headers.includes('serverid') &&
+            headers.includes('privacy')
+        )
     })
 
     if (headerIndex < 0) {
-        throw new Error('The custom tab must contain headers named id and input.')
+        throw new Error('The custom tab must contain id, input, serverId and privacy headers.')
     }
 
     const headers = values[headerIndex]!.map((cell) =>
@@ -194,12 +206,16 @@ async function customRows(): Promise<Row[]> {
 
     const idIndex = headers.indexOf('id')
     const inputIndex = headers.indexOf('input')
+    const serverIdIndex = headers.indexOf('serverid')
+    const privacyIndex = headers.indexOf('privacy')
 
     const result = values
         .slice(headerIndex + 1)
         .map((cells) => ({
             id: normalizeId(cells[idIndex]),
-            input: String(cells[inputIndex] ?? '').trim(),
+            input: normalizeId(cells[inputIndex]),
+            serverId: normalizeId(cells[serverIdIndex]),
+            privacy: normalizeId(cells[privacyIndex]),
         }))
         .filter((row) => row.id && row.input)
 
@@ -213,17 +229,30 @@ function isCustomLevelId(id: string): boolean {
     return normalized.startsWith('60') || normalized.startsWith('X')
 }
 
+function isPublicLevel(row: Row): boolean {
+    const privacy = normalizeId(row.privacy).toLowerCase()
+    const serverId = normalizeId(row.serverId)
+
+    return privacy !== 'unlisted' && serverId !== '-'
+}
+
 export async function getCustomLevels(): Promise<SheetChart[]> {
     const rows = await customRows()
-    const matchingRows = rows.filter((row) => isCustomLevelId(row.id))
 
-    const charts = matchingRows
+    const matchingRows = rows.filter((row) => isCustomLevelId(row.id))
+    const publicRows = matchingRows.filter(isPublicLevel)
+
+    const charts = publicRows
         .map((row) => chartFromUrl(row.id, row.input))
         .filter((chart): chart is SheetChart => chart !== null)
         .sort(compareIdDescending)
 
     console.log(
-        `[Sheets] Levels: ${charts.length} valid charts from ${matchingRows.length} matching IDs.`,
+        `[Sheets] Levels: ${charts.length} valid public charts from ${matchingRows.length} matching IDs. ${matchingRows.length - publicRows.length} excluded by privacy/serverId.`,
+    )
+
+    console.log(
+        '[Sheets] Public level IDs:',
         charts.map((chart) => chart.id).join(', '),
     )
 
@@ -313,18 +342,15 @@ function isGroupHeader(header: string): boolean {
 }
 
 export async function getEditionData(): Promise<EditionData> {
-    // The tournament configuration is read exclusively from the INDEX tab.
     const rows = await fetchSheet(INDEX_SHEET_ID, 'INDEX')
 
     if (rows.length < 3) {
         throw new Error('The INDEX tab must contain its title, headers and edition rows.')
     }
 
-    // A1 contains "Index". Row 2 contains the column headers.
     const headers = rows[1]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
 
-    // The current edition is always the last non-empty cell in column A.
     let activeRow: string[] | null = null
 
     for (let i = rows.length - 1; i >= 2; i--) {
@@ -356,10 +382,7 @@ export async function getEditionData(): Promise<EditionData> {
 
         if (!header || !value) continue
 
-        // Columns G1, G2, G3... contain Group Stage song URLs.
         const groupMatch = header.match(/^G(\d+)$/)
-
-        // Columns F1, F2, F3... contain Final song URLs.
         const finalMatch = header.match(/^F(\d+)$/)
 
         if (groupMatch || finalMatch) {
@@ -383,7 +406,6 @@ export async function getEditionData(): Promise<EditionData> {
             continue
         }
 
-        // Columns A, B, C... after the song columns contain group handles.
         if (isGroupHeader(header)) {
             for (const handle of splitHandles(value)) {
                 divisions[handle] = `Group ${header}`
@@ -392,7 +414,6 @@ export async function getEditionData(): Promise<EditionData> {
             continue
         }
 
-        // UB and LB contain bracket handles.
         if (header === 'UB' || header === 'LB') {
             const division = header === 'UB'
                 ? 'Upper Bracket'
