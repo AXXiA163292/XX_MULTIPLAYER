@@ -98,15 +98,24 @@ const fresh = (): RoomState => ({
     history: [],
 })
 
-const getRoomTitle = (settings: RoomSettings) =>
-    settings.type === 'groupStage'
-        ? `Group ${settings.group || 'A'}`
-        : `${SERVER_DESCRIPTION} Final`
+const getRoomTitle = (settings: RoomSettings) => {
+    if (settings.type === 'groupStage') {
+        return `Group ${settings.group || 'A'}`
+    }
+
+    if (settings.type === 'casualRoom') {
+        return 'Casual Room'
+    }
+
+    return `${SERVER_DESCRIPTION} Final`
+}
 
 function songPoolSuggestions(
     type: RoomSettings['type'],
     userId: string,
 ) {
+    if (type === 'casualRoom') return []
+
     const edition = EDITIONS[ACTIVE_EDITION]
     const charts = type === 'groupStage'
         ? edition?.groupStage
@@ -266,15 +275,27 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     ? Math.round(parsedRating * 10) / 10
                     : null
 
-                const constant = getChartConstant(
-                    level.address,
-                    level.name,
-                    'groupStage',
-                ) ?? getChartConstant(
-                    level.address,
-                    level.name,
-                    'final',
-                ) ?? rating
+                const configuredConstant =
+                    getChartConstant(
+                        level.address,
+                        level.name,
+                        'groupStage',
+                    ) ??
+                    getChartConstant(
+                        level.address,
+                        level.name,
+                        'final',
+                    )
+
+                const descriptionConstant = extractDescriptionNumber(
+                    description,
+                    'Constant',
+                )
+
+                const constant =
+                    configuredConstant ??
+                    descriptionConstant ??
+                    rating
 
                 return {
                     title: localize(item.title) || level.name,
@@ -310,7 +331,7 @@ const isNum = (x: unknown): x is number =>
 
 const isResult = (r: any): r is GameplayResult =>
     !!r &&
-    ['allPerfect', 'fullCombo', 'pass', 'fail'].includes(r.grade) &&
+    ['allPerfect', 'fullCombo', 'pass', 'fail', 'X'].includes(r.grade) &&
     [
         r.arcadeScore,
         r.accuracyScore,
@@ -550,10 +571,22 @@ export class Room extends DurableObject<Env> {
 
                 s.levelInfo = await fetchLevelInfo(s.level)
 
-                this.sendAll({
+                this.sendHost({
                     type: 'updateLevel',
                     level: s.level,
                 })
+
+                if (s.settings.type === 'casualRoom') {
+                    this.sendExcept(uid, {
+                        type: 'updateLevel',
+                        level: s.level,
+                    })
+                } else {
+                    this.sendExcept(uid, {
+                        type: 'updateLevel',
+                        level: null,
+                    })
+                }
 
                 this.pushScoreboard()
                 return
@@ -593,6 +626,18 @@ export class Room extends DurableObject<Env> {
                         type: 'updateSuggestions',
                         suggestions: s.suggestions,
                     })
+
+                    if (next.type !== 'casualRoom' && s.level) {
+                        this.sendExcept(uid, {
+                            type: 'updateLevel',
+                            level: null,
+                        })
+                    } else if (s.level) {
+                        this.sendExcept(uid, {
+                            type: 'updateLevel',
+                            level: s.level,
+                        })
+                    }
                 }
 
                 this.sendAll({
@@ -834,9 +879,6 @@ export class Room extends DurableObject<Env> {
                 })
 
                 this.pushScoreboard()
-
-                // Do not send a full room resync after a valid finish.
-                // The client has already received the result and status events.
                 return
             }
 
@@ -928,6 +970,17 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'selecting',
             })
+
+            if (s.settings.type !== 'casualRoom') {
+                for (const member of s.members) {
+                    if (member.id !== s.hostId) {
+                        this.sendTo(member.id, {
+                            type: 'updateLevel',
+                            level: null,
+                        })
+                    }
+                }
+            }
         } else if (
             cur === 'preparing' &&
             next === 'playing'
@@ -961,6 +1014,17 @@ export class Room extends DurableObject<Env> {
                 status: 'playing',
             })
 
+            if (s.settings.type !== 'casualRoom' && s.level) {
+                for (const member of s.members) {
+                    if (member.id !== s.hostId) {
+                        this.sendTo(member.id, {
+                            type: 'updateLevel',
+                            level: s.level,
+                        })
+                    }
+                }
+            }
+
             const start = {
                 type: 'startRound',
                 state: s.round.state,
@@ -991,6 +1055,17 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'selecting',
             })
+
+            if (s.settings.type !== 'casualRoom') {
+                for (const member of s.members) {
+                    if (member.id !== s.hostId) {
+                        this.sendTo(member.id, {
+                            type: 'updateLevel',
+                            level: null,
+                        })
+                    }
+                }
+            }
 
             this.pushScoreboard()
         } else {
@@ -1029,6 +1104,11 @@ export class Room extends DurableObject<Env> {
             s.members.map((m) => m.id),
         )
 
+        const canSeeLevel =
+            isHost ||
+            s.settings.type === 'casualRoom' ||
+            s.status === 'playing'
+
         return {
             type: 'update',
             allowOtherServers: true,
@@ -1039,7 +1119,7 @@ export class Room extends DurableObject<Env> {
             lead: master,
             options: roomForms(),
             optionValues: serializeSettings(s.settings),
-            level: s.level,
+            level: canSeeLevel ? s.level : null,
             levelOptions: [],
             autoExit: 'off',
             isSuggestionsLocked: !isHost,
@@ -1173,6 +1253,13 @@ export class Room extends DurableObject<Env> {
 
     private getDivisions(members: Member[]) {
         const type = this.st.settings.type
+
+        if (type === 'casualRoom') {
+            return [{
+                title: 'All Players',
+                members,
+            }]
+        }
 
         if (type === 'groupStage') {
             const groups = GROUP_ORDER.map((group) => ({
