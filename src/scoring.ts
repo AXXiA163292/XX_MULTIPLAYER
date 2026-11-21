@@ -35,22 +35,23 @@ export function ppScore(
     if (!round) return 0
 
     const rating = round.levelConstant ?? round.levelRating
-    const noteCount = round.noteCount
+    const noteCount = round.noteCount ?? r.totalCount
 
-    if (!rating || !noteCount) return 0
-
-    const bad = Math.max(
-        0,
-        noteCount - r.perfect - r.great - r.good - r.miss,
-    )
+    if (
+        typeof rating !== 'number' ||
+        !Number.isFinite(rating) ||
+        rating <= 0 ||
+        !Number.isInteger(noteCount) ||
+        noteCount <= 0
+    ) return 0
 
     return calculatePP({
         rating,
         noteCount,
-        perfect: r.perfect,
+        perfect: noteCount - r.great - r.good - r.miss,
         great: r.great,
         good: r.good,
-        bad,
+        bad: 0,
         miss: r.miss,
         combo: r.combo,
         difficulty: round.difficulty ?? round.levelTag ?? 'MASTER',
@@ -117,10 +118,7 @@ export function totals(
 export const fmtScore = (
     n: number,
     mode: ScoringMode,
-) =>
-    mode === 'pp'
-        ? formatPP(n)
-        : `${n} pts`
+) => `${Math.round(n)}`
 
 export function fmtDetail(
     result: GameplayResult,
@@ -129,7 +127,17 @@ export function fmtDetail(
 ): string {
     const score = roundScore(result, mode, round)
 
-    return mode === 'pp'
-        ? `${formatPP(score)} | P ${result.perfect} · Gr ${result.great} · Gd ${result.good} · M ${result.miss} | ${result.combo}x`
-        : `${fmtScore(score, mode)} | P ${result.perfect} · Gr ${result.great} · Gd ${result.good} · M ${result.miss} | ${result.combo}x`
+    const grade = result.grade === 'allPerfect'
+        ? 'AP'
+        : result.grade === 'fullCombo'
+            ? 'FC'
+            : result.grade === 'pass'
+                ? 'CLEAR'
+                : 'FAIL'
+
+    const formattedScore = mode === 'pp'
+        ? formatPP(score)
+        : `${score}`
+
+    return `${formattedScore} | ${grade} • ${result.combo}x (${result.great}/${result.good}/${result.miss})`
 }
