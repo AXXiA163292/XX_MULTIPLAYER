@@ -1,6 +1,6 @@
 
 import { SERVER_DESCRIPTION, SERVER_TITLE, TOURNAMENT_HOST_HANDLE } from './config.ts'
-import { getCustomLevels, getPlaylists, type SheetChart } from './sheets.ts'
+import { getCustomLevelPage, getCustomLevels, getPlaylists, type SheetChart } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
 import type { AuthSession, Env, JoinSession, UserProfile } from './types.ts'
@@ -222,17 +222,29 @@ async function remoteLevelItem(
 }
 
 async function loadLevelItems(charts: SheetChart[]) {
-    const loaded = await Promise.all(
-        charts.map(async (chart) => ({
-            chart,
-            item: await remoteLevelItem(chart),
-        })),
-    )
+    const loaded: { chart: SheetChart; item: RemoteLevelItem }[] = []
 
-    return loaded.filter(
-        (entry): entry is { chart: SheetChart; item: RemoteLevelItem } =>
-            entry.item !== null,
-    )
+    // Five concurrent source requests at a time.
+    // Each page contains at most ten levels.
+    for (let i = 0; i < charts.length; i += 5) {
+        const batch = charts.slice(i, i + 5)
+
+        const results = await Promise.all(
+            batch.map(async (chart) => ({
+                chart,
+                item: await remoteLevelItem(chart),
+            })),
+        )
+
+        loaded.push(
+            ...results.filter(
+                (entry): entry is { chart: SheetChart; item: RemoteLevelItem } =>
+                    entry.item !== null,
+            ),
+        )
+    }
+
+    return loaded
 }
 
 export default {
@@ -546,7 +558,7 @@ export default {
             }
 
             await env.POSTS_BUCKET.put(
-                `posts/${post.item.name}/thumbnail`,
+                `posts/${postName}/thumbnail`,
                 bytes,
                 {
                     httpMetadata: { contentType },
@@ -604,8 +616,12 @@ export default {
 
         if (path === '/sonolus/levels/info' && req.method === 'GET') {
             try {
-                const charts = await getCustomLevels()
+                const { charts, pageCount } = await getCustomLevelPage(0)
                 const loaded = await loadLevelItems(charts)
+
+                console.log(
+                    `[Levels] Info page 0: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
+                )
 
                 return json({
                     creates: [],
@@ -626,17 +642,35 @@ export default {
 
         if (path === '/sonolus/levels/list' && req.method === 'GET') {
             try {
-                const charts = await getCustomLevels()
+                const requestedPage = Number(url.searchParams.get('page') ?? '0')
+                const page = Number.isInteger(requestedPage) && requestedPage >= 0
+                    ? requestedPage
+                    : 0
+
+                const { charts, pageCount } = await getCustomLevelPage(page)
+
+                if (page >= pageCount) {
+                    return json({
+                        pageCount,
+                        items: [],
+                        searches: [],
+                    })
+                }
+
                 const loaded = await loadLevelItems(charts)
 
+                console.log(
+                    `[Levels] List page ${page}: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
+                )
+
                 return json({
-                    pageCount: 1,
+                    pageCount,
                     items: loaded.map((entry) => entry.item),
                     searches: [],
                 })
             } catch (error) {
                 console.error('Could not read custom levels sheet:', error)
-                return message(502, 'Could not read the custom levels sheet.')
+                return message(502, 'Could not read custom levels sheet.')
             }
         }
 
