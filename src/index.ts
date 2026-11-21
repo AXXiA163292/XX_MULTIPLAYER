@@ -1,4 +1,3 @@
-
 import { SERVER_DESCRIPTION, SERVER_TITLE, TOURNAMENT_HOST_HANDLE } from './config.ts'
 import { getCustomLevelPage, getCustomLevels, getPlaylists, type SheetChart } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
@@ -172,10 +171,13 @@ function playlistSlug(name: string): string {
 }
 
 type RemoteLevelItem = Record<string, any>
+type RemoteLevelDetails = Record<string, any> & {
+    item: RemoteLevelItem
+}
 
-async function remoteLevelItem(
+async function remoteLevelDetails(
     chart: SheetChart,
-): Promise<RemoteLevelItem | null> {
+): Promise<RemoteLevelDetails | null> {
     const base = chart.address.replace(/\/+$/, '')
     const endpoint = `${base}/sonolus/levels/${encodeURIComponent(chart.name)}`
 
@@ -212,13 +214,53 @@ async function remoteLevelItem(
         }
 
         return {
-            ...item,
-            source: chart.address,
+            ...data,
+            item: {
+                ...item,
+                source: chart.address,
+            },
         }
     } catch (error) {
         console.error('Could not fetch source level', chart.id, endpoint, error)
         return null
     }
+}
+
+async function remoteLevelItem(
+    chart: SheetChart,
+): Promise<RemoteLevelItem | null> {
+    const details = await remoteLevelDetails(chart)
+    return details?.item ?? null
+}
+
+function descriptionText(value: any): string {
+    if (typeof value === 'string') return value.trim()
+
+    if (Array.isArray(value)) {
+        return value.map(descriptionText).filter(Boolean).join('\n')
+    }
+
+    if (value && typeof value === 'object') {
+        if (typeof value.en === 'string') return value.en.trim()
+
+        return Object.values(value)
+            .filter((entry): entry is string => typeof entry === 'string')
+            .map((entry) => entry.trim())
+            .filter(Boolean)
+            .join('\n')
+    }
+
+    return ''
+}
+
+function localizedTitle(value: any): string {
+    if (typeof value === 'string') return value
+    if (value && typeof value === 'object') {
+        if (typeof value.en === 'string') return value.en
+        const first = Object.values(value).find((entry) => typeof entry === 'string')
+        return typeof first === 'string' ? first : ''
+    }
+    return ''
 }
 
 async function loadLevelItems(charts: SheetChart[]) {
@@ -558,7 +600,7 @@ export default {
             }
 
             await env.POSTS_BUCKET.put(
-                `posts/${postName}/thumbnail`,
+                \`posts/\${post.item.name}/thumbnail\`,
                 bytes,
                 {
                     httpMetadata: { contentType },
@@ -568,7 +610,7 @@ export default {
             await lobby(env).setPostThumbnail(
                 post.item.name,
                 hash,
-                `/sonolus/posts/${post.item.name}/thumbnail`,
+                \`/sonolus/posts/\${post.item.name}/thumbnail\`,
             )
 
             return json({})
@@ -580,7 +622,7 @@ export default {
 
         if (thumbnailPath && req.method === 'GET') {
             const object = await env.POSTS_BUCKET.get(
-                `posts/${thumbnailPath[1]}/thumbnail`,
+                \`posts/\${thumbnailPath[1]}/thumbnail\`,
             )
 
             if (!object) return new Response(null, { status: 404 })
@@ -620,7 +662,7 @@ export default {
                 const loaded = await loadLevelItems(charts)
 
                 console.log(
-                    `[Levels] Info page 0: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
+                    \`[Levels] Info page 0: \${loaded.length}/\${charts.length} levels loaded. \${pageCount} pages total.\`,
                 )
 
                 return json({
@@ -660,7 +702,7 @@ export default {
                 const loaded = await loadLevelItems(charts)
 
                 console.log(
-                    `[Levels] List page ${page}: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
+                    \`[Levels] List page \${page}: \${loaded.length}/\${charts.length} levels loaded. \${pageCount} pages total.\`,
                 )
 
                 return json({
@@ -680,8 +722,15 @@ export default {
             const requestedName = decodeURIComponent(levelPath[1]!)
 
             try {
-                const charts = await getCustomLevels()
-                const chart = charts.find(
+                const [customCharts, playlists] = await Promise.all([
+                    getCustomLevels(),
+                    getPlaylists(),
+                ])
+                const allCharts = [
+                    ...customCharts,
+                    ...playlists.flatMap((playlist) => playlist.charts),
+                ]
+                const chart = allCharts.find(
                     (entry) =>
                         entry.name === requestedName ||
                         entry.id === requestedName,
@@ -689,16 +738,18 @@ export default {
 
                 if (!chart) return new Response(null, { status: 404 })
 
-                const item = await remoteLevelItem(chart)
+                const details = await remoteLevelDetails(chart)
 
-                if (!item) return new Response(null, { status: 502 })
+                if (!details) return new Response(null, { status: 502 })
 
                 return json({
-                    item,
-                    actions: [],
-                    hasCommunity: false,
-                    leaderboards: [],
-                    sections: [],
+                    ...details,
+                    item: details.item,
+                    description: details.description ?? details.item.description ?? '',
+                    actions: Array.isArray(details.actions) ? details.actions : [],
+                    hasCommunity: details.hasCommunity ?? false,
+                    leaderboards: Array.isArray(details.leaderboards) ? details.leaderboards : Array.isArray(details.item.leaderboards) ? details.item.leaderboards : [],
+                    sections: Array.isArray(details.sections) ? details.sections : [],
                 })
             } catch (error) {
                 console.error('Could not load level details:', error)
@@ -719,7 +770,7 @@ export default {
                         name: playlistSlug(playlist.name),
                         version: 1 as const,
                         title: playlist.name,
-                        subtitle: `${loaded.length} levels`,
+                        subtitle: \`\${loaded.length} levels\`,
                         author: "AXX!A's server",
                         tags: [],
                         levels: loaded.map((entry) => entry.item),
@@ -772,15 +823,42 @@ export default {
             const requestedName = decodeURIComponent(playlistPath[1]!)
 
             try {
-                const items = await makePlaylistItems()
-                const item = items.find(
-                    (entry) => entry.name === requestedName,
+                const playlists = await getPlaylists()
+                const playlist = playlists.find(
+                    (entry) => playlistSlug(entry.name) === requestedName,
                 )
 
-                if (!item) return new Response(null, { status: 404 })
+                if (!playlist) return new Response(null, { status: 404 })
+
+                const details = await Promise.all(
+                    playlist.charts.map((chart) => remoteLevelDetails(chart)),
+                )
+                const loaded = details.filter(
+                    (detail): detail is RemoteLevelDetails => detail !== null,
+                )
+                const item = {
+                    name: requestedName,
+                    version: 1 as const,
+                    title: playlist.name,
+                    subtitle: \`\${loaded.length} levels\`,
+                    author: "AXX!A's server",
+                    tags: [],
+                    levels: loaded.map((detail) => detail.item),
+                }
+                const description = loaded
+                    .map((detail) => {
+                        const title = localizedTitle(detail.item?.title)
+                        const text = descriptionText(
+                            detail.description ?? detail.item?.description,
+                        )
+                        return text ? [title, text].filter(Boolean).join('\n') : ''
+                    })
+                    .filter(Boolean)
+                    .join('\n\n')
 
                 return json({
                     item,
+                    description,
                     actions: [],
                     hasCommunity: false,
                     leaderboards: [],
@@ -903,7 +981,7 @@ export default {
             } satisfies JoinSession)
 
             const wsUrl =
-                addressOf(req, env).replace(/^http/, 'ws') + `/ws/${name}`
+                addressOf(req, env).replace(/^http/, 'ws') + \`/ws/\${name}\`
 
             return json({
                 url: wsUrl,
