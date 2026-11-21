@@ -6,6 +6,7 @@ import {
     SCORING_MODES,
     SERVER_DESCRIPTION,
 } from './config.ts'
+import { ACTIVE_EDITION, EDITIONS } from './songpool.ts'
 import {
     parseSettings,
     roomForms,
@@ -94,6 +95,43 @@ const getRoomTitle = (settings: RoomSettings) =>
     settings.type === 'groupStage'
         ? `Group ${settings.group || 'A'}`
         : `${SERVER_DESCRIPTION} Final`
+
+function songPoolSuggestions(
+    type: RoomSettings['type'],
+    userId: string,
+) {
+    const edition = EDITIONS[ACTIVE_EDITION]
+    const links = type === 'groupStage'
+        ? edition?.groupStage
+        : edition?.final
+
+    if (!Array.isArray(links)) return []
+
+    return links.flatMap((link) => {
+        if (typeof link !== 'string' || !link.trim()) return []
+
+        try {
+            const url = new URL(link)
+            const match = url.pathname.match(/^\/levels\/([^/]+)\/?$/)
+
+            if (
+                url.protocol !== 'https:' ||
+                url.hostname !== 'untitledcharts.com' ||
+                !match
+            ) return []
+
+            return [{
+                userId,
+                level: {
+                    address: url.origin,
+                    name: decodeURIComponent(match[1]!),
+                },
+            }]
+        } catch {
+            return []
+        }
+    })
+}
 
 const localize = (value: any): string => {
     if (typeof value === 'string') return value
@@ -204,10 +242,6 @@ export class Room extends DurableObject<Env> {
         })
     }
 
-    // ------------------------------------------------------------------
-    // Room reservation and configuration
-    // ------------------------------------------------------------------
-
     async reserve(name: string, reservation: Reservation): Promise<void> {
         this.st = {
             ...fresh(),
@@ -239,6 +273,7 @@ export class Room extends DurableObject<Env> {
         this.st.hostId = host.id
         this.st.hostName = host.name
         this.st.settings = settings
+        this.st.suggestions = songPoolSuggestions(settings.type, host.id)
         this.st.reserved = null
 
         await this.save()
@@ -262,18 +297,22 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    // ------------------------------------------------------------------
-    // WebSocket entry
-    // ------------------------------------------------------------------
-
     async fetch(request: Request): Promise<Response> {
         if (request.headers.get('Upgrade') !== 'websocket') {
             return new Response('Expected WebSocket', { status: 426 })
         }
 
-        const join = JSON.parse(
-            decodeURIComponent(request.headers.get('x-join') ?? 'null'),
-        ) as JoinSession | null
+        let join: JoinSession | null
+
+        try {
+            join = JSON.parse(
+                decodeURIComponent(
+                    request.headers.get('x-join') ?? 'null',
+                ),
+            ) as JoinSession | null
+        } catch {
+            return new Response('Invalid join session', { status: 400 })
+        }
 
         if (
             !join ||
@@ -312,6 +351,7 @@ export class Room extends DurableObject<Env> {
         await this.save()
 
         this.send(server, this.view(user.id))
+
         this.sendExcept(user.id, {
             type: 'addUser',
             user: member.roomUser,
@@ -336,10 +376,6 @@ export class Room extends DurableObject<Env> {
             webSocket: client,
         })
     }
-
-    // ------------------------------------------------------------------
-    // WebSocket handlers
-    // ------------------------------------------------------------------
 
     async webSocketMessage(
         ws: WebSocket,
@@ -400,10 +436,6 @@ export class Room extends DurableObject<Env> {
         this.st = fresh()
     }
 
-    // ------------------------------------------------------------------
-    // Command handling
-    // ------------------------------------------------------------------
-
     private async handle(uid: string, cmd: Cmd): Promise<void> {
         const s = this.st
         const isHost = uid === s.hostId
@@ -440,8 +472,6 @@ export class Room extends DurableObject<Env> {
                         ? parseSettings(cmd.optionValues)
                         : null
 
-                // Settings can only be changed by the host before
-                // the first round begins.
                 if (
                     !isHost ||
                     !next ||
@@ -454,11 +484,23 @@ export class Room extends DurableObject<Env> {
                 const modeChanged =
                     next.scoring !== s.settings.scoring
 
+                const typeChanged =
+                    next.type !== s.settings.type
+
                 const titleChanged =
-                    next.type !== s.settings.type ||
+                    typeChanged ||
                     next.group !== s.settings.group
 
                 s.settings = next
+
+                if (typeChanged) {
+                    s.suggestions = songPoolSuggestions(next.type, uid)
+
+                    this.sendHost({
+                        type: 'updateSuggestions',
+                        suggestions: s.suggestions,
+                    })
+                }
 
                 this.sendAll({
                     type: 'updateOptionValues',
@@ -517,7 +559,6 @@ export class Room extends DurableObject<Env> {
                 return
             }
 
-            // Only the host can manage suggestions.
             case 'addSuggestion': {
                 if (!isHost || !isSil(cmd.level)) {
                     return this.resync(uid)
@@ -611,7 +652,6 @@ export class Room extends DurableObject<Env> {
                 return
             }
 
-            // Locked controls are rejected.
             case 'updateLead':
             case 'updateMaster':
             case 'updateAutoExit':
@@ -755,10 +795,6 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Status changes
-    // ------------------------------------------------------------------
-
     private async changeStatus(
         uid: string,
         next: RoomStatus,
@@ -871,10 +907,6 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    // ------------------------------------------------------------------
-    // State views
-    // ------------------------------------------------------------------
-
     private hostPresent = () =>
         this.st.members.some(
             (m) => m.id === this.st.hostId,
@@ -891,11 +923,6 @@ export class Room extends DurableObject<Env> {
             s.members.map((m) => m.id),
         )
 
-        const canEditSettings =
-            isHost &&
-            s.status === 'selecting' &&
-            s.history.length === 0
-
         return {
             type: 'update',
             allowOtherServers: true,
@@ -905,8 +932,8 @@ export class Room extends DurableObject<Env> {
             master,
             lead: master,
 
-            // Only the host sees settings, and only before round 1.
-            options: canEditSettings ? roomForms() : [],
+            // Keep options present so optionValues always has valid definitions.
+            options: roomForms(),
             optionValues: serializeSettings(s.settings),
 
             level: s.level,
@@ -1057,10 +1084,6 @@ export class Room extends DurableObject<Env> {
             scoreboardSections: this.sections(),
         })
     }
-
-    // ------------------------------------------------------------------
-    // Plumbing
-    // ------------------------------------------------------------------
 
     private async dropMember(
         uid: string,
