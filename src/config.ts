@@ -1,3 +1,4 @@
+
 export const ACTIVE_EDITION = 'WINTER 2027'
 // ============================================================
 // EDITION CONFIGURATION
@@ -37,53 +38,52 @@ export type Edition = {
 export const EDITIONS: Record<string, Edition> = {
     'WINTER 2027': {
         groupStage: [
-{url:null,constant:null},
-{url:null,constant:null},
-{url:null,constant:null},
-{url:null,constant:null},
-{url:null,constant:null},
-{url:'https://untitledcharts.com/levels/UnCh-3d7bd1a1a8c14f058b4e56d45e315c32',constant:null},
+            {url:null,constant:null},
+            {url:null,constant:null},
+            {url:null,constant:null},
+            {url:null,constant:null},
+            {url:null,constant:null},
+            {url:'https://untitledcharts.com/levels/UnCh-3d7bd1a1a8c14f058b4e56d45e315c32',constant:null},
         ],
-// ============================================================
-// FINAL
-// ============================================================
+        // ============================================================
+        // FINAL
+        // ============================================================
         final: [
-{url:null,constant:null},
-{url:'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',constant:33.0},
-{url:null,constant:null},
-{url:null,constant:null},
+            {url:null,constant:null},
+            {url:'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',constant:33.0},
+            {url:null,constant:null},
+            {url:null,constant:null},
         ],
-// ============================================================
-// GROUPS
-// ============================================================
+        // ============================================================
+        // GROUPS
+        // ============================================================
 
         // PLAYER ASSIGNMENTS
         composition: {
             groupStage: {
                 groups: {
-A: [],
-B: [],
-C: [],
-D: [],
-E: [],
-F: [],
-G: [],
-H: [],
-I: [],
-J: [],
-K: [],
-X: [],
-T: [],
+                    A: [],
+                    B: [],
+                    C: [],
+                    D: [],
+                    E: [],
+                    F: [],
+                    G: [],
+                    H: [],
+                    I: [],
+                    J: [],
+                    K: [],
+                    X: [],
+                    T: [],
                 },
             },
-// ============================================================
-// FINAL COMPOSITION
-// ============================================================
-
+            // ============================================================
+            // FINAL COMPOSITION
+            // ============================================================
             final: {
                 brackets: {
-upperBracket: ['163292'],
-lowerBracket: [],
+                    upperBracket: ['163292'],
+                    lowerBracket: [],
                 },
             },
         },
@@ -104,13 +104,14 @@ export const RANKED_POINTS = {
 export const ROOM_TYPES = {
     groupStage: 'Group Stage',
     final: 'Final',
+    casualRoom: 'Casual Room',
 } as const
 
 export type RoomType = keyof typeof ROOM_TYPES
 
 export const SCORING_MODES = {
-    rankedMatch: 'Ranked Match',
     pp: 'PP',
+    rankedMatch: 'Ranked Match',
 } as const
 
 export type ScoringMode = keyof typeof SCORING_MODES
