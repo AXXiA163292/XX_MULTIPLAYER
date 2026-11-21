@@ -117,7 +117,7 @@ export const SCORING_MODES = {
 export type ScoringMode = keyof typeof SCORING_MODES
 
 export const DEFAULT_TYPE: RoomType = 'groupStage'
-export const DEFAULT_SCORING: ScoringMode = 'rankedMatch'
+export const DEFAULT_SCORING: ScoringMode = 'pp'
 
 export const SERVER_TITLE = 'XX! Championship'
 export const SERVER_DESCRIPTION = ACTIVE_EDITION
