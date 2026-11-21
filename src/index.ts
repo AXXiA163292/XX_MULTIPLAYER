@@ -332,9 +332,27 @@ export default {
         }
 
         if (path === '/sonolus/info' && req.method === 'GET') {
+            const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
+            let banner: { hash: string; url: string } | undefined
+
+            if (bannerObject) {
+                const bytes = await bannerObject.arrayBuffer()
+                const digest = await crypto.subtle.digest('SHA-1', bytes)
+                const hash = Array.from(
+                    new Uint8Array(digest),
+                    (byte) => byte.toString(16).padStart(2, '0'),
+                ).join('')
+
+                banner = {
+                    hash,
+                    url: '/sonolus/server/banner',
+                }
+            }
+
             return json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
+                ...(banner ? { banner } : {}),
                 buttons: [
                     { type: 'authentication' },
                     { type: 'room' },
@@ -380,6 +398,19 @@ export default {
             return json({ session, expiration })
         }
 
+        if (path === '/sonolus/server/banner' && req.method === 'GET') {
+            const object = await env.POSTS_BUCKET.get('server/banner.png')
+
+            if (!object) return new Response(null, { status: 404 })
+
+            return new Response(object.body, {
+                headers: {
+                    'Content-Type': object.httpMetadata?.contentType ?? 'image/png',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
         // Posts: Announcements and News
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
@@ -416,7 +447,6 @@ export default {
 
         if (path === '/sonolus/posts/create' && req.method === 'POST') {
             const session = await sessionOf(req, env)
-
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -815,7 +845,7 @@ export default {
                 })
             } catch (error) {
                 console.error('Could not read playlists sheet:', error)
-                return message(502, 'Could not read the playlists sheet.')
+                return message(502, 'Could not read playlists sheet.')
             }
         }
 
