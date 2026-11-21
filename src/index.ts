@@ -22,7 +22,6 @@ const message = (status: number, text: string) =>
 const addressOf = (req: Request, env: Env) =>
     (env.PUBLIC_ADDRESS ?? new URL(req.url).origin).replace(/\/+$/, '')
 
-/** Verifies a Sonolus-signed request body. */
 async function verifySigned(
     req: Request,
     env: Env,
@@ -138,6 +137,9 @@ const postForm = {
     ],
 }
 
+const canManagePosts = (session: AuthSession | null, env: Env) =>
+    session?.user.handle === env.HOST_HANDLE
+
 export default {
     async fetch(req: Request, env: Env): Promise<Response> {
         const url = new URL(req.url)
@@ -152,8 +154,6 @@ export default {
                 },
             })
         }
-
-        // ---------------------------------------------------------------- WebSocket
 
         const ws = path.match(/^\/ws\/([\w-]+)$/)
 
@@ -178,8 +178,6 @@ export default {
                 new Request(req, { headers }),
             )
         }
-
-        // ---------------------------------------------------------------- Sonolus server API
 
         if (path === '/' || path === '/sonolus')
             return new Response('AXX! Sonolus multiplayer server')
@@ -218,15 +216,14 @@ export default {
             return json({ session, expiration })
         }
 
-        // ---------------------------------------------------------------- Posts
+        // Posts
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const s = await sessionOf(req, env)
-            const canPost = s?.user.id === '163292'
             const posts = await lobby(env).listPosts()
 
             return json({
-                creates: canPost ? [postForm] : [],
+                creates: canManagePosts(s, env) ? [postForm] : [],
                 searches: [],
                 sections: [
                     {
@@ -253,7 +250,7 @@ export default {
 
             if (!s) return new Response(null, { status: 401 })
 
-            if (s.user.id !== '163292')
+            if (!canManagePosts(s, env))
                 return message(403, 'Only the designated publisher can create posts.')
 
             let body: any
@@ -312,7 +309,7 @@ export default {
 
             if (!s) return new Response(null, { status: 401 })
 
-            if (s.user.id !== '163292')
+            if (!canManagePosts(s, env))
                 return message(403, 'Only the designated publisher can upload images.')
 
             const key = req.headers.get('Sonolus-Upload-Key')
@@ -409,7 +406,7 @@ export default {
             })
         }
 
-        // ---------------------------------------------------------------- Rooms
+        // Rooms
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
             const s = await sessionOf(req, env)
