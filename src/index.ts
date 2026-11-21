@@ -1,3 +1,4 @@
+
 import { SERVER_DESCRIPTION, SERVER_TITLE } from './config.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
@@ -78,10 +79,14 @@ const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
 async function roomItems(env: Env) {
-    return (await lobby(env).list()).map((r) => ({
-        ...r,
-        tags: [],
-    }))
+    const rooms = await lobby(env).list()
+
+    return Promise.all(
+        rooms.map(async (room) => {
+            const current = await roomStub(env, room.name).summary()
+            return { ...(current ?? room), tags: [] }
+        }),
+    )
 }
 
 const postForm = {
@@ -110,18 +115,8 @@ const postForm = {
             shortcuts: [],
         },
         {
-            query: 'tags',
-            name: 'Tags',
-            required: false,
-            type: 'text',
-            def: '',
-            placeholder: 'News, Announcement',
-            limit: 100,
-            shortcuts: [],
-        },
-        {
             query: 'thumbnail',
-            name: 'Image thumbnail',
+            name: 'Thumbnail',
             description: 'Optional post image.',
             required: false,
             type: 'file',
@@ -279,13 +274,6 @@ export default {
             if (title.length > 100 || description.length > 5000)
                 return message(400, 'Post is too long.')
 
-            const tags = (values.get('tags') ?? '')
-                .split(',')
-                .map((tag) => tag.trim())
-                .filter(Boolean)
-                .slice(0, 8)
-                .map((title) => ({ title }))
-
             const name = randomId(12)
             const key = randomId(24)
 
@@ -296,7 +284,7 @@ export default {
                     title,
                     time: Date.now(),
                     author: s.user.name || s.user.handle,
-                    tags,
+                    tags: [],
                 },
                 description,
                 uploadKey: key,
@@ -344,7 +332,6 @@ export default {
 
             return json({
                 shouldRemoveItem: true,
-                shouldUpdateItem: true,
             })
         }
 
