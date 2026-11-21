@@ -64,6 +64,16 @@ export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\nAXX!A's server!
 export const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 5 * 60 * 1000
 
+const GROUP_ASSIGNMENTS: Record<string, string> = {
+    '1289288': 'Group B',
+    '283420': 'Group F',
+    '163292': 'Group X',
+}
+
+const FINAL_ASSIGNMENTS: Record<string, BracketName> = {
+    '163292': 'Upper Bracket',
+}
+
 export function getChartConstant(
     _address: string,
     _name: string,
@@ -73,10 +83,12 @@ export function getChartConstant(
 }
 
 export function getDivision(
-    _handle: string,
-    _type: 'groupStage' | 'final',
+    handle: string,
+    type: 'groupStage' | 'final',
 ): string | null {
-    return null
+    return type === 'groupStage'
+        ? GROUP_ASSIGNMENTS[handle] ?? null
+        : FINAL_ASSIGNMENTS[handle] ?? null
 }
 
 export function getEditionChart(
