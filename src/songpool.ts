@@ -3,7 +3,7 @@ export const ACTIVE_EDITION = 'WINTER 2027'
 
 export const GROUP_ORDER = [
     'A', 'B', 'C', 'D', 'E', 'F',
-    'G', 'H', 'I', 'J', 'K', 'X',
+    'G', 'H', 'I', 'J', 'K', 'X', 'T',
 ] as const
 
 export type GroupName = typeof GROUP_ORDER[number]
@@ -44,6 +44,7 @@ const emptyGroups = (): Record<GroupName, string[]> => ({
     I: [],
     J: [],
     K: [],
+    T: [],
     X: [],
 })
 
@@ -65,7 +66,7 @@ export const EDITIONS: Record<string, Edition> = {
             null,
             {
                 url: 'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',
-                constant: null,
+                constant: 33.0,
             },
             null,
             null,
