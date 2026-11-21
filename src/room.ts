@@ -1,4 +1,3 @@
-
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
@@ -175,7 +174,6 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
         for (const path of paths) {
             try {
                 const response = await fetch(path, {
-                    redirect: 'error',
                     signal: AbortSignal.timeout(5000),
                 })
 
@@ -186,7 +184,12 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
 
                 return {
                     title: localize(item.title) || level.name,
-                    firstTag: localize(item.tags?.[0]?.title),
+                    firstTag: localize(item.tags?.find((tag: any) =>
+                        ['EASY', 'NORMAL', 'HARD', 'EXPERT', 'MASTER', 'APPEND']
+                            .some((difficulty) =>
+                                localize(tag?.title).toUpperCase().startsWith(difficulty),
+                            ),
+                    )?.title),
                     rating: typeof item.rating === 'number'
                         ? item.rating
                         : null,
