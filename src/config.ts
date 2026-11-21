@@ -1,10 +1,7 @@
-
+export const ACTIVE_EDITION = 'WINTER 2027'
 // ============================================================
 // EDITION CONFIGURATION
-// Change this section when preparing a new championship.
 // ============================================================
-
-export const ACTIVE_EDITION = 'WINTER 2027'
 
 export const GROUP_ORDER = ['A','B','C','D','E','F','G','H','I','J','K','X','T'] as const
 
@@ -12,7 +9,7 @@ export type GroupName = typeof GROUP_ORDER[number]
 export type BracketName = 'Upper Bracket' | 'Lower Bracket'
 
 export type SongPoolChart = {
-    url: string
+    url: string | null
     constant: number | null
 }
 
@@ -35,62 +32,58 @@ export type Edition = {
 }
 
 // ------------------------------------------------------------
-// WINTER 2027
+// WINTER 2027 SONG POOL
 // ------------------------------------------------------------
-
 export const EDITIONS: Record<string, Edition> = {
     'WINTER 2027': {
-
-        // GROUP STAGE
-        // Six song slots. Use null for an empty slot.
         groupStage: [
-            null,
-            null,
-            null,
-            null,
-            null,
-            {
-                url: 'https://untitledcharts.com/levels/UnCh-3d7bd1a1a8c14f058b4e56d45e315c32',
-                constant: null,
-            },
+{url:null,constant:null},
+{url:null,constant:null},
+{url:null,constant:null},
+{url:null,constant:null},
+{url:null,constant:null},
+{url:'https://untitledcharts.com/levels/UnCh-3d7bd1a1a8c14f058b4e56d45e315c32',constant:null},
         ],
-
-        // FINAL
-        // Four song slots. Use null for an empty slot.
+// ============================================================
+// FINAL
+// ============================================================
         final: [
-            null,
-            {
-                url: 'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',
-                constant: 33.0,
-            },
-            null,
-            null,
+{url:null,constant:null},
+{url:'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',constant:33.0},
+{url:null,constant:null},
+{url:null,constant:null},
         ],
+// ============================================================
+// GROUPS
+// ============================================================
 
         // PLAYER ASSIGNMENTS
         composition: {
             groupStage: {
                 groups: {
-                    A: [],
-                    B: [],
-                    C: [],
-                    D: [],
-                    E: [],
-                    F: [],
-                    G: [],
-                    H: [],
-                    I: [],
-                    J: [],
-                    K: [],
-                    X: [],
-                    T: [],
+A: [],
+B: [],
+C: [],
+D: [],
+E: [],
+F: [],
+G: [],
+H: [],
+I: [],
+J: [],
+K: [],
+X: [],
+T: [],
                 },
             },
+// ============================================================
+// FINAL COMPOSITION
+// ============================================================
 
             final: {
                 brackets: {
-                    upperBracket: [],
-                    lowerBracket: [],
+upperBracket: ['163292'],
+lowerBracket: [],
                 },
             },
         },
@@ -152,7 +145,7 @@ export function getChartConstant(
     const target = `${address.replace(/\/+$/, '')}/levels/${name}`
 
     for (const chart of charts) {
-        if (!chart) continue
+        if (!chart || !chart.url) continue
 
         try {
             const url = new URL(chart.url)
