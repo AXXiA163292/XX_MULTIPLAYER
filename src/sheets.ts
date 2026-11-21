@@ -355,18 +355,19 @@ function isGroupHeader(header: string): boolean {
 }
 
 export async function getEditionData(): Promise<EditionData> {
-    const rows = await fetchSheet(INDEX_SHEET_ID, 'INDEX')
+    const rows = await fetchSheet(INDEX_SHEET_ID, 'index')
 
-    if (rows.length < 3) {
-        throw new Error('The INDEX tab must contain its title, headers and edition rows.')
+    if (rows.length < 2) {
+        throw new Error('The index tab must contain a header row and at least one edition row.')
     }
 
-    const headers = rows[1]!.map((cell) => normalizeId(cell))
+    // Row 1 contains the headers (A1 = Index). Row 2 onward contains editions.
+    const headers = rows[0]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
 
     let activeRow: string[] | null = null
 
-    for (let i = rows.length - 1; i >= 2; i--) {
+    for (let i = rows.length - 1; i >= 1; i--) {
         const row = rows[i]!
 
         if (normalizeId(row[0])) {
@@ -376,13 +377,13 @@ export async function getEditionData(): Promise<EditionData> {
     }
 
     if (!activeRow) {
-        throw new Error('No edition was found in column A of the INDEX tab.')
+        throw new Error('No edition was found in column A of the index tab.')
     }
 
     const edition = normalizeId(activeRow[0])
 
     if (!edition) {
-        throw new Error('The current edition name in column A is empty.')
+        throw new Error('The current edition name in column A of the index tab is empty.')
     }
 
     const groupStage: SheetChart[] = []
