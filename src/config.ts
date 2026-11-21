@@ -18,8 +18,8 @@ export type ScoringMode = keyof typeof SCORING_MODES
 export const DEFAULT_TYPE: RoomType = 'groupStage'
 export const DEFAULT_SCORING: ScoringMode = 'rankedMatch'
 
-export const SERVER_TITLE = 'AXX! Tournament Multiplayer'
-export const SERVER_DESCRIPTION = 'Private tournament rooms. Only the host can create rooms.'
+export const SERVER_TITLE = 'XX! Championship'
+export const SERVER_DESCRIPTION = 'WINTER 2027.'
 
 /** Empty rooms are deleted after this long. */
 export const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
