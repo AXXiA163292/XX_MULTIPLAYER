@@ -1,7 +1,10 @@
 
 import type { EditionData, SheetChart } from './sheets.ts'
 
-export const GROUP_ORDER = ['A','B','C','D','E','F','G','H','I','J','K','X','T'] as const
+export const GROUP_ORDER = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G',
+    'H', 'I', 'J', 'K', 'X', 'T',
+] as const
 
 export type GroupName = typeof GROUP_ORDER[number]
 export type BracketName = 'Upper Bracket' | 'Lower Bracket'
@@ -64,14 +67,12 @@ export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\nAXX!A's server!
 export const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 5 * 60 * 1000
 
-const GROUP_ASSIGNMENTS: Record<string, string> = {
-    '1289288': 'Group B',
-    '283420': 'Group F',
-    '163292': 'Group X',
-}
+let sheetDivisions: Record<string, string> = {}
 
-const FINAL_ASSIGNMENTS: Record<string, BracketName> = {
-    '163292': 'Upper Bracket',
+export function setSheetDivisions(
+    divisions: Record<string, string>,
+): void {
+    sheetDivisions = { ...divisions }
 }
 
 export function getChartConstant(
@@ -86,9 +87,20 @@ export function getDivision(
     handle: string,
     type: 'groupStage' | 'final',
 ): string | null {
-    return type === 'groupStage'
-        ? GROUP_ASSIGNMENTS[handle] ?? null
-        : FINAL_ASSIGNMENTS[handle] ?? null
+    const division = sheetDivisions[handle]
+
+    if (!division) return null
+
+    if (type === 'groupStage') {
+        return division.startsWith('Group ')
+            ? division
+            : null
+    }
+
+    return division === 'Upper Bracket' ||
+        division === 'Lower Bracket'
+        ? division
+        : null
 }
 
 export function getEditionChart(
