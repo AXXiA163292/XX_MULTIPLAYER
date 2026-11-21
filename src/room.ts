@@ -1046,19 +1046,33 @@ export class Room extends DurableObject<Env> {
                 status: 'selecting',
             })
 
-            if (s.settings.type !== 'casualRoom') {
-                for (const member of s.members) {
-                    if (member.id !== s.hostId) {
-                        this.sendTo(member.id, {
-                            type: 'updateLevel',
-                            level: null,
-                        })
-                    }
-                }
-            }
+            if (s.settings.type !== 'casualRoom' && s.level) {
+    for (const member of s.members) {
+        if (member.id !== s.hostId) {
+            this.sendTo(member.id, {
+                type: 'updateLevel',
+                level: s.level,
+            })
+        }
+    }
+}
 
-            this.pushScoreboard()
-        } else {
+this.sendAll({
+    type: 'updateStatus',
+    status: 'playing',
+})
+
+const start = {
+    type: 'startRound',
+    state: s.round.state,
+    seed: s.round.seed,
+}
+
+for (const m of s.members) {
+    if (s.statuses[m.id] === 'ready') {
+        this.sendTo(m.id, start)
+    }
+} else {
             return this.resync(uid)
         }
     }
