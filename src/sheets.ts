@@ -1,4 +1,3 @@
-
 const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
 
@@ -234,6 +233,20 @@ function isPublicLevel(row: Row): boolean {
     const serverId = normalizeId(row.serverId)
 
     return privacy !== 'unlisted' && serverId !== '-'
+}
+
+export const CUSTOM_LEVEL_PAGE_SIZE = 10
+
+export async function getCustomLevelPage(page: number): Promise<{ charts: SheetChart[]; pageCount: number }> {
+    const all = await getCustomLevels()
+    const safePage = Number.isFinite(page) ? Math.max(0, Math.floor(page)) : 0
+    const pageCount = Math.max(1, Math.ceil(all.length / CUSTOM_LEVEL_PAGE_SIZE))
+    const start = safePage * CUSTOM_LEVEL_PAGE_SIZE
+
+    return {
+        charts: all.slice(start, start + CUSTOM_LEVEL_PAGE_SIZE),
+        pageCount,
+    }
 }
 
 export async function getCustomLevels(): Promise<SheetChart[]> {
