@@ -257,5 +257,5 @@ export function roundPP(value: number): number {
 }
 
 export function formatPP(value: number): string {
-    return `${value.toFixed(PP_SETTINGS.displayDecimals)} pp`
+    return `${value.toFixed(PP_SETTINGS.displayDecimals)}pp`
 }
