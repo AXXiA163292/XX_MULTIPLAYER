@@ -1,5 +1,6 @@
 const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
+const INDEX_SHEET_TAB = 'index'
 
 type Row = {
     id: string
@@ -67,61 +68,52 @@ function parseCSV(input: string): string[][] {
 }
 
 async function fetchSheet(id: string, tab: string): Promise<string[][]> {
-    const urls = [
-        `https://docs.google.com/spreadsheets/d/${id}/export?format=csv&sheet=${encodeURIComponent(tab)}&t=${Date.now()}`,
-        `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}&t=${Date.now()}`,
-    ]
+    const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}&t=${Date.now()}`
 
-    let lastError: unknown = null
+    try {
+        console.log(`[Sheets] Requesting spreadsheet ${id}, tab "${tab}".`)
+        console.log(`[Sheets] Exact tab request: ${url}`)
 
-    for (let i = 0; i < urls.length; i++) {
-        try {
-            const response = await fetch(urls[i]!, {
-                headers: {
-                    Accept: 'text/csv,text/plain,*/*',
-                    'Cache-Control': 'no-cache',
-                },
-                signal: AbortSignal.timeout(15000),
-                cache: 'no-store',
-            })
+        const response = await fetch(url, {
+            headers: {
+                Accept: 'text/csv,text/plain,*/*',
+                'Cache-Control': 'no-cache',
+            },
+            signal: AbortSignal.timeout(15000),
+            cache: 'no-store',
+        })
 
-            if (!response.ok) {
-                throw new Error(`Google Sheets HTTP ${response.status}`)
-            }
-
-            const content = (await response.text()).replace(/^\uFEFF/, '')
-            const trimmed = content.trimStart()
-
-            if (
-                !trimmed ||
-                trimmed.startsWith('<!DOCTYPE') ||
-                trimmed.startsWith('<html') ||
-                trimmed.startsWith('google.visualization')
-            ) {
-                throw new Error(`Google Sheets did not return CSV for tab "${tab}".`)
-            }
-
-            const parsed = parseCSV(content)
-
-            if (!parsed.length) {
-                throw new Error(`The "${tab}" tab is empty.`)
-            }
-
-            if (i > 0) {
-                console.log(`[Sheets] Read tab "${tab}" using fallback URL.`)
-            }
-
-            return parsed
-        } catch (error) {
-            lastError = error
+        if (!response.ok) {
+            throw new Error(`Google Sheets HTTP ${response.status} for tab "${tab}".`)
         }
+
+        const content = (await response.text()).replace(/^\uFEFF/, '')
+        const trimmed = content.trimStart()
+
+        if (
+            !trimmed ||
+            trimmed.startsWith('<!DOCTYPE') ||
+            trimmed.startsWith('<html') ||
+            trimmed.startsWith('google.visualization')
+        ) {
+            throw new Error(`Google Sheets did not return CSV for tab "${tab}".`)
+        }
+
+        const parsed = parseCSV(content)
+
+        if (!parsed.length) {
+            throw new Error(`The "${tab}" tab is empty.`)
+        }
+
+        console.log(`[Sheets] Successfully read ${parsed.length} rows from tab "${tab}".`)
+
+        return parsed
+    } catch (error) {
+        console.error(`[Sheets] Failed to read spreadsheet ${id}, tab "${tab}".`, error)
+        throw error instanceof Error
+            ? error
+            : new Error(`Could not read Google Sheet tab "${tab}".`)
     }
-
-    console.error(`[Sheets] Could not read tab "${tab}" from either Google Sheets URL.`, lastError)
-
-    throw lastError instanceof Error
-        ? lastError
-        : new Error(`Could not read Google Sheet tab "${tab}".`)
 }
 
 function normalizeId(value: unknown): string {
@@ -355,15 +347,30 @@ function isGroupHeader(header: string): boolean {
 }
 
 export async function getEditionData(): Promise<EditionData> {
-    const rows = await fetchSheet(INDEX_SHEET_ID, 'index')
+    console.log(`[INDEX] Reading spreadsheet ${INDEX_SHEET_ID}, tab "${INDEX_SHEET_TAB}".`)
+
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
     if (rows.length < 2) {
-        throw new Error('The index tab must contain a header row and at least one edition row.')
+        throw new Error(`The "${INDEX_SHEET_TAB}" tab must contain a header row and at least one edition row.`)
     }
 
-    // Row 1 contains the headers (A1 = Index). Row 2 onward contains editions.
     const headers = rows[0]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
+
+    if (normalizeId(headers[0]).toLowerCase() !== 'index') {
+        throw new Error(
+            `[INDEX] Wrong tab data received. Expected cell A1 to be "Index" from the "${INDEX_SHEET_TAB}" tab, received "${headers[0] ?? ''}". Refusing to load another tab.`,
+        )
+    }
+
+    if (!normalized.includes('G1') || !normalized.includes('F1')) {
+        throw new Error(
+            `[INDEX] The "${INDEX_SHEET_TAB}" tab has an unexpected header row. Expected G1 and F1 columns.`,
+        )
+    }
+
+    console.log(`[INDEX] Verified tab "${INDEX_SHEET_TAB}". A1="${headers[0]}". Headers:`, headers)
 
     let activeRow: string[] | null = null
 
@@ -377,13 +384,13 @@ export async function getEditionData(): Promise<EditionData> {
     }
 
     if (!activeRow) {
-        throw new Error('No edition was found in column A of the index tab.')
+        throw new Error(`No edition was found in column A of the "${INDEX_SHEET_TAB}" tab.`)
     }
 
     const edition = normalizeId(activeRow[0])
 
     if (!edition) {
-        throw new Error('The current edition name in column A of the index tab is empty.')
+        throw new Error(`The current edition name in column A of the "${INDEX_SHEET_TAB}" tab is empty.`)
     }
 
     const groupStage: SheetChart[] = []
@@ -449,7 +456,7 @@ export async function getEditionData(): Promise<EditionData> {
         divisions,
     }
 
-    console.log('[INDEX] Current edition:', edition)
+    console.log(`[INDEX] Current edition from "${INDEX_SHEET_TAB}"!A${rows.indexOf(activeRow) + 1}:`, edition)
     console.log('[INDEX] Group Stage songs:', groupStage.length, groupStage)
     console.log('[INDEX] Final songs:', final.length, final)
     console.log('[INDEX] Divisions:', divisions)
