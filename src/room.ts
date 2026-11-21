@@ -933,18 +933,23 @@ export class Room extends DurableObject<Env> {
         }
 
         if (
-            cur === 'selecting' &&
-            next === 'preparing' &&
-            s.level
-        ) {
-            s.status = 'preparing'
-            waitAll()
+    cur === 'selecting' &&
+    next === 'preparing' &&
+    s.level
+) {
+    s.status = 'preparing'
+    waitAll()
 
-            this.sendAll({
-                type: 'updateStatus',
-                status: 'preparing',
-            })
-        } else if (
+    this.sendExcept(uid, {
+        type: 'updateLevel',
+        level: s.level,
+    })
+
+    this.sendAll({
+        type: 'updateStatus',
+        status: 'preparing',
+    })
+} else if (
             cur === 'preparing' &&
             next === 'selecting'
         ) {
