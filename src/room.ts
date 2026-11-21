@@ -1,4 +1,3 @@
-
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
@@ -669,7 +668,6 @@ export class Room extends DurableObject<Env> {
             webSocket: client,
         })
     }
-
     async webSocketMessage(
         ws: WebSocket,
         raw: string | ArrayBuffer,
@@ -1211,7 +1209,6 @@ export class Room extends DurableObject<Env> {
         this.pushScoreboard()
         return true
     }
-
     private async changeStatus(
         uid: string,
         next: RoomStatus,
@@ -1609,6 +1606,39 @@ export class Room extends DurableObject<Env> {
         if (!member) return
 
         if (retain) {
+            // A player who disconnects after gameplay started receives X.
+            // The server cannot inspect the client's remaining note chart,
+            // so an active gameplay disconnect is treated as an incomplete run.
+            if (
+                state.status === 'playing' &&
+                state.statuses[uid] === 'playing' &&
+                !state.results[uid]
+            ) {
+                const result: GameplayResult = {
+                    grade: 'X',
+                    arcadeScore: 0,
+                    accuracyScore: 0,
+                    combo: 0,
+                    perfect: 0,
+                    great: 0,
+                    good: 0,
+                    miss: 0,
+                    totalCount: 0,
+                }
+
+                state.results[uid] = result
+
+                if (announce) {
+                    this.sendAll({
+                        type: 'addResult',
+                        result: {
+                            userId: uid,
+                            result,
+                        },
+                    })
+                }
+            }
+
             state.statuses[uid] = 'waiting'
 
             if (announce) {
