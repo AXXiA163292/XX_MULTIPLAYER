@@ -25,6 +25,9 @@ export function compareResults(a: GameplayResult, b: GameplayResult, mode: Scori
 
 export type RoundRecord = {
     level: { address: string; name: string } | null
+    levelTitle?: string
+    levelTag?: string
+    levelRating?: number
     results: Record<string, GameplayResult>
 }
 
