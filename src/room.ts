@@ -1090,9 +1090,10 @@ export class Room extends DurableObject<Env> {
         )
 
         const canSeeLevel =
-            isHost ||
-            s.settings.type === 'casualRoom' ||
-            s.status === 'playing'
+    isHost ||
+    s.settings.type === 'casualRoom' ||
+    s.status === 'preparing' ||
+    s.status === 'playing'
 
         return {
             type: 'update',
