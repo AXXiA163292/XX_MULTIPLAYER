@@ -973,12 +973,15 @@ export class Room extends DurableObject<Env> {
             next === 'playing'
         ) {
             if (
-                !s.members.some(
-                    (m) =>
-                        m.id !== s.hostId &&
-                        s.statuses[m.id] === 'ready',
-                ) &&
-                s.statuses[s.hostId] !== 'ready'
+                !s.level ||
+                (
+                    !s.members.some(
+                        (m) =>
+                            m.id !== s.hostId &&
+                            s.statuses[m.id] === 'ready',
+                    ) &&
+                    s.statuses[s.hostId] !== 'ready'
+                )
             ) {
                 return this.resync(uid)
             }
@@ -993,17 +996,6 @@ export class Room extends DurableObject<Env> {
             for (const m of s.members) {
                 if (s.statuses[m.id] === 'skipped') {
                     s.statuses[m.id] = 'waiting'
-                }
-            }
-
-            if (s.settings.type !== 'casualRoom' && s.level) {
-                for (const member of s.members) {
-                    if (member.id !== s.hostId) {
-                        this.sendTo(member.id, {
-                            type: 'updateLevel',
-                            level: s.level,
-                        })
-                    }
                 }
             }
 
