@@ -1,27 +1,55 @@
+
 # AXX!A Sonolus multiplayer server
 
-Round multiplayer server for Sonolus, built from the public spec
-(https://wiki.sonolus.com/round-multiplayer-server-specs) on Cloudflare Workers + Durable Objects (free plan OK).
+Round multiplayer server for Sonolus, built from the public spec:
+https://wiki.sonolus.com/round-multiplayer-server-specs
 
-## Deploy (free)
+Built with Cloudflare Workers and Durable Objects.
+
+## Deploy
+
+1. Install dependencies.
+2. Log in to Cloudflare.
+3. Set the SESSION_SECRET.
+4. Deploy the Worker.
+
+Commands:
+
     npm install
     npx wrangler login
-    npx wrangler secret put SESSION_SECRET     # paste any long random string
+    npx wrangler secret put SESSION_SECRET
     npx wrangler deploy
 
-Then in Sonolus: Servers -> Add -> https://axxia-multiplayer.<your-subdomain>.workers.dev, sign in, open Rooms.
+## Sonolus
+
+Add the server in Sonolus:
+
+Servers -> Add -> Your Worker URL
+
+Sign in and open Rooms.
 
 ## What's customised
-- Only handle 163292 (HOST_HANDLE in wrangler.jsonc) can create rooms. Checked from the Sonolus-signed profile, at create and at join.
-- Room types: Group Stage / Final, same settings. Only setting: Round scoring = Ranked Match | PP.
-- Tiebreakers fixed: most perfects, then highest combo. No random, no auto exit, no level options.
-- Host is always room master + lead. Nobody can change them. Only the host picks the level, starts rounds, kicks.
-- Players can't suggest levels and can't skip. Suggestions / scoreboard / results are only sent to the host.
-- Scoreboard (host only): Total on top, then each round with ranked score first, then P/Gr/Gd/M and combo.
+
+- Only handle 163292 can create rooms.
+- Room types: Group Stage and Final.
+- Group Stage rooms use the Group field.
+- Final rooms use the server description followed by Final.
+- Default scoring is Ranked Match.
+- Ranked Match scoring: Perfect ×3, Great ×2, Good ×1.
+- Tiebreakers: most Perfects, then highest combo.
+- Settings can only be changed before the first round.
+- Host is always room master and lead.
+- Only the host can select levels, start rounds and kick players.
+- Players cannot suggest levels or skip.
+- Suggestions, scoreboard and results are host-only.
+- No random level selection.
+- Auto Exit is disabled.
 
 ## Where to change things
-- src/config.ts   points per judgment, names, TTLs
-- src/scoring.ts  PP formula (ppScore), tiebreakers
-- src/room.ts     all room rules
-- test/e2e.mjs    local test: npx wrangler dev --var DEV_SKIP_SIGNATURE:1 --var SESSION_SECRET:test, then node test/e2e.mjs
-  (DEV_SKIP_SIGNATURE disables signature checks. Never set it when deployed.)
+
+- src/config.ts: scoring points, names and room timeouts.
+- src/forms.ts: room creation forms and defaults.
+- src/scoring.ts: PP formula and tiebreakers.
+- src/room.ts: room rules and multiplayer behavior.
+- src/index.ts: Sonolus API endpoints.
+- src/lobby.ts: room and post storage.
