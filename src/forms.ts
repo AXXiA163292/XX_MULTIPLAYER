@@ -1,4 +1,3 @@
-
 import { DEFAULT_SCORING, DEFAULT_TYPE, ROOM_TYPES, SCORING_MODES, type RoomType, type ScoringMode } from './config.ts'
 
 const scoringOption = {
@@ -32,6 +31,14 @@ const titleOption = {
     placeholder: 'Custom Room',
     limit: 48,
     shortcuts: [],
+}
+
+export const closeRoomForm = {
+    type: 'closeRoom',
+    title: 'Close Room',
+    icon: 'delete',
+    requireConfirmation: true,
+    options: [],
 }
 
 export const roomForms = (isTournamentHost = false) =>
