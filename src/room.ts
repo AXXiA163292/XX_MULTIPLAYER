@@ -84,7 +84,7 @@ const fresh = (): RoomState => ({
     hostName: '',
     settings: {
         type: 'groupStage',
-        scoring: 'rankedMatch',
+        scoring: 'pp',
         group: 'A',
     },
     status: 'selecting',
