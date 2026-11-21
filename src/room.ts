@@ -1,3 +1,4 @@
+
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
@@ -555,27 +556,27 @@ export class Room extends DurableObject<Env> {
 
         switch (cmd.type) {
             case 'updateLevel': {
-    if (!isHost || s.status !== 'selecting' || !isSil(cmd.level)) {
-        return this.resync(uid)
-    }
+                if (!isHost || s.status !== 'selecting' || !isSil(cmd.level)) {
+                    return this.resync(uid)
+                }
 
-    s.level = {
-        address: cmd.level.address,
-        name: cmd.level.name,
-    }
-    s.levelInfo = null
+                s.level = {
+                    address: cmd.level.address,
+                    name: cmd.level.name,
+                }
+                s.levelInfo = null
 
-    this.sendHost({
-        type: 'updateLevel',
-        level: s.level,
-    })
+                this.sendHost({
+                    type: 'updateLevel',
+                    level: s.level,
+                })
 
-    this.pushScoreboard()
+                this.pushScoreboard()
 
-    s.levelInfo = await fetchLevelInfo(s.level)
-    this.pushScoreboard()
-    return
-}
+                s.levelInfo = await fetchLevelInfo(s.level)
+                this.pushScoreboard()
+                return
+            }
 
             case 'updateOptionValues': {
                 const next =
@@ -933,23 +934,23 @@ export class Room extends DurableObject<Env> {
         }
 
         if (
-    cur === 'selecting' &&
-    next === 'preparing' &&
-    s.level
-) {
-    s.status = 'preparing'
-    waitAll()
+            cur === 'selecting' &&
+            next === 'preparing' &&
+            s.level
+        ) {
+            s.status = 'preparing'
+            waitAll()
 
-    this.sendExcept(uid, {
-        type: 'updateLevel',
-        level: s.level,
-    })
+            this.sendExcept(uid, {
+                type: 'updateLevel',
+                level: s.level,
+            })
 
-    this.sendAll({
-        type: 'updateStatus',
-        status: 'preparing',
-    })
-} else if (
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'preparing',
+            })
+        } else if (
             cur === 'preparing' &&
             next === 'selecting'
         ) {
@@ -962,14 +963,10 @@ export class Room extends DurableObject<Env> {
             })
 
             if (s.settings.type !== 'casualRoom') {
-                for (const member of s.members) {
-                    if (member.id !== s.hostId) {
-                        this.sendTo(member.id, {
-                            type: 'updateLevel',
-                            level: null,
-                        })
-                    }
-                }
+                this.sendExcept(uid, {
+                    type: 'updateLevel',
+                    level: null,
+                })
             }
         } else if (
             cur === 'preparing' &&
@@ -999,11 +996,6 @@ export class Room extends DurableObject<Env> {
                 }
             }
 
-            this.sendAll({
-                type: 'updateStatus',
-                status: 'playing',
-            })
-
             if (s.settings.type !== 'casualRoom' && s.level) {
                 for (const member of s.members) {
                     if (member.id !== s.hostId) {
@@ -1014,6 +1006,11 @@ export class Room extends DurableObject<Env> {
                     }
                 }
             }
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'playing',
+            })
 
             const start = {
                 type: 'startRound',
@@ -1046,33 +1043,13 @@ export class Room extends DurableObject<Env> {
                 status: 'selecting',
             })
 
-            if (s.settings.type !== 'casualRoom' && s.level) {
-    for (const member of s.members) {
-        if (member.id !== s.hostId) {
-            this.sendTo(member.id, {
-                type: 'updateLevel',
-                level: s.level,
-            })
-        }
-    }
-}
-
-this.sendAll({
-    type: 'updateStatus',
-    status: 'playing',
-})
-
-const start = {
-    type: 'startRound',
-    state: s.round.state,
-    seed: s.round.seed,
-}
-
-for (const m of s.members) {
-    if (s.statuses[m.id] === 'ready') {
-        this.sendTo(m.id, start)
-    }
-} else {
+            if (s.settings.type !== 'casualRoom') {
+                this.sendExcept(uid, {
+                    type: 'updateLevel',
+                    level: null,
+                })
+            }
+        } else {
             return this.resync(uid)
         }
     }
@@ -1109,10 +1086,10 @@ for (const m of s.members) {
         )
 
         const canSeeLevel =
-    isHost ||
-    s.settings.type === 'casualRoom' ||
-    s.status === 'preparing' ||
-    s.status === 'playing'
+            isHost ||
+            s.settings.type === 'casualRoom' ||
+            s.status === 'preparing' ||
+            s.status === 'playing'
 
         return {
             type: 'update',
