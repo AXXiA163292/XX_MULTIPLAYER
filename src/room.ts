@@ -5,14 +5,12 @@ import {
     RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
     SERVER_DESCRIPTION,
-} from './config.ts'
-import {
     ACTIVE_EDITION,
     EDITIONS,
     GROUP_ORDER,
     getChartConstant,
     getDivision,
-} from './songpool.ts'
+} from './config.ts'
 import {
     parseSettings,
     roomForms,
