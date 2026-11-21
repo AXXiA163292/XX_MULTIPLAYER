@@ -3,7 +3,10 @@ const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
 const CACHE_MS = 30_000
 
-type Row = Record<string, string>
+type Row = {
+    id: string
+    input: string
+}
 
 export type SheetChart = {
     id: string
@@ -71,27 +74,38 @@ async function fetchSheet(
     id: string,
     tab: string,
 ): Promise<string[][]> {
-    const url = new URL(`https://docs.google.com/spreadsheets/d/${id}/export`)
-    url.searchParams.set('format', 'csv')
+    const url = new URL(
+        `https://docs.google.com/spreadsheets/d/${id}/gviz/tq`,
+    )
+
+    url.searchParams.set('tqx', 'out:csv')
     url.searchParams.set('sheet', tab)
 
     const response = await fetch(url.toString(), {
-        headers: { Accept: 'text/csv,text/plain,*/*' },
+        headers: {
+            Accept: 'text/csv,text/plain,*/*',
+        },
         signal: AbortSignal.timeout(12_000),
     })
 
     if (!response.ok) {
-        throw new Error(`Google Sheets returned HTTP ${response.status} for tab "${tab}".`)
+        throw new Error(
+            `Google Sheets returned HTTP ${response.status} for "${tab}".`,
+        )
     }
 
     const content = await response.text()
+    const trimmed = content.trimStart()
 
     if (
-        !content.trim() ||
-        content.trimStart().startsWith('<!DOCTYPE') ||
-        content.trimStart().startsWith('<html')
+        !trimmed ||
+        trimmed.startsWith('<!DOCTYPE') ||
+        trimmed.startsWith('<html') ||
+        trimmed.startsWith('google.visualization')
     ) {
-        throw new Error(`Could not read the "${tab}" sheet. Check its tab name and public access.`)
+        throw new Error(
+            `Could not read the "${tab}" tab as CSV.`,
+        )
     }
 
     return parseCSV(content)
@@ -106,6 +120,7 @@ async function customRows(): Promise<Row[]> {
 
     customPending = (async () => {
         const values = await fetchSheet(CUSTOM_SHEET_ID, 'custom')
+
         if (!values.length) return []
 
         const headers = values[0]!.map((x) => x.trim().toLowerCase())
@@ -113,7 +128,9 @@ async function customRows(): Promise<Row[]> {
         const inputIndex = headers.indexOf('input')
 
         if (idIndex < 0 || inputIndex < 0) {
-            throw new Error('The custom tab must contain columns named id and input.')
+            throw new Error(
+                'The custom tab needs columns named id and input.',
+            )
         }
 
         const rows = values.slice(1).map((cells) => ({
@@ -121,7 +138,11 @@ async function customRows(): Promise<Row[]> {
             input: (cells[inputIndex] ?? '').trim(),
         }))
 
-        customCache = { time: Date.now(), rows }
+        customCache = {
+            time: Date.now(),
+            rows,
+        }
+
         return rows
     })()
 
@@ -141,7 +162,12 @@ async function indexRows(): Promise<string[][]> {
 
     indexPending = (async () => {
         const rows = await fetchSheet(INDEX_SHEET_ID, 'index')
-        indexCache = { time: Date.now(), rows }
+
+        indexCache = {
+            time: Date.now(),
+            rows,
+        }
+
         return rows
     })()
 
@@ -152,9 +178,13 @@ async function indexRows(): Promise<string[][]> {
     }
 }
 
-function chartFromUrl(id: string, rawUrl: string): SheetChart | null {
+function chartFromUrl(
+    id: string,
+    rawUrl: string,
+): SheetChart | null {
     try {
         const url = new URL(rawUrl)
+
         if (url.protocol !== 'https:') return null
 
         const match = url.pathname.match(/\/levels\/([^/]+)\/?$/)
@@ -171,7 +201,10 @@ function chartFromUrl(id: string, rawUrl: string): SheetChart | null {
     }
 }
 
-function compareIdDescending(a: SheetChart, b: SheetChart): number {
+function compareIdDescending(
+    a: SheetChart,
+    b: SheetChart,
+): number {
     return b.id.localeCompare(a.id, undefined, {
         numeric: true,
         sensitivity: 'base',
@@ -190,6 +223,7 @@ export async function getCustomLevels(): Promise<SheetChart[]> {
 
 export async function getPlaylists(): Promise<PlaylistData[]> {
     const rows = await customRows()
+
     const charts = rows
         .filter((row) => /^(X|D)/i.test(row.id))
         .map((row) => chartFromUrl(row.id, row.input))
@@ -224,10 +258,19 @@ export async function getPlaylists(): Promise<PlaylistData[]> {
         .sort((a, b) => {
             const aD = a.name.match(/^SUDU (\d+)$/)
             const bD = b.name.match(/^SUDU (\d+)$/)
-            if (aD && bD) return Number(aD[1]) - Number(bD[1])
+
+            if (aD && bD) {
+                return Number(aD[1]) - Number(bD[1])
+            }
+
             if (aD) return -1
             if (bD) return 1
-            return a.name.localeCompare(b.name, undefined, { numeric: true })
+
+            return a.name.localeCompare(
+                b.name,
+                undefined,
+                { numeric: true },
+            )
         })
 }
 
@@ -235,13 +278,14 @@ export async function getEditionData(): Promise<EditionData> {
     const rows = await indexRows()
 
     if (rows.length < 3) {
-        throw new Error('The index tab needs headers on row 2 and edition data below.')
+        throw new Error(
+            'The index tab needs headers on row 2 and edition data below.',
+        )
     }
 
     const headers = rows[1]!.map((x) => x.trim())
     const dataRows = rows.slice(2)
 
-    // The active edition is the last non-empty value in column A.
     let activeRow: string[] | null = null
 
     for (let i = dataRows.length - 1; i >= 0; i--) {
@@ -252,7 +296,9 @@ export async function getEditionData(): Promise<EditionData> {
     }
 
     if (!activeRow) {
-        throw new Error('No current edition was found in column A of the index tab.')
+        throw new Error(
+            'No current edition was found in column A of the index tab.',
+        )
     }
 
     const edition = (activeRow[0] ?? '').trim()
@@ -277,18 +323,20 @@ export async function getEditionData(): Promise<EditionData> {
         const chart = chartFromUrl(id, rawUrl)
         if (!chart) continue
 
-        if (groupMatch) groupStage.push(chart)
-        else final.push(chart)
+        if (groupMatch) {
+            groupStage.push(chart)
+        } else {
+            final.push(chart)
+        }
     }
+
+    const sortByNumber = (a: SheetChart, b: SheetChart) =>
+        Number(a.id.slice(1)) - Number(b.id.slice(1))
 
     return {
         edition,
-        groupStage: groupStage.sort((a, b) =>
-            Number(a.id.slice(1)) - Number(b.id.slice(1)),
-        ),
-        final: final.sort((a, b) =>
-            Number(a.id.slice(1)) - Number(b.id.slice(1)),
-        ),
+        groupStage: groupStage.sort(sortByNumber),
+        final: final.sort(sortByNumber),
     }
 }
 
