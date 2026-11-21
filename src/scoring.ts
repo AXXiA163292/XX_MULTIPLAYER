@@ -1,53 +1,135 @@
+
 import { RANKED_POINTS, type ScoringMode } from './config.ts'
+import { calculatePP, formatPP, roundPP } from './pp.ts'
 import type { GameplayResult } from './types.ts'
 
-export const rankedScore = (r: GameplayResult): number =>
-    r.perfect * RANKED_POINTS.perfect + r.great * RANKED_POINTS.great + r.good * RANKED_POINTS.good
-
-/**
- * PP is not defined yet. Plug the formula in here when it exists.
- * Until then every result is worth 0 PP and ties fall through to the tiebreakers.
- */
-export const PP_CONFIGURED = false
-export const ppScore = (_r: GameplayResult): number => 0
-
-export const roundScore = (r: GameplayResult, mode: ScoringMode): number =>
-    mode === 'pp' ? ppScore(r) : rankedScore(r)
-
-/** Tiebreakers are fixed: 1) more perfects, 2) higher combo. Highest first. */
-export function compareResults(a: GameplayResult, b: GameplayResult, mode: ScoringMode): number {
-    return (
-        roundScore(b, mode) - roundScore(a, mode) ||
-        b.perfect - a.perfect ||
-        b.combo - a.combo
-    )
-}
+export const PP_CONFIGURED = true
 
 export type RoundRecord = {
     level: { address: string; name: string } | null
     levelTitle?: string
     levelTag?: string
     levelRating?: number
+    levelConstant?: number
+    noteCount?: number
+    difficulty?: string
     results: Record<string, GameplayResult>
 }
 
-export type Total = { userId: string; score: number; perfect: number; bestCombo: number }
-
-export function totals(history: RoundRecord[], mode: ScoringMode): Total[] {
-    const map = new Map<string, Total>()
-    for (const round of history) {
-        for (const [userId, r] of Object.entries(round.results)) {
-            const t = map.get(userId) ?? { userId, score: 0, perfect: 0, bestCombo: 0 }
-            t.score += roundScore(r, mode)
-            t.perfect += r.perfect
-            t.bestCombo = Math.max(t.bestCombo, r.combo)
-            map.set(userId, t)
-        }
-    }
-    return [...map.values()].sort((a, b) => b.score - a.score || b.perfect - a.perfect || b.bestCombo - a.bestCombo)
+export type Total = {
+    userId: string
+    score: number
+    perfect: number
+    bestCombo: number
 }
 
-export const fmtScore = (n: number, mode: ScoringMode) => (mode === 'pp' ? `${n.toFixed(2)} pp` : `${n} pts`)
+export const rankedScore = (r: GameplayResult): number =>
+    r.perfect * RANKED_POINTS.perfect +
+    r.great * RANKED_POINTS.great +
+    r.good * RANKED_POINTS.good
 
-export const fmtDetail = (r: GameplayResult, mode: ScoringMode) =>
-    `${fmtScore(roundScore(r, mode), mode)} | P ${r.perfect} · Gr ${r.great} · Gd ${r.good} · M ${r.miss} | ${r.combo}x`
+export function ppScore(
+    r: GameplayResult,
+    round?: RoundRecord,
+): number {
+    if (!round) return 0
+
+    const rating = round.levelConstant ?? round.levelRating
+    const noteCount = round.noteCount
+
+    if (!rating || !noteCount) return 0
+
+    const bad = Math.max(
+        0,
+        noteCount - r.perfect - r.great - r.good - r.miss,
+    )
+
+    return calculatePP({
+        rating,
+        noteCount,
+        perfect: r.perfect,
+        great: r.great,
+        good: r.good,
+        bad,
+        miss: r.miss,
+        combo: r.combo,
+        difficulty: round.difficulty ?? round.levelTag ?? 'MASTER',
+    }).pp
+}
+
+export const roundScore = (
+    r: GameplayResult,
+    mode: ScoringMode,
+    round?: RoundRecord,
+): number =>
+    mode === 'pp'
+        ? ppScore(r, round)
+        : rankedScore(r)
+
+export function compareResults(
+    a: GameplayResult,
+    b: GameplayResult,
+    mode: ScoringMode,
+    round?: RoundRecord,
+): number {
+    return (
+        roundScore(b, mode, round) -
+        roundScore(a, mode, round) ||
+        b.perfect - a.perfect ||
+        b.combo - a.combo
+    )
+}
+
+export function totals(
+    history: RoundRecord[],
+    mode: ScoringMode,
+): Total[] {
+    const map = new Map<string, Total>()
+
+    for (const round of history) {
+        for (const [userId, result] of Object.entries(round.results)) {
+            const total = map.get(userId) ?? {
+                userId,
+                score: 0,
+                perfect: 0,
+                bestCombo: 0,
+            }
+
+            total.score += mode === 'pp'
+                ? roundPP(ppScore(result, round))
+                : rankedScore(result)
+
+            total.perfect += result.perfect
+            total.bestCombo = Math.max(total.bestCombo, result.combo)
+
+            map.set(userId, total)
+        }
+    }
+
+    return [...map.values()].sort(
+        (a, b) =>
+            b.score - a.score ||
+            b.perfect - a.perfect ||
+            b.bestCombo - a.bestCombo,
+    )
+}
+
+export const fmtScore = (
+    n: number,
+    mode: ScoringMode,
+) =>
+    mode === 'pp'
+        ? formatPP(n)
+        : `${n} pts`
+
+export function fmtDetail(
+    result: GameplayResult,
+    mode: ScoringMode,
+    round?: RoundRecord,
+): string {
+    const score = roundScore(result, mode, round)
+
+    return mode === 'pp'
+        ? `${formatPP(score)} | P ${result.perfect} · Gr ${result.great} · Gd ${result.good} · M ${result.miss} | ${result.combo}x`
+        : `${fmtScore(score, mode)} | P ${result.perfect} · Gr ${result.great} · Gd ${result.good} · M ${result.miss} | ${result.combo}x`
+}
