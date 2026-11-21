@@ -1,6 +1,6 @@
 
 import { RANKED_POINTS, type ScoringMode } from './config.ts'
-import { calculatePP, formatPP, roundPP } from './pp.ts'
+import { calculatePP, formatPP, roundPP, PP_SETTINGS } from './pp.ts'
 import type { GameplayResult } from './types.ts'
 
 export const PP_CONFIGURED = true
@@ -131,9 +131,13 @@ export function fmtDetail(
         ? 'AP'
         : result.grade === 'fullCombo'
             ? 'FC'
-            : result.grade === 'pass'
-                ? 'CLEAR'
-                : 'FAIL'
+            : mode === 'pp'
+                ? result.miss > PP_SETTINGS.skill.failedMissThreshold
+                    ? 'F'
+                    : 'P'
+                : result.grade === 'pass'
+                    ? 'P'
+                    : 'F'
 
     const formattedScore = mode === 'pp'
         ? formatPP(score)
