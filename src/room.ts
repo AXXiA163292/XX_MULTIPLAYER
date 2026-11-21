@@ -1,4 +1,3 @@
-
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
@@ -406,7 +405,7 @@ export class Room extends DurableObject<Env> {
         return {
             name: this.st.name,
             title: getRoomTitle(this.st.settings),
-            subtitle: SCORING_MODES[this.st.settings.scoring],
+            subtitle: '',
             master: this.st.hostName,
         }
     }
