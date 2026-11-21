@@ -109,12 +109,22 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
             return parsed
         } catch (error) {
             lastError = error
+            console.warn(`Could not read Google Sheet tab "${tab}" from endpoint:`, error)
         }
     }
 
     throw lastError instanceof Error
         ? lastError
         : new Error(`Could not read Google Sheet tab "${tab}".`)
+}
+
+function normalizeId(value: unknown): string {
+    return String(value ?? '')
+        .replace(/^\uFEFF/, '')
+        .replace(/[\u200B-\u200D\u2060]/g, '')
+        .trim()
+        .replace(/^'/, '')
+        .trim()
 }
 
 function chartFromUrl(id: string, rawInput: string): SheetChart | null {
@@ -133,19 +143,23 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
         const url = new URL(candidate)
 
         if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+            console.warn(`Invalid protocol for chart ${id}:`, raw)
             return null
         }
 
         const match = url.pathname.match(/\/levels\/([^/]+)\/?$/i)
 
         if (!match) {
-            console.warn('Sheet level URL has no /levels/{name} path:', id, raw)
+            console.warn(`Chart ${id} has no valid /levels/{name} URL:`, raw)
             return null
         }
 
         const name = decodeURIComponent(match[1]!)
 
-        if (!name) return null
+        if (!name) {
+            console.warn(`Chart ${id} has an empty level name:`, raw)
+            return null
+        }
 
         return {
             id,
@@ -154,7 +168,7 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
             name,
         }
     } catch (error) {
-        console.warn('Invalid level URL in sheet:', id, raw, error)
+        console.warn(`Invalid level URL for chart ${id}:`, raw, error)
         return null
     }
 }
@@ -170,7 +184,7 @@ async function customRows(): Promise<Row[]> {
     const values = await fetchSheet(CUSTOM_SHEET_ID, 'custom')
 
     const headerIndex = values.findIndex((row) => {
-        const headers = row.map((cell) => cell.trim().toLowerCase())
+        const headers = row.map((cell) => normalizeId(cell).toLowerCase())
         return headers.includes('id') && headers.includes('input')
     })
 
@@ -178,46 +192,90 @@ async function customRows(): Promise<Row[]> {
         throw new Error('The custom tab must contain headers named id and input.')
     }
 
-    const headers = values[headerIndex]!.map((cell) => cell.trim().toLowerCase())
+    const headers = values[headerIndex]!.map((cell) =>
+        normalizeId(cell).toLowerCase(),
+    )
+
     const idIndex = headers.indexOf('id')
     const inputIndex = headers.indexOf('input')
 
-    return values.slice(headerIndex + 1).map((cells) => ({
-        id: (cells[idIndex] ?? '').trim(),
-        input: (cells[inputIndex] ?? '').trim(),
-    })).filter((row) => row.id && row.input)
+    const result = values
+        .slice(headerIndex + 1)
+        .map((cells) => ({
+            id: normalizeId(cells[idIndex]),
+            input: String(cells[inputIndex] ?? '').trim(),
+        }))
+        .filter((row) => row.id && row.input)
+
+    console.log(
+        `[Sheets] Read ${result.length} usable rows from custom tab.`,
+        `First IDs: ${result.slice(0, 10).map((row) => row.id).join(', ')}`,
+    )
+
+    return result
+}
+
+function isCustomLevelId(id: string): boolean {
+    const normalized = normalizeId(id).toUpperCase()
+    return normalized.startsWith('60') || normalized.startsWith('X')
 }
 
 export async function getCustomLevels(): Promise<SheetChart[]> {
     const rows = await customRows()
 
-    return rows
-        .filter((row) => /^(60|X)/i.test(row.id))
+    const matchingRows = rows.filter((row) => isCustomLevelId(row.id))
+
+    const charts = matchingRows
         .map((row) => chartFromUrl(row.id, row.input))
         .filter((chart): chart is SheetChart => chart !== null)
         .sort(compareIdDescending)
+
+    console.log(
+        `[Sheets] Custom levels: ${charts.length} valid charts from ${matchingRows.length} matching IDs.`,
+        `IDs: ${charts.map((chart) => chart.id).join(', ')}`,
+    )
+
+    return charts
+}
+
+function suduPlaylistName(id: string): string | null {
+    const match = normalizeId(id).toUpperCase().match(/^D(\d{2})/)
+
+    if (!match) return null
+
+    const editionNumber = Number(match[1])
+
+    if (!Number.isFinite(editionNumber)) return null
+
+    return `SUDU-${String(editionNumber).padStart(3, '0')}`
 }
 
 export async function getPlaylists(): Promise<PlaylistData[]> {
     const rows = await customRows()
 
     const charts = rows
-        .filter((row) => /^(X|D)/i.test(row.id))
+        .filter((row) => {
+            const id = normalizeId(row.id).toUpperCase()
+            return id.startsWith('X') || id.startsWith('D')
+        })
         .map((row) => chartFromUrl(row.id, row.input))
         .filter((chart): chart is SheetChart => chart !== null)
 
     const groups = new Map<string, SheetChart[]>()
 
     for (const chart of charts) {
-        const dMatch = chart.id.match(/^D(\d+)/i)
-        const xMatch = chart.id.match(/^X(\d+)/i)
+        const id = normalizeId(chart.id).toUpperCase()
 
         let title: string | null = null
 
-        if (dMatch) {
-            title = `SUDU ${dMatch[1]}`
-        } else if (xMatch) {
-            title = `XX! Championship 20${xMatch[1]}`
+        if (id.startsWith('D')) {
+            title = suduPlaylistName(id)
+        } else {
+            const xMatch = id.match(/^X(\d+)/)
+
+            if (xMatch) {
+                title = `XX! Championship 20${xMatch[1]}`
+            }
         }
 
         if (!title) continue
@@ -227,23 +285,33 @@ export async function getPlaylists(): Promise<PlaylistData[]> {
         groups.set(title, list)
     }
 
-    return [...groups.entries()]
+    const playlists = [...groups.entries()]
         .map(([name, items]) => ({
             name,
             charts: items.sort(compareIdDescending),
         }))
         .sort((a, b) => {
-            const aD = a.name.match(/^SUDU (\d+)$/)
-            const bD = b.name.match(/^SUDU (\d+)$/)
+            const aSudu = a.name.match(/^SUDU-(\d+)$/)
+            const bSudu = b.name.match(/^SUDU-(\d+)$/)
 
-            if (aD && bD) return Number(aD[1]) - Number(bD[1])
-            if (aD) return -1
-            if (bD) return 1
+            if (aSudu && bSudu) {
+                return Number(aSudu[1]) - Number(bSudu[1])
+            }
+
+            if (aSudu) return -1
+            if (bSudu) return 1
 
             return a.name.localeCompare(b.name, undefined, {
                 numeric: true,
             })
         })
+
+    console.log(
+        `[Sheets] Playlists: ${playlists.length}.`,
+        playlists.map((playlist) => `${playlist.name} (${playlist.charts.length})`).join(', '),
+    )
+
+    return playlists
 }
 
 function splitHandles(value: string): string[] {
