@@ -1,4 +1,4 @@
-# AXX! Sonolus multiplayer server
+# AXX!A Sonolus multiplayer server
 
 Round multiplayer server for Sonolus, built from the public spec
 (https://wiki.sonolus.com/round-multiplayer-server-specs) on Cloudflare Workers + Durable Objects (free plan OK).
