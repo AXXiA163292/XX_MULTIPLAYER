@@ -1,3 +1,4 @@
+
 import { DEFAULT_SCORING, DEFAULT_TYPE, ROOM_TYPES, SCORING_MODES, type RoomType, type ScoringMode } from './config.ts'
 
 const scoringOption = {
@@ -24,7 +25,7 @@ const groupOption = {
 const titleOption = {
     query: 'title',
     name: 'Room title',
-    description: 'Choose a name for your Casual Room.',
+    description: 'Choose a name for your Custom Room.',
     required: false,
     type: 'text' as const,
     def: '',
