@@ -14,6 +14,7 @@ const json = (data: unknown, status = 200) =>
         headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-store',
         },
     })
 
@@ -44,16 +45,22 @@ async function verifySigned(
         body.address.replace(/\/+$/, '') !== addressOf(req, env)
     ) return null
 
-    if (typeof body.time !== 'number' || body.time + 60_000 < Date.now())
+    if (typeof body.time !== 'number' || body.time + 60_000 < Date.now()) {
         return null
+    }
 
     const p = body.userProfile
-    if (typeof p?.id !== 'string' || typeof p?.handle !== 'string')
+
+    if (typeof p?.id !== 'string' || typeof p?.handle !== 'string') {
         return null
+    }
 
     if (!env.DEV_SKIP_SIGNATURE) {
         const sig = req.headers.get('Sonolus-Signature')
-        if (!sig || !(await verifySonolusSignature(raw, sig))) return null
+
+        if (!sig || !(await verifySonolusSignature(raw, sig))) {
+            return null
+        }
     }
 
     return body
@@ -69,8 +76,8 @@ async function sessionOf(
     req: Request,
     env: Env,
 ): Promise<AuthSession | null> {
-    const t = req.headers.get('Sonolus-Session')
-    return t ? verifyToken<AuthSession>(env.SESSION_SECRET, t) : null
+    const token = req.headers.get('Sonolus-Session')
+    return token ? verifyToken<AuthSession>(env.SESSION_SECRET, token) : null
 }
 
 const roomStub = (env: Env, name: string) =>
@@ -90,57 +97,142 @@ async function roomItems(env: Env) {
     )
 }
 
-const postForm = {
-    type: 'post',
-    title: 'Create announcement',
-    requireConfirmation: false,
-    options: [
-        {
-            query: 'title',
-            name: 'Title',
-            required: true,
-            type: 'text',
-            def: '',
-            placeholder: 'Announcement title',
-            limit: 100,
-            shortcuts: [],
-        },
-        {
-            query: 'description',
-            name: 'Announcement',
-            required: true,
-            type: 'textArea',
-            def: '',
-            placeholder: 'Write your announcement...',
-            limit: 5000,
-            shortcuts: [],
-        },
-        {
-            query: 'thumbnail',
-            name: 'Thumbnail',
-            description: 'Optional announcement image.',
-            required: false,
-            type: 'file',
-            def: '',
-            validation: {
-                type: 'postThumbnail',
-                maxSize: 5242880,
-                maxWidth: 2048,
-                maxHeight: 2048,
-            },
-        },
-    ],
-}
-
 const canManagePosts = (session: AuthSession | null) =>
     session?.user.handle === TOURNAMENT_HOST_HANDLE
 
+function postForm(category: 'announcements' | 'news') {
+    const announcement = category === 'announcements'
+
+    return {
+        type: 'post',
+        title: announcement ? 'Create announcement' : 'Create news post',
+        requireConfirmation: false,
+        options: [
+            {
+                query: 'title',
+                name: 'Title',
+                required: true,
+                type: 'text',
+                def: '',
+                placeholder: announcement
+                    ? 'Announcement title'
+                    : 'News title',
+                limit: 100,
+                shortcuts: [],
+            },
+            {
+                query: 'description',
+                name: 'Content',
+                required: true,
+                type: 'textArea',
+                def: '',
+                placeholder: announcement
+                    ? 'Write your announcement...'
+                    : 'Write your news post...',
+                limit: 5000,
+                shortcuts: [],
+            },
+            {
+                query: 'thumbnail',
+                name: 'Thumbnail',
+                description: 'Optional image.',
+                required: false,
+                type: 'file',
+                def: '',
+                validation: {
+                    type: 'postThumbnail',
+                    maxSize: 5242880,
+                    maxWidth: 2048,
+                    maxHeight: 2048,
+                },
+            },
+        ],
+    }
+}
+
 const deletePostForm = {
     type: 'deletePost',
-    title: 'Delete announcement',
+    title: 'Delete post',
     icon: 'delete',
     requireConfirmation: true,
     options: [],
+}
+
+function postCategory(url: URL): 'announcements' | 'news' {
+    return url.searchParams.get('type') === 'announcements'
+        ? 'announcements'
+        : 'news'
+}
+
+function playlistSlug(name: string): string {
+    return name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+}
+
+type RemoteLevelItem = Record<string, any>
+
+async function remoteLevelItem(
+    chart: SheetChart,
+): Promise<RemoteLevelItem | null> {
+    const base = chart.address.replace(/\/+$/, '')
+    const endpoint = `${base}/sonolus/levels/${encodeURIComponent(chart.name)}`
+
+    try {
+        const response = await fetch(endpoint, {
+            headers: {
+                Accept: 'application/json',
+                'Cache-Control': 'no-cache',
+            },
+            cache: 'no-store',
+            signal: AbortSignal.timeout(12000),
+        })
+
+        if (!response.ok) {
+            console.warn(
+                `Level ${chart.id} could not be fetched: HTTP ${response.status}`,
+                endpoint,
+            )
+            return null
+        }
+
+        const data: any = await response.json()
+        const item = data.item ?? data
+
+        if (
+            !item ||
+            typeof item.name !== 'string' ||
+            typeof item.title === 'undefined' ||
+            typeof item.engine === 'undefined' ||
+            typeof item.data === 'undefined'
+        ) {
+            console.warn('Invalid Sonolus LevelItem returned for', chart.id, item)
+            return null
+        }
+
+        return {
+            ...item,
+            source: chart.address,
+        }
+    } catch (error) {
+        console.error('Could not fetch source level', chart.id, endpoint, error)
+        return null
+    }
+}
+
+async function loadLevelItems(charts: SheetChart[]) {
+    const loaded = await Promise.all(
+        charts.map(async (chart) => ({
+            chart,
+            item: await remoteLevelItem(chart),
+        })),
+    )
+
+    return loaded.filter(
+        (entry): entry is { chart: SheetChart; item: RemoteLevelItem } =>
+            entry.item !== null,
+    )
 }
 
 export default {
@@ -171,8 +263,9 @@ export default {
                 ? await verifyToken<JoinSession>(env.SESSION_SECRET, token)
                 : null
 
-            if (!join || join.room !== ws[1])
+            if (!join || join.room !== ws[1]) {
                 return new Response('Unauthorized', { status: 401 })
+            }
 
             const headers = new Headers(req.headers)
             headers.set('x-join', encodeURIComponent(JSON.stringify(join)))
@@ -182,8 +275,9 @@ export default {
             )
         }
 
-        if (path === '/' || path === '/sonolus')
+        if (path === '/' || path === '/sonolus') {
             return new Response('AXX! Sonolus multiplayer server')
+        }
 
         if (path === '/sonolus/info' && req.method === 'GET') {
             return json({
@@ -192,12 +286,25 @@ export default {
                 buttons: [
                     { type: 'authentication' },
                     { type: 'room' },
-                    { type: 'post', title: 'Announcements' },
+                    {
+                        type: 'post',
+                        title: 'Announcements',
+                        icon: 'announcement',
+                        infoType: 'announcements',
+                    },
+                    {
+                        type: 'post',
+                        title: 'News',
+                        icon: 'post',
+                        infoType: 'news',
+                    },
                     { type: 'level' },
                     { type: 'playlist' },
                     { type: 'configuration' },
                 ],
-                configuration: { options: [] },
+                configuration: {
+                    options: [],
+                },
             })
         }
 
@@ -221,72 +328,82 @@ export default {
             return json({ session, expiration })
         }
 
-        // Announcements
+        // Posts: Announcements and News
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
-            const s = await sessionOf(req, env)
-            const posts = await lobby(env).listPosts()
+            const category = postCategory(url)
+            const session = await sessionOf(req, env)
+            const posts = await lobby(env).listPosts(category)
 
             return json({
-                creates: canManagePosts(s) ? [postForm] : [],
+                creates: canManagePosts(session)
+                    ? [postForm(category)]
+                    : [],
                 searches: [],
                 sections: [
                     {
-                        title: 'Announcements',
+                        title: category === 'announcements'
+                            ? 'Announcements'
+                            : 'News',
                         itemType: 'post',
-                        items: posts.map((p) => p.item),
+                        items: posts.map((post) => post.item),
                     },
                 ],
             })
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const posts = await lobby(env).listPosts()
+            const posts = await lobby(env).listPosts(postCategory(url))
 
             return json({
                 pageCount: 1,
-                items: posts.map((p) => p.item),
+                items: posts.map((post) => post.item),
                 searches: [],
             })
         }
 
         if (path === '/sonolus/posts/create' && req.method === 'POST') {
-            const s = await sessionOf(req, env)
+            const session = await sessionOf(req, env)
 
-            if (!s) return new Response(null, { status: 401 })
+            if (!session) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(s))
-                return message(403, 'Only handle 163292 can publish announcements.')
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can publish posts.')
+            }
 
             let body: any
 
             try {
                 body = await req.json()
             } catch {
-                return message(400, 'Invalid announcement data.')
+                return message(400, 'Invalid post data.')
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
+            const category = postCategory(url)
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
             const thumbnailHash = (values.get('thumbnail') ?? '').trim()
 
-            if (!title || !description)
+            if (!title || !description) {
                 return message(400, 'A title and content are required.')
+            }
 
-            if (title.length > 100 || description.length > 5000)
-                return message(400, 'Announcement is too long.')
+            if (title.length > 100 || description.length > 5000) {
+                return message(400, 'Post is too long.')
+            }
 
             const name = randomId(12)
             const key = randomId(24)
 
             await lobby(env).createPost({
+                category,
                 item: {
                     name,
                     version: 1,
                     title,
                     time: Date.now(),
-                    author: s.user.name || s.user.handle,
+                    author: session.user.name || session.user.handle,
                     tags: [],
                 },
                 description,
@@ -302,15 +419,18 @@ export default {
             })
         }
 
-        const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
+        const postSubmitPath = path.match(
+            /^\/sonolus\/posts\/([\w-]+)\/submit$/,
+        )
 
         if (postSubmitPath && req.method === 'POST') {
-            const s = await sessionOf(req, env)
+            const session = await sessionOf(req, env)
 
-            if (!s) return new Response(null, { status: 401 })
+            if (!session) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(s))
-                return message(403, 'Only handle 163292 can delete announcements.')
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can delete posts.')
+            }
 
             const postName = postSubmitPath[1]!
             const post = await lobby(env).getPost(postName)
@@ -322,13 +442,14 @@ export default {
             try {
                 body = await req.json()
             } catch {
-                return message(400, 'Invalid announcement action.')
+                return message(400, 'Invalid post action.')
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
 
-            if (values.get('type') !== 'deletePost')
-                return message(400, 'Unknown announcement action.')
+            if (values.get('type') !== 'deletePost') {
+                return message(400, 'Unknown post action.')
+            }
 
             await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
             await lobby(env).removePost(postName)
@@ -337,20 +458,23 @@ export default {
         }
 
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
-            const s = await sessionOf(req, env)
+            const session = await sessionOf(req, env)
 
-            if (!s) return new Response(null, { status: 401 })
+            if (!session) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(s))
-                return message(403, 'Only handle 163292 can upload announcement images.')
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can upload post images.')
+            }
 
             const key = req.headers.get('Sonolus-Upload-Key')
+
             if (!key) return message(400, 'Missing upload key.')
 
             const post = await lobby(env).findPostByUploadKey(key)
 
-            if (!post || !post.thumbnailHash)
+            if (!post || !post.thumbnailHash) {
                 return message(403, 'Invalid upload key.')
+            }
 
             let form: FormData
 
@@ -366,8 +490,9 @@ export default {
 
             if (!file) return message(400, 'No image was uploaded.')
 
-            if (file.size > 5 * 1024 * 1024)
+            if (file.size > 5 * 1024 * 1024) {
                 return message(400, 'Image is too large.')
+            }
 
             const bytes = await file.arrayBuffer()
             const image = new Uint8Array(bytes)
@@ -402,18 +527,23 @@ export default {
                         ? 'image/webp'
                         : null
 
-            if (!contentType)
-                return message(400, 'Unsupported image format. Use PNG, JPEG, or WebP.')
+            if (!contentType) {
+                return message(
+                    400,
+                    'Unsupported image format. Use PNG, JPEG, or WebP.',
+                )
+            }
 
             const digest = await crypto.subtle.digest('SHA-1', bytes)
 
             const hash = Array.from(
                 new Uint8Array(digest),
-                (b) => b.toString(16).padStart(2, '0'),
+                (byte) => byte.toString(16).padStart(2, '0'),
             ).join('')
 
-            if (hash.toLowerCase() !== post.thumbnailHash.toLowerCase())
+            if (hash.toLowerCase() !== post.thumbnailHash.toLowerCase()) {
                 return message(400, 'Image hash does not match.')
+            }
 
             await env.POSTS_BUCKET.put(
                 `posts/${post.item.name}/thumbnail`,
@@ -461,136 +591,181 @@ export default {
             return json({
                 item: post.item,
                 description: post.description,
-                actions: canManagePosts(await sessionOf(req, env)) ? [deletePostForm] : [],
+                actions: canManagePosts(await sessionOf(req, env))
+                    ? [deletePostForm]
+                    : [],
                 hasCommunity: false,
                 leaderboards: [],
                 sections: [],
             })
         }
 
-        // Dynamic levels and playlists
+        // Levels
 
-        const remoteLevelItem = async (chart: SheetChart) => {
-            const endpoint = `${chart.address.replace(/\/+$/, '')}/sonolus/levels/${encodeURIComponent(chart.name)}`
-
+        if (path === '/sonolus/levels/info' && req.method === 'GET') {
             try {
-                const response = await fetch(endpoint, {
-                    signal: AbortSignal.timeout(8000),
+                const charts = await getCustomLevels()
+                const loaded = await loadLevelItems(charts)
+
+                return json({
+                    creates: [],
+                    searches: [],
+                    sections: [
+                        {
+                            title: 'Custom Levels',
+                            itemType: 'level',
+                            items: loaded.map((entry) => entry.item),
+                        },
+                    ],
                 })
-                if (!response.ok) return null
-
-                const data: any = await response.json()
-                const item = data.item ?? data
-
-                if (!item || typeof item.name !== 'string') return null
-                return item
             } catch (error) {
-                console.error('Could not fetch level item', chart.name, error)
-                return null
+                console.error('Could not read custom levels sheet:', error)
+                return message(502, 'Could not read the custom levels sheet.')
             }
         }
 
-        if (path === '/sonolus/levels/info' && req.method === 'GET') {
-            const charts = await getCustomLevels().catch((error) => {
-                console.error('Custom levels sheet failed', error)
-                return []
-            })
-
-            const items = (await Promise.all(charts.map(remoteLevelItem)))
-                .filter((item): item is Record<string, any> => item !== null)
-
-            return json({
-                creates: [],
-                searches: [],
-                sections: [{ title: 'Custom Levels', itemType: 'level', items }],
-            })
-        }
-
         if (path === '/sonolus/levels/list' && req.method === 'GET') {
-            const charts = await getCustomLevels().catch(() => [])
-            const items = (await Promise.all(charts.map(remoteLevelItem)))
-                .filter((item): item is Record<string, any> => item !== null)
+            try {
+                const charts = await getCustomLevels()
+                const loaded = await loadLevelItems(charts)
 
-            return json({ pageCount: 1, items, searches: [] })
+                return json({
+                    pageCount: 1,
+                    items: loaded.map((entry) => entry.item),
+                    searches: [],
+                })
+            } catch (error) {
+                console.error('Could not read custom levels sheet:', error)
+                return message(502, 'Could not read the custom levels sheet.')
+            }
         }
 
-        const levelPath = path.match(/^\/sonolus\/levels\/([\w-]+)$/)
+        const levelPath = path.match(/^\/sonolus\/levels\/([^/]+)$/)
+
         if (levelPath && req.method === 'GET') {
-            const charts = await getCustomLevels().catch(() => [])
-            const chart = charts.find((entry) => entry.name === levelPath[1])
-            if (!chart) return new Response(null, { status: 404 })
+            const requestedName = decodeURIComponent(levelPath[1]!)
 
-            const item = await remoteLevelItem(chart)
-            if (!item) return new Response(null, { status: 502 })
+            try {
+                const charts = await getCustomLevels()
+                const chart = charts.find(
+                    (entry) =>
+                        entry.name === requestedName ||
+                        entry.id === requestedName,
+                )
 
-            return json({
-                item,
-                actions: [],
-                hasCommunity: false,
-                leaderboards: [],
-                sections: [],
-            })
+                if (!chart) return new Response(null, { status: 404 })
+
+                const item = await remoteLevelItem(chart)
+
+                if (!item) return new Response(null, { status: 502 })
+
+                return json({
+                    item,
+                    actions: [],
+                    hasCommunity: false,
+                    leaderboards: [],
+                    sections: [],
+                })
+            } catch (error) {
+                console.error('Could not load level details:', error)
+                return message(502, 'Could not load level details.')
+            }
         }
+
+        // Playlists
 
         const makePlaylistItems = async () => {
             const playlists = await getPlaylists()
 
-            return playlists.map((playlist, index) => ({
-                name: `xx-playlist-${index + 1}`,
-                version: 1,
-                title: playlist.name,
-                subtitle: `${playlist.charts.length} levels`,
-                author: "AXX!A's server",
-                tags: [],
-                levels: playlist.charts.map((chart) => ({
-                    address: chart.address,
-                    name: chart.name,
-                })),
-            }))
+            return Promise.all(
+                playlists.map(async (playlist) => {
+                    const loaded = await loadLevelItems(playlist.charts)
+
+                    return {
+                        name: playlistSlug(playlist.name),
+                        version: 1 as const,
+                        title: playlist.name,
+                        subtitle: `${loaded.length} levels`,
+                        author: "AXX!A's server",
+                        tags: [],
+                        levels: loaded.map((entry) => entry.item),
+                    }
+                }),
+            )
         }
 
         if (path === '/sonolus/playlists/info' && req.method === 'GET') {
-            const items = await makePlaylistItems().catch((error) => {
-                console.error('Custom playlists sheet failed', error)
-                return []
-            })
+            try {
+                const items = await makePlaylistItems()
 
-            return json({
-                creates: [],
-                searches: [],
-                sections: [{ title: 'Playlists', itemType: 'playlist', items }],
-            })
+                return json({
+                    creates: [],
+                    searches: [],
+                    sections: [
+                        {
+                            title: 'Playlists',
+                            itemType: 'playlist',
+                            items,
+                        },
+                    ],
+                })
+            } catch (error) {
+                console.error('Could not read playlists sheet:', error)
+                return message(502, 'Could not read the playlists sheet.')
+            }
         }
 
         if (path === '/sonolus/playlists/list' && req.method === 'GET') {
-            const items = await makePlaylistItems().catch(() => [])
-            return json({ pageCount: 1, items, searches: [] })
+            try {
+                const items = await makePlaylistItems()
+
+                return json({
+                    pageCount: 1,
+                    items,
+                    searches: [],
+                })
+            } catch (error) {
+                console.error('Could not read playlists sheet:', error)
+                return message(502, 'Could not read the playlists sheet.')
+            }
         }
 
-        const playlistPath = path.match(/^\/sonolus\/playlists\/([\w-]+)$/)
-        if (playlistPath && req.method === 'GET') {
-            const items = await makePlaylistItems().catch(() => [])
-            const index = Number(playlistPath[1].replace('xx-playlist-', '')) - 1
-            const item = items[index]
-            if (!item) return new Response(null, { status: 404 })
+        const playlistPath = path.match(
+            /^\/sonolus\/playlists\/([^/]+)$/,
+        )
 
-            return json({
-                item,
-                actions: [],
-                hasCommunity: false,
-                leaderboards: [],
-                sections: [],
-            })
+        if (playlistPath && req.method === 'GET') {
+            const requestedName = decodeURIComponent(playlistPath[1]!)
+
+            try {
+                const items = await makePlaylistItems()
+                const item = items.find(
+                    (entry) => entry.name === requestedName,
+                )
+
+                if (!item) return new Response(null, { status: 404 })
+
+                return json({
+                    item,
+                    actions: [],
+                    hasCommunity: false,
+                    leaderboards: [],
+                    sections: [],
+                })
+            } catch (error) {
+                console.error('Could not load playlist details:', error)
+                return message(502, 'Could not load playlist details.')
+            }
         }
 
         // Rooms
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
-            const s = await sessionOf(req, env)
-            const isHost = s?.user.handle === TOURNAMENT_HOST_HANDLE
+            const session = await sessionOf(req, env)
+            const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
             return json({
-                creates: s ? roomForms(isHost) : [],
+                creates: session ? roomForms(isHost) : [],
                 searches: [],
                 sections: [
                     {
@@ -611,18 +786,18 @@ export default {
         }
 
         if (path === '/sonolus/rooms/create' && req.method === 'POST') {
-            const s = await sessionOf(req, env)
+            const session = await sessionOf(req, env)
 
-            if (!s) return new Response(null, { status: 401 })
+            if (!session) return new Response(null, { status: 401 })
 
             const name = randomId(8)
             const key = randomId(24)
 
             await roomStub(env, name).reserve(name, {
                 key,
-                hostId: s.user.id,
-                hostName: s.user.name,
-                hostHandle: s.user.handle,
+                hostId: session.user.id,
+                hostName: session.user.name,
+                hostHandle: session.user.handle,
             })
 
             return json({ name, key })
@@ -655,8 +830,9 @@ export default {
                 'authenticateMultiplayer',
             )
 
-            if (!body || body.room !== name)
+            if (!body || body.room !== name) {
                 return new Response(null, { status: 400 })
+            }
 
             const user = profileOf(body.userProfile)
             const stub = roomStub(env, name)
@@ -665,11 +841,15 @@ export default {
             if (key) {
                 const settings = parseSettings(url.searchParams)
 
-                if (!settings)
+                if (!settings) {
                     return new Response(null, { status: 400 })
+                }
 
                 if (
-                    (user.handle !== TOURNAMENT_HOST_HANDLE && settings.type !== 'casualRoom') ||
+                    (
+                        user.handle !== TOURNAMENT_HOST_HANDLE &&
+                        settings.type !== 'casualRoom'
+                    ) ||
                     !(await stub.configure(key, settings, user))
                 ) {
                     return message(403, 'You can only create Custom Rooms.')
