@@ -1,9 +1,5 @@
 
-export const ACTIVE_EDITION = 'WINTER 2027'
-
-// ============================================================
-// EDITION CONFIGURATION
-// ============================================================
+import type { EditionData, SheetChart } from './sheets.ts'
 
 export const GROUP_ORDER = ['A','B','C','D','E','F','G','H','I','J','K','X','T'] as const
 
@@ -33,57 +29,8 @@ export type Edition = {
     composition: EditionComposition
 }
 
-// ------------------------------------------------------------
-// WINTER 2027 SONG POOL
-// ------------------------------------------------------------
-
-export const EDITIONS: Record<string, Edition> = {
-    'WINTER 2027': {
-        groupStage: [
-            {url:null,constant:null},
-            {url:null,constant:null},
-            {url:null,constant:null},
-            {url:null,constant:null},
-            {url:null,constant:null},
-            {url:'https://untitledcharts.com/levels/UnCh-3d7bd1a1a8c14f058b4e56d45e315c32',constant:null},
-        ],
-        final: [
-            {url:null,constant:null},
-            {url:'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',constant:33.0},
-            {url:null,constant:null},
-            {url:null,constant:null},
-        ],
-        composition: {
-            groupStage: {
-                groups: {
-                    A: [],
-                    B: ['1289288'],
-                    C: [],
-                    D: [],
-                    E: [],
-                    F: ['283420'],
-                    G: [],
-                    H: [],
-                    I: [],
-                    J: [],
-                    K: [],
-                    X: ['163292'],
-                    T: [],
-                },
-            },
-            final: {
-                brackets: {
-                    upperBracket: ['163292'],
-                    lowerBracket: [],
-                },
-            },
-        },
-    },
-}
-
-// ============================================================
-// SCORING AND ROOM SETTINGS
-// ============================================================
+export const ACTIVE_EDITION = 'CURRENT EDITION'
+export const EDITIONS: Record<string, Edition> = {}
 
 export const RANKED_POINTS = {
     perfect: 3,
@@ -112,74 +59,31 @@ export const DEFAULT_TYPE: RoomType = 'groupStage'
 export const DEFAULT_SCORING: ScoringMode = 'pp'
 
 export const SERVER_TITLE = 'XX! Championship'
-export const SERVER_DESCRIPTION = ACTIVE_EDITION
+export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\nAXX!A's server!"
 
 export const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 5 * 60 * 1000
 
-// ============================================================
-// CONFIGURATION HELPERS
-// ============================================================
-
 export function getChartConstant(
-    address: string,
-    name: string,
-    type: 'groupStage' | 'final',
+    _address: string,
+    _name: string,
+    _type: 'groupStage' | 'final',
 ): number | null {
-    const edition = EDITIONS[ACTIVE_EDITION]
-
-    const charts = type === 'groupStage'
-        ? edition.groupStage
-        : edition.final
-
-    const target = `${address.replace(/\/+$/, '')}/levels/${name}`
-
-    for (const chart of charts) {
-        if (!chart || !chart.url) continue
-
-        try {
-            const url = new URL(chart.url)
-
-            const id = decodeURIComponent(
-                url.pathname.match(/^\/levels\/([^/]+)\/?$/)?.[1] ?? '',
-            )
-
-            if (`${url.origin}/levels/${id}` === target) {
-                return chart.constant
-            }
-        } catch {
-            continue
-        }
-    }
-
     return null
 }
 
 export function getDivision(
-    handle: string,
-    type: 'groupStage' | 'final',
+    _handle: string,
+    _type: 'groupStage' | 'final',
 ): string | null {
-    const composition = EDITIONS[ACTIVE_EDITION]?.composition
-
-    if (!composition) return null
-
-    if (type === 'groupStage') {
-        for (const group of GROUP_ORDER) {
-            if (composition.groupStage.groups[group].includes(handle)) {
-                return `Group ${group}`
-            }
-        }
-
-        return null
-    }
-
-    if (composition.final.brackets.upperBracket.includes(handle)) {
-        return 'Upper Bracket'
-    }
-
-    if (composition.final.brackets.lowerBracket.includes(handle)) {
-        return 'Lower Bracket'
-    }
-
     return null
+}
+
+export function getEditionChart(
+    edition: EditionData,
+    type: 'groupStage' | 'final',
+): SheetChart[] {
+    return type === 'groupStage'
+        ? edition.groupStage
+        : edition.final
 }
