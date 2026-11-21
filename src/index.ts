@@ -1,5 +1,6 @@
 
 import { SERVER_DESCRIPTION, SERVER_TITLE, TOURNAMENT_HOST_HANDLE } from './config.ts'
+import { getCustomLevels, getPlaylists, type SheetChart } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
 import type { AuthSession, Env, JoinSession, UserProfile } from './types.ts'
@@ -91,7 +92,7 @@ async function roomItems(env: Env) {
 
 const postForm = {
     type: 'post',
-    title: 'Create post',
+    title: 'Create announcement',
     requireConfirmation: false,
     options: [
         {
@@ -100,24 +101,24 @@ const postForm = {
             required: true,
             type: 'text',
             def: '',
-            placeholder: 'Post title',
+            placeholder: 'Announcement title',
             limit: 100,
             shortcuts: [],
         },
         {
             query: 'description',
-            name: 'Content',
+            name: 'Announcement',
             required: true,
             type: 'textArea',
             def: '',
-            placeholder: 'Write your post...',
+            placeholder: 'Write your announcement...',
             limit: 5000,
             shortcuts: [],
         },
         {
             query: 'thumbnail',
             name: 'Thumbnail',
-            description: 'Optional post image.',
+            description: 'Optional announcement image.',
             required: false,
             type: 'file',
             def: '',
@@ -131,12 +132,12 @@ const postForm = {
     ],
 }
 
-const canManagePosts = (session: AuthSession | null, env: Env) =>
-    session?.user.handle === env.HOST_HANDLE
+const canManagePosts = (session: AuthSession | null) =>
+    session?.user.handle === TOURNAMENT_HOST_HANDLE
 
 const deletePostForm = {
     type: 'deletePost',
-    title: 'Delete post',
+    title: 'Delete announcement',
     icon: 'delete',
     requireConfirmation: true,
     options: [],
@@ -191,7 +192,9 @@ export default {
                 buttons: [
                     { type: 'authentication' },
                     { type: 'room' },
-                    { type: 'post' },
+                    { type: 'post', title: 'Announcements' },
+                    { type: 'level' },
+                    { type: 'playlist' },
                     { type: 'configuration' },
                 ],
                 configuration: { options: [] },
@@ -218,18 +221,18 @@ export default {
             return json({ session, expiration })
         }
 
-        // Posts
+        // Announcements
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const s = await sessionOf(req, env)
             const posts = await lobby(env).listPosts()
 
             return json({
-                creates: canManagePosts(s, env) ? [postForm] : [],
+                creates: canManagePosts(s) ? [postForm] : [],
                 searches: [],
                 sections: [
                     {
-                        title: 'Posts',
+                        title: 'Announcements',
                         itemType: 'post',
                         items: posts.map((p) => p.item),
                     },
@@ -252,15 +255,15 @@ export default {
 
             if (!s) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(s, env))
-                return message(403, 'Only the designated publisher can create posts.')
+            if (!canManagePosts(s))
+                return message(403, 'Only handle 163292 can publish announcements.')
 
             let body: any
 
             try {
                 body = await req.json()
             } catch {
-                return message(400, 'Invalid post data.')
+                return message(400, 'Invalid announcement data.')
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
@@ -272,7 +275,7 @@ export default {
                 return message(400, 'A title and content are required.')
 
             if (title.length > 100 || description.length > 5000)
-                return message(400, 'Post is too long.')
+                return message(400, 'Announcement is too long.')
 
             const name = randomId(12)
             const key = randomId(24)
@@ -306,8 +309,8 @@ export default {
 
             if (!s) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(s, env))
-                return message(403, 'Only the designated publisher can delete posts.')
+            if (!canManagePosts(s))
+                return message(403, 'Only handle 163292 can delete announcements.')
 
             const postName = postSubmitPath[1]!
             const post = await lobby(env).getPost(postName)
@@ -319,20 +322,18 @@ export default {
             try {
                 body = await req.json()
             } catch {
-                return message(400, 'Invalid post action.')
+                return message(400, 'Invalid announcement action.')
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
 
             if (values.get('type') !== 'deletePost')
-                return message(400, 'Unknown post action.')
+                return message(400, 'Unknown announcement action.')
 
             await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
             await lobby(env).removePost(postName)
 
-            return json({
-                shouldRemoveItem: true,
-            })
+            return json({ shouldRemoveItem: true })
         }
 
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
@@ -340,8 +341,8 @@ export default {
 
             if (!s) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(s, env))
-                return message(403, 'Only the designated publisher can upload images.')
+            if (!canManagePosts(s))
+                return message(403, 'Only handle 163292 can upload announcement images.')
 
             const key = req.headers.get('Sonolus-Upload-Key')
             if (!key) return message(400, 'Missing upload key.')
@@ -418,9 +419,7 @@ export default {
                 `posts/${post.item.name}/thumbnail`,
                 bytes,
                 {
-                    httpMetadata: {
-                        contentType,
-                    },
+                    httpMetadata: { contentType },
                 },
             )
 
@@ -462,7 +461,122 @@ export default {
             return json({
                 item: post.item,
                 description: post.description,
-                actions: canManagePosts(await sessionOf(req, env), env) ? [deletePostForm] : [],
+                actions: canManagePosts(await sessionOf(req, env)) ? [deletePostForm] : [],
+                hasCommunity: false,
+                leaderboards: [],
+                sections: [],
+            })
+        }
+
+        // Dynamic levels and playlists
+
+        const remoteLevelItem = async (chart: SheetChart) => {
+            const endpoint = `${chart.address.replace(/\/+$/, '')}/sonolus/levels/${encodeURIComponent(chart.name)}`
+
+            try {
+                const response = await fetch(endpoint, {
+                    signal: AbortSignal.timeout(8000),
+                })
+                if (!response.ok) return null
+
+                const data: any = await response.json()
+                const item = data.item ?? data
+
+                if (!item || typeof item.name !== 'string') return null
+                return item
+            } catch (error) {
+                console.error('Could not fetch level item', chart.name, error)
+                return null
+            }
+        }
+
+        if (path === '/sonolus/levels/info' && req.method === 'GET') {
+            const charts = await getCustomLevels().catch((error) => {
+                console.error('Custom levels sheet failed', error)
+                return []
+            })
+
+            const items = (await Promise.all(charts.map(remoteLevelItem)))
+                .filter((item): item is Record<string, any> => item !== null)
+
+            return json({
+                creates: [],
+                searches: [],
+                sections: [{ title: 'Custom Levels', itemType: 'level', items }],
+            })
+        }
+
+        if (path === '/sonolus/levels/list' && req.method === 'GET') {
+            const charts = await getCustomLevels().catch(() => [])
+            const items = (await Promise.all(charts.map(remoteLevelItem)))
+                .filter((item): item is Record<string, any> => item !== null)
+
+            return json({ pageCount: 1, items, searches: [] })
+        }
+
+        const levelPath = path.match(/^\/sonolus\/levels\/([\w-]+)$/)
+        if (levelPath && req.method === 'GET') {
+            const charts = await getCustomLevels().catch(() => [])
+            const chart = charts.find((entry) => entry.name === levelPath[1])
+            if (!chart) return new Response(null, { status: 404 })
+
+            const item = await remoteLevelItem(chart)
+            if (!item) return new Response(null, { status: 502 })
+
+            return json({
+                item,
+                actions: [],
+                hasCommunity: false,
+                leaderboards: [],
+                sections: [],
+            })
+        }
+
+        const makePlaylistItems = async () => {
+            const playlists = await getPlaylists()
+
+            return playlists.map((playlist, index) => ({
+                name: `xx-playlist-${index + 1}`,
+                version: 1,
+                title: playlist.name,
+                subtitle: `${playlist.charts.length} levels`,
+                author: "AXX!A's server",
+                tags: [],
+                levels: playlist.charts.map((chart) => ({
+                    address: chart.address,
+                    name: chart.name,
+                })),
+            }))
+        }
+
+        if (path === '/sonolus/playlists/info' && req.method === 'GET') {
+            const items = await makePlaylistItems().catch((error) => {
+                console.error('Custom playlists sheet failed', error)
+                return []
+            })
+
+            return json({
+                creates: [],
+                searches: [],
+                sections: [{ title: 'Playlists', itemType: 'playlist', items }],
+            })
+        }
+
+        if (path === '/sonolus/playlists/list' && req.method === 'GET') {
+            const items = await makePlaylistItems().catch(() => [])
+            return json({ pageCount: 1, items, searches: [] })
+        }
+
+        const playlistPath = path.match(/^\/sonolus\/playlists\/([\w-]+)$/)
+        if (playlistPath && req.method === 'GET') {
+            const items = await makePlaylistItems().catch(() => [])
+            const index = Number(playlistPath[1].replace('xx-playlist-', '')) - 1
+            const item = items[index]
+            if (!item) return new Response(null, { status: 404 })
+
+            return json({
+                item,
+                actions: [],
                 hasCommunity: false,
                 leaderboards: [],
                 sections: [],
