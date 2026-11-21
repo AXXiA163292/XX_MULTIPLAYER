@@ -2,7 +2,12 @@
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from './types.ts'
 
-export type LobbyRoom = { name: string; title: string; subtitle: string; master: string }
+export type LobbyRoom = {
+    name: string
+    title: string
+    subtitle: string
+    master: string
+}
 
 export type LobbyPost = {
     item: {
@@ -29,7 +34,10 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async list(): Promise<LobbyRoom[]> {
-        const map = await this.ctx.storage.list<LobbyRoom>({ prefix: 'room:' })
+        const map = await this.ctx.storage.list<LobbyRoom>({
+            prefix: 'room:',
+        })
+
         return [...map.values()]
     }
 
@@ -38,24 +46,43 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async getPost(name: string): Promise<LobbyPost | null> {
-        return (await this.ctx.storage.get<LobbyPost>(`post:${name}`)) ?? null
+        return (
+            (await this.ctx.storage.get<LobbyPost>(`post:${name}`)) ?? null
+        )
     }
 
     async listPosts(): Promise<LobbyPost[]> {
-        const map = await this.ctx.storage.list<LobbyPost>({ prefix: 'post:' })
-        return [...map.values()].sort((a, b) => b.item.time - a.item.time)
+        const map = await this.ctx.storage.list<LobbyPost>({
+            prefix: 'post:',
+        })
+
+        return [...map.values()].sort(
+            (a, b) => b.item.time - a.item.time,
+        )
     }
 
     async findPostByUploadKey(key: string): Promise<LobbyPost | null> {
         const posts = await this.listPosts()
-        return posts.find((p) => p.uploadKey === key) ?? null
+
+        return posts.find((post) => post.uploadKey === key) ?? null
     }
 
-    async setPostThumbnail(name: string, hash: string, url: string): Promise<void> {
+    async setPostThumbnail(
+        name: string,
+        hash: string,
+        url: string,
+    ): Promise<void> {
         const post = await this.getPost(name)
+
         if (!post) return
+
         post.item.thumbnail = { hash, url }
         post.uploadKey = ''
+
         await this.createPost(post)
+    }
+
+    async removePost(name: string): Promise<void> {
+        await this.ctx.storage.delete(`post:${name}`)
     }
 }
