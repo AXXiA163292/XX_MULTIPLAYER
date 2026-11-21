@@ -1,5 +1,6 @@
 
 export const ACTIVE_EDITION = 'WINTER 2027'
+
 // ============================================================
 // EDITION CONFIGURATION
 // ============================================================
@@ -35,6 +36,7 @@ export type Edition = {
 // ------------------------------------------------------------
 // WINTER 2027 SONG POOL
 // ------------------------------------------------------------
+
 export const EDITIONS: Record<string, Edition> = {
     'WINTER 2027': {
         groupStage: [
@@ -45,20 +47,12 @@ export const EDITIONS: Record<string, Edition> = {
             {url:null,constant:null},
             {url:'https://untitledcharts.com/levels/UnCh-3d7bd1a1a8c14f058b4e56d45e315c32',constant:null},
         ],
-        // ============================================================
-        // FINAL
-        // ============================================================
         final: [
             {url:null,constant:null},
             {url:'https://untitledcharts.com/levels/UnCh-27582388d8bc42b0b6afcc12faf8871b',constant:33.0},
             {url:null,constant:null},
             {url:null,constant:null},
         ],
-        // ============================================================
-        // GROUPS
-        // ============================================================
-
-        // PLAYER ASSIGNMENTS
         composition: {
             groupStage: {
                 groups: {
@@ -77,9 +71,6 @@ export const EDITIONS: Record<string, Edition> = {
                     T: [],
                 },
             },
-            // ============================================================
-            // FINAL COMPOSITION
-            // ============================================================
             final: {
                 brackets: {
                     upperBracket: ['163292'],
@@ -94,7 +85,6 @@ export const EDITIONS: Record<string, Edition> = {
 // SCORING AND ROOM SETTINGS
 // ============================================================
 
-/** Points per judgment for Ranked Match. */
 export const RANKED_POINTS = {
     perfect: 3,
     great: 2,
@@ -104,8 +94,10 @@ export const RANKED_POINTS = {
 export const ROOM_TYPES = {
     groupStage: 'Group Stage',
     final: 'Final',
-    casualRoom: 'Casual Room',
+    casualRoom: 'Custom Room',
 } as const
+
+export const TOURNAMENT_HOST_HANDLE = '163292'
 
 export type RoomType = keyof typeof ROOM_TYPES
 
@@ -122,10 +114,7 @@ export const DEFAULT_SCORING: ScoringMode = 'pp'
 export const SERVER_TITLE = 'XX! Championship'
 export const SERVER_DESCRIPTION = ACTIVE_EDITION
 
-/** Empty rooms are deleted after this long. */
 export const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
-
-/** Reserved rooms that are never joined are deleted after this long. */
 export const RESERVED_ROOM_TTL_MS = 5 * 60 * 1000
 
 // ============================================================
