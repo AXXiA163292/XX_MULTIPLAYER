@@ -4,9 +4,7 @@ import {
     EMPTY_ROOM_TTL_MS,
     RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
-    GROUP_ORDER,
     TOURNAMENT_HOST_HANDLE,
-    getDivision,
 } from './config.ts'
 import {
     parseSettings,
@@ -22,7 +20,7 @@ import {
     totals,
     type RoundRecord,
 } from './scoring.ts'
-import { getEditionData, getCurrentEdition } from './sheets.ts'
+import { getEditionData, type EditionData, type SheetChart } from './sheets.ts'
 import type {
     Env,
     GameplayResult,
@@ -59,6 +57,7 @@ type LevelInfo = {
 type RoomState = {
     name: string
     edition: string
+    divisions: Record<string, string>
     reserved: Reservation | null
     configured: boolean
     hostId: string
@@ -78,6 +77,7 @@ type RoomState = {
 const fresh = (): RoomState => ({
     name: '',
     edition: '',
+    divisions: {},
     reserved: null,
     configured: false,
     hostId: '',
@@ -111,6 +111,27 @@ const getRoomTitle = (settings: RoomSettings, edition = '') => {
     return `${edition || 'Final'} Final`
 }
 
+function chartsForType(
+    edition: EditionData,
+    type: RoomSettings['type'],
+): SheetChart[] {
+    if (type === 'casualRoom') return []
+    return type === 'groupStage' ? edition.groupStage : edition.final
+}
+
+function suggestionsFromCharts(
+    charts: SheetChart[],
+    userId: string,
+) {
+    return charts.map((chart) => ({
+        userId,
+        level: {
+            address: chart.address,
+            name: chart.name,
+        },
+    }))
+}
+
 async function songPoolSuggestions(
     type: RoomSettings['type'],
     userId: string,
@@ -119,19 +140,9 @@ async function songPoolSuggestions(
 
     try {
         const edition = await getEditionData()
-        const charts = type === 'groupStage'
-            ? edition.groupStage
-            : edition.final
-
-        return charts.map((chart) => ({
-            userId,
-            level: {
-                address: chart.address,
-                name: chart.name,
-            },
-        }))
+        return suggestionsFromCharts(chartsForType(edition, type), userId)
     } catch (error) {
-        console.error('Could not load tournament songs', error)
+        console.error('Could not load tournament songs:', error)
         return []
     }
 }
@@ -198,10 +209,12 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
         const base = new URL(level.address)
 
         if (
-            base.protocol !== 'https:' ||
+            (base.protocol !== 'https:' && base.protocol !== 'http:') ||
             base.username ||
             base.password
-        ) return null
+        ) {
+            return null
+        }
 
         const encodedName = encodeURIComponent(level.name)
         const root = base.toString().replace(/\/+$/, '')
@@ -219,13 +232,21 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
         for (const path of paths) {
             try {
                 const response = await fetch(path, {
-                    signal: AbortSignal.timeout(5000),
+                    headers: {
+                        Accept: 'application/json',
+                        'Cache-Control': 'no-cache',
+                    },
+                    cache: 'no-store',
+                    signal: AbortSignal.timeout(8000),
                 })
 
                 if (!response.ok) continue
 
                 const data: any = await response.json()
                 const item = data.item ?? data
+
+                if (!item || typeof item !== 'object') continue
+
                 const description = descriptionText(item.description)
 
                 const firstTag = localize(
@@ -267,9 +288,7 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     'Constant',
                 )
 
-                const constant =
-                    descriptionConstant ??
-                    rating
+                const constant = descriptionConstant ?? rating
 
                 return {
                     title: localize(item.title) || level.name,
@@ -279,12 +298,12 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     noteCount,
                     difficulty,
                 }
-            } catch {
-                continue
+            } catch (error) {
+                console.warn('Could not fetch level metadata:', path, error)
             }
         }
-    } catch {
-        return null
+    } catch (error) {
+        console.warn('Invalid level address:', level.address, error)
     }
 
     return null
@@ -317,6 +336,34 @@ const isResult = (r: any): r is GameplayResult =>
         r.totalCount,
     ].every(isNum)
 
+function isRoomStatus(value: unknown): value is RoomStatus {
+    return ['selecting', 'preparing', 'playing'].includes(String(value))
+}
+
+function isUserStatus(value: unknown): value is UserStatus {
+    return ['waiting', 'ready', 'skipped', 'playing'].includes(String(value))
+}
+
+function cleanDivisions(value: unknown): Record<string, string> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return {}
+    }
+
+    const result: Record<string, string> = {}
+
+    for (const [handle, division] of Object.entries(value)) {
+        if (
+            typeof handle === 'string' &&
+            typeof division === 'string' &&
+            division.trim()
+        ) {
+            result[handle.trim()] = division.trim()
+        }
+    }
+
+    return result
+}
+
 export class Room extends DurableObject<Env> {
     st: RoomState = fresh()
 
@@ -324,7 +371,7 @@ export class Room extends DurableObject<Env> {
         super(ctx, env)
 
         ctx.blockConcurrencyWhile(async () => {
-            const saved = await ctx.storage.get<RoomState>('st')
+            const saved = await ctx.storage.get<Partial<RoomState>>('st')
             const base = fresh()
 
             this.st = {
@@ -337,7 +384,18 @@ export class Room extends DurableObject<Env> {
                 edition: typeof saved?.edition === 'string'
                     ? saved.edition
                     : '',
+                divisions: cleanDivisions(saved?.divisions),
                 reserved: saved?.reserved ?? null,
+                configured: saved?.configured === true,
+                hostId: typeof saved?.hostId === 'string'
+                    ? saved.hostId
+                    : '',
+                hostName: typeof saved?.hostName === 'string'
+                    ? saved.hostName
+                    : '',
+                status: isRoomStatus(saved?.status)
+                    ? saved.status
+                    : 'selecting',
                 level: saved?.level && isSil(saved.level)
                     ? saved.level
                     : null,
@@ -355,11 +413,19 @@ export class Room extends DurableObject<Env> {
                         (x) =>
                             x &&
                             typeof x.id === 'string' &&
-                            x.roomUser,
+                            typeof x.name === 'string' &&
+                            typeof x.handle === 'string' &&
+                            x.roomUser &&
+                            typeof x.roomUser.authentication === 'string' &&
+                            typeof x.roomUser.signature === 'string',
                     )
                     : [],
                 statuses: saved?.statuses && typeof saved.statuses === 'object'
-                    ? saved.statuses
+                    ? Object.fromEntries(
+                        Object.entries(saved.statuses).filter(
+                            ([, value]) => isUserStatus(value),
+                        ),
+                    ) as Record<string, UserStatus>
                     : {},
                 results: saved?.results && typeof saved.results === 'object'
                     ? Object.fromEntries(
@@ -371,7 +437,9 @@ export class Room extends DurableObject<Env> {
                 history: Array.isArray(saved?.history)
                     ? saved.history
                     : [],
-                round: saved?.round && typeof saved.round.state === 'string'
+                round: saved?.round &&
+                    typeof saved.round.state === 'string' &&
+                    typeof saved.round.seed === 'number'
                     ? saved.round
                     : null,
             }
@@ -390,6 +458,17 @@ export class Room extends DurableObject<Env> {
             for (const member of this.st.members) {
                 this.st.statuses[member.id] ??= 'waiting'
             }
+
+            if (this.st.status === 'playing' && !this.st.round) {
+                this.st.status = 'selecting'
+                this.st.results = {}
+
+                for (const member of this.st.members) {
+                    this.st.statuses[member.id] = 'waiting'
+                }
+            }
+
+            await ctx.storage.put('st', this.st)
         })
     }
 
@@ -410,38 +489,66 @@ export class Room extends DurableObject<Env> {
         key: string,
         settings: RoomSettings,
         host: { id: string; name: string; handle: string },
-    ) {
-        const r = this.st.reserved
+    ): Promise<boolean> {
+        const reservation = this.st.reserved
 
         if (
-            !r ||
-            r.key !== key ||
-            r.hostId !== host.id ||
-            r.hostHandle !== host.handle
-        ) return false
+            !reservation ||
+            reservation.key !== key ||
+            reservation.hostId !== host.id ||
+            reservation.hostHandle !== host.handle
+        ) {
+            return false
+        }
 
         if (
             host.handle !== TOURNAMENT_HOST_HANDLE &&
             settings.type !== 'casualRoom'
-        ) return false
+        ) {
+            return false
+        }
 
         if (settings.type === 'casualRoom' && !settings.title) {
             settings.title = 'Custom Room'
         }
 
-        this.st.edition = await getCurrentEdition().catch(
-            () => this.st.edition || 'Final',
-        )
+        let editionData: EditionData | null = null
+
+        try {
+            editionData = await getEditionData()
+        } catch (error) {
+            console.error('Could not load edition sheet while configuring room:', error)
+        }
+
+        if (editionData) {
+            this.st.edition = editionData.edition
+            this.st.divisions = cleanDivisions(editionData.divisions)
+            this.st.suggestions = suggestionsFromCharts(
+                chartsForType(editionData, settings.type),
+                host.id,
+            )
+        } else {
+            this.st.edition ||= 'Final'
+            this.st.divisions = {}
+            this.st.suggestions = await songPoolSuggestions(
+                settings.type,
+                host.id,
+            )
+        }
+
         this.st.configured = true
         this.st.hostId = host.id
         this.st.hostName = host.name
-        this.st.settings = settings
-        this.st.suggestions = await songPoolSuggestions(
-            settings.type,
-            host.id,
-        )
+        this.st.settings = { ...settings }
         this.st.reserved = null
+        this.st.status = 'selecting'
+        this.st.level = null
+        this.st.levelInfo = null
+        this.st.round = null
+        this.st.results = {}
+        this.st.history = []
 
+        await this.ctx.storage.deleteAlarm()
         await this.save()
         await this.syncLobby()
 
@@ -483,7 +590,10 @@ export class Room extends DurableObject<Env> {
         if (
             !join ||
             !this.st.configured ||
-            join.room !== this.st.name
+            join.room !== this.st.name ||
+            !join.user ||
+            typeof join.user.id !== 'string' ||
+            !join.roomUser
         ) {
             return new Response('No such room', { status: 404 })
         }
@@ -492,12 +602,16 @@ export class Room extends DurableObject<Env> {
         const user = join.user
 
         const existingMember = this.st.members.find(
-            (m) => m.id === user.id,
+            (member) => member.id === user.id,
         )
 
         if (existingMember) {
-            for (const ws of this.socketsOf(user.id)) {
-                ws.close(4000, 'replaced')
+            for (const oldSocket of this.socketsOf(user.id)) {
+                try {
+                    oldSocket.close(4000, 'replaced')
+                } catch {
+                    // The previous connection may already be closed.
+                }
             }
 
             existingMember.name = user.name
@@ -525,8 +639,10 @@ export class Room extends DurableObject<Env> {
 
         await this.save()
 
+        // Send the complete room state to the reconnecting client.
         this.send(server, this.view(user.id))
 
+        // Existing users are not removed and re-added on reconnect.
         if (!existingMember) {
             this.sendExcept(user.id, {
                 type: 'addUser',
@@ -558,42 +674,47 @@ export class Room extends DurableObject<Env> {
         ws: WebSocket,
         raw: string | ArrayBuffer,
     ): Promise<void> {
-        const att = ws.deserializeAttachment() as {
+        const attachment = ws.deserializeAttachment() as {
             userId: string
         } | null
 
-        if (!att || typeof raw !== 'string') return
+        if (!attachment || typeof raw !== 'string') return
 
-        let cmd: Cmd
+        let command: Cmd
 
         try {
-            cmd = JSON.parse(raw)
+            command = JSON.parse(raw)
         } catch {
             return
         }
 
-        if (!this.st.members.some((m) => m.id === att.userId)) return
+        if (!this.st.members.some((member) => member.id === attachment.userId)) {
+            return
+        }
 
         try {
-            await this.handle(att.userId, cmd)
-        } catch (e) {
-            console.error('command failed', cmd?.type, e)
-            this.resync(att.userId)
+            await this.handle(attachment.userId, command)
+        } catch (error) {
+            console.error('Room command failed:', command?.type, error)
+            this.resync(attachment.userId)
         }
 
         await this.save()
     }
 
     async webSocketClose(ws: WebSocket): Promise<void> {
-        const att = ws.deserializeAttachment() as {
+        const attachment = ws.deserializeAttachment() as {
             userId: string
         } | null
 
-        if (!att) return
+        if (!attachment) return
 
-        if (this.socketsOf(att.userId).some((s) => s !== ws)) return
+        // A replaced socket must not affect the new connection.
+        if (this.socketsOf(attachment.userId).some((socket) => socket !== ws)) {
+            return
+        }
 
-        await this.dropMember(att.userId, true, true)
+        await this.dropMember(attachment.userId, true, true)
     }
 
     async webSocketError(ws: WebSocket): Promise<void> {
@@ -601,9 +722,7 @@ export class Room extends DurableObject<Env> {
     }
 
     async alarm(): Promise<void> {
-        const empty = this.ctx.getWebSockets().length === 0
-
-        if (!empty) return
+        if (this.ctx.getWebSockets().length > 0) return
 
         await this.env.LOBBY
             .get(this.env.LOBBY.idFromName('main'))
@@ -614,29 +733,33 @@ export class Room extends DurableObject<Env> {
     }
 
     private async handle(uid: string, cmd: Cmd): Promise<void> {
-        const s = this.st
-        const isHost = uid === s.hostId
+        const state = this.st
+        const isHost = uid === state.hostId
 
         switch (cmd.type) {
             case 'updateLevel': {
-                if (!isHost || s.status !== 'selecting' || !isSil(cmd.level)) {
+                if (
+                    !isHost ||
+                    state.status !== 'selecting' ||
+                    !isSil(cmd.level)
+                ) {
                     return this.resync(uid)
                 }
 
-                s.level = {
+                state.level = {
                     address: cmd.level.address,
                     name: cmd.level.name,
                 }
-                s.levelInfo = null
+                state.levelInfo = null
 
                 this.sendHost({
                     type: 'updateLevel',
-                    level: s.level,
+                    level: state.level,
                 })
 
                 this.pushScoreboard()
 
-                s.levelInfo = await fetchLevelInfo(s.level)
+                state.levelInfo = await fetchLevelInfo(state.level)
                 this.pushScoreboard()
                 return
             }
@@ -647,43 +770,68 @@ export class Room extends DurableObject<Env> {
                         ? parseSettings(cmd.optionValues)
                         : null
 
-                const tournamentHost = s.members.find(
-                    (m) => m.id === uid,
-                )?.handle === TOURNAMENT_HOST_HANDLE
+                const member = state.members.find(
+                    (entry) => entry.id === uid,
+                )
+
+                const tournamentHost =
+                    member?.handle === TOURNAMENT_HOST_HANDLE
 
                 if (
                     !isHost ||
                     !next ||
                     (!tournamentHost && next.type !== 'casualRoom') ||
-                    s.status !== 'selecting' ||
-                    s.history.length > 0
+                    state.status !== 'selecting' ||
+                    state.history.length > 0
                 ) {
                     return this.resync(uid)
                 }
 
                 const modeChanged =
-                    next.scoring !== s.settings.scoring
+                    next.scoring !== state.settings.scoring
 
                 const typeChanged =
-                    next.type !== s.settings.type
+                    next.type !== state.settings.type
 
                 const titleChanged =
                     typeChanged ||
-                    next.group !== s.settings.group ||
-                    next.title !== s.settings.title
+                    next.group !== state.settings.group ||
+                    next.title !== state.settings.title
 
                 if (next.type === 'casualRoom' && !next.title) {
                     next.title = 'Custom Room'
                 }
 
-                s.settings = next
+                state.settings = next
 
                 if (typeChanged) {
-                    s.suggestions = await songPoolSuggestions(next.type, uid)
+                    let editionData: EditionData | null = null
+
+                    if (next.type !== 'casualRoom') {
+                        try {
+                            editionData = await getEditionData()
+                        } catch (error) {
+                            console.error('Could not reload edition sheet:', error)
+                        }
+                    }
+
+                    if (editionData) {
+                        state.edition = editionData.edition
+                        state.divisions = cleanDivisions(editionData.divisions)
+                        state.suggestions = suggestionsFromCharts(
+                            chartsForType(editionData, next.type),
+                            uid,
+                        )
+                    } else {
+                        state.suggestions = await songPoolSuggestions(
+                            next.type,
+                            uid,
+                        )
+                    }
 
                     const updateSuggestions = {
                         type: 'updateSuggestions',
-                        suggestions: s.suggestions,
+                        suggestions: state.suggestions,
                     }
 
                     if (next.type === 'casualRoom') {
@@ -697,15 +845,15 @@ export class Room extends DurableObject<Env> {
                         isSuggestionsLocked: next.type !== 'casualRoom',
                     })
 
-                    if (next.type !== 'casualRoom' && s.level) {
+                    if (next.type !== 'casualRoom' && state.level) {
                         this.sendExcept(uid, {
                             type: 'updateLevel',
                             level: null,
                         })
-                    } else if (s.level) {
+                    } else if (state.level) {
                         this.sendExcept(uid, {
                             type: 'updateLevel',
-                            level: s.level,
+                            level: state.level,
                         })
                     }
                 }
@@ -718,7 +866,7 @@ export class Room extends DurableObject<Env> {
                 if (titleChanged) {
                     this.sendAll({
                         type: 'updateTitle',
-                        title: getRoomTitle(next, s.edition),
+                        title: getRoomTitle(next, state.edition),
                     })
                 }
 
@@ -744,15 +892,20 @@ export class Room extends DurableObject<Env> {
                 if (
                     !isHost ||
                     cmd.userId === uid ||
-                    !s.members.some((m) => m.id === cmd.userId)
+                    !state.members.some((member) => member.id === cmd.userId)
                 ) {
                     return this.resync(uid)
                 }
 
                 const target = cmd.userId as string
 
-                for (const ws of this.socketsOf(target)) {
-                    ws.close(4001, 'kicked')
+                // Keep kicked users in the room's member list and standings.
+                for (const socket of this.socketsOf(target)) {
+                    try {
+                        socket.close(4001, 'kicked')
+                    } catch {
+                        // Socket may already be closed.
+                    }
                 }
 
                 await this.dropMember(target, true, true)
@@ -762,26 +915,27 @@ export class Room extends DurableObject<Env> {
             case 'resetScoreboard': {
                 if (!isHost) return this.resync(uid)
 
-                s.history = []
+                state.history = []
+                state.results = {}
                 this.pushScoreboard()
                 return
             }
 
             case 'addSuggestion': {
                 if (
-                    (!isHost && s.settings.type !== 'casualRoom') ||
+                    (!isHost && state.settings.type !== 'casualRoom') ||
                     !isSil(cmd.level)
                 ) {
                     return this.resync(uid)
                 }
 
-                if (
-                    !s.suggestions.some(
-                        (x) =>
-                            x.level.address === cmd.level.address &&
-                            x.level.name === cmd.level.name,
-                    )
-                ) {
+                const alreadyExists = state.suggestions.some(
+                    (entry) =>
+                        entry.level.address === cmd.level.address &&
+                        entry.level.name === cmd.level.name,
+                )
+
+                if (!alreadyExists) {
                     const suggestion = {
                         userId: uid,
                         level: {
@@ -790,14 +944,14 @@ export class Room extends DurableObject<Env> {
                         },
                     }
 
-                    s.suggestions.push(suggestion)
+                    state.suggestions.push(suggestion)
 
                     const event = {
                         type: 'addSuggestion',
                         suggestion,
                     }
 
-                    if (s.settings.type === 'casualRoom') {
+                    if (state.settings.type === 'casualRoom') {
                         this.sendAll(event)
                     } else {
                         this.sendHost(event)
@@ -808,16 +962,18 @@ export class Room extends DurableObject<Env> {
             }
 
             case 'removeSuggestion': {
-                const i = s.suggestions.findIndex(
-                    (x) =>
-                        x.userId === cmd.suggestion?.userId &&
-                        x.level.address === cmd.suggestion?.level?.address &&
-                        x.level.name === cmd.suggestion?.level?.name,
+                const index = state.suggestions.findIndex(
+                    (entry) =>
+                        entry.userId === cmd.suggestion?.userId &&
+                        entry.level.address === cmd.suggestion?.level?.address &&
+                        entry.level.name === cmd.suggestion?.level?.name,
                 )
 
-                if (!isHost || i < 0) return this.resync(uid)
+                if (!isHost || index < 0) {
+                    return this.resync(uid)
+                }
 
-                const [removed] = s.suggestions.splice(i, 1)
+                const [removed] = state.suggestions.splice(index, 1)
 
                 this.sendHost({
                     type: 'removeSuggestion',
@@ -830,7 +986,7 @@ export class Room extends DurableObject<Env> {
             case 'clearSuggestions': {
                 if (!isHost) return this.resync(uid)
 
-                s.suggestions = []
+                state.suggestions = []
 
                 this.sendHost({
                     type: 'clearSuggestions',
@@ -840,12 +996,12 @@ export class Room extends DurableObject<Env> {
             }
 
             case 'swapSuggestions': {
-                const find = (q: any) =>
-                    s.suggestions.findIndex(
-                        (x) =>
-                            x.userId === q?.userId &&
-                            x.level.address === q?.level?.address &&
-                            x.level.name === q?.level?.name,
+                const find = (suggestion: any) =>
+                    state.suggestions.findIndex(
+                        (entry) =>
+                            entry.userId === suggestion?.userId &&
+                            entry.level.address === suggestion?.level?.address &&
+                            entry.level.name === suggestion?.level?.name,
                     )
 
                 const a = find(cmd.suggestionA)
@@ -855,9 +1011,9 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                ;[s.suggestions[a], s.suggestions[b]] = [
-                    s.suggestions[b]!,
-                    s.suggestions[a]!,
+                ;[state.suggestions[a], state.suggestions[b]] = [
+                    state.suggestions[b]!,
+                    state.suggestions[a]!,
                 ]
 
                 this.sendHost({
@@ -877,26 +1033,26 @@ export class Room extends DurableObject<Env> {
                 return this.resync(uid)
 
             case 'updateUserStatus': {
-                const want = cmd.status as UserStatus
+                const wanted = cmd.status as UserStatus
 
                 const allowed: UserStatus[] = isHost
                     ? ['waiting', 'ready', 'skipped']
                     : ['waiting', 'ready']
 
                 if (
-                    s.status !== 'preparing' ||
-                    !allowed.includes(want)
+                    state.status !== 'preparing' ||
+                    !allowed.includes(wanted)
                 ) {
                     return this.resync(uid)
                 }
 
-                s.statuses[uid] = want
+                state.statuses[uid] = wanted
 
                 this.sendAll({
                     type: 'updateUserStatus',
                     userStatus: {
                         userId: uid,
-                        status: want,
+                        status: wanted,
                     },
                 })
 
@@ -905,15 +1061,15 @@ export class Room extends DurableObject<Env> {
 
             case 'startGameplay': {
                 if (
-                    s.status !== 'playing' ||
-                    !s.round ||
-                    cmd.state !== s.round.state ||
-                    s.statuses[uid] !== 'ready'
+                    state.status !== 'playing' ||
+                    !state.round ||
+                    cmd.state !== state.round.state ||
+                    state.statuses[uid] !== 'ready'
                 ) {
                     return
                 }
 
-                s.statuses[uid] = 'playing'
+                state.statuses[uid] = 'playing'
 
                 this.sendAll({
                     type: 'updateUserStatus',
@@ -928,18 +1084,18 @@ export class Room extends DurableObject<Env> {
 
             case 'finishGameplay': {
                 const valid =
-                    s.status === 'playing' &&
-                    s.round &&
-                    cmd.state === s.round.state &&
+                    state.status === 'playing' &&
+                    state.round &&
+                    cmd.state === state.round.state &&
                     isResult(cmd.result) &&
-                    !s.results[uid]
+                    !state.results[uid]
 
                 if (!valid) {
                     return this.resync(uid)
                 }
 
-                s.results[uid] = cmd.result
-                s.statuses[uid] = 'waiting'
+                state.results[uid] = cmd.result
+                state.statuses[uid] = 'waiting'
 
                 this.sendAll({
                     type: 'updateUserStatus',
@@ -964,34 +1120,34 @@ export class Room extends DurableObject<Env> {
             }
 
             case 'addChatMessage': {
-                const m = cmd.message
+                const incoming = cmd.message
                 let message: Ev | null = null
 
                 if (
-                    m?.type === 'quick' &&
-                    ['hello', 'glhf', 'gg', 'ns', 'ty'].includes(m.value)
+                    incoming?.type === 'quick' &&
+                    ['hello', 'glhf', 'gg', 'ns', 'ty'].includes(incoming.value)
                 ) {
                     message = {
                         userId: uid,
                         type: 'quick',
-                        value: m.value,
+                        value: incoming.value,
                     }
                 } else if (
-                    m?.type === 'text' &&
-                    typeof m.value === 'string' &&
-                    m.value.trim()
+                    incoming?.type === 'text' &&
+                    typeof incoming.value === 'string' &&
+                    incoming.value.trim()
                 ) {
                     message = {
                         userId: uid,
                         type: 'text',
-                        value: m.value.slice(0, 200),
+                        value: incoming.value.slice(0, 200),
                     }
                 }
 
                 if (!message) return
 
-                for (const member of s.members) {
-                    const ev: Ev = {
+                for (const member of state.members) {
+                    const event: Ev = {
                         type: 'addChatMessage',
                         message,
                     }
@@ -1000,10 +1156,10 @@ export class Room extends DurableObject<Env> {
                         member.id === uid &&
                         typeof cmd.nonce === 'number'
                     ) {
-                        ev.nonce = cmd.nonce
+                        event.nonce = cmd.nonce
                     }
 
-                    this.sendTo(member.id, ev)
+                    this.sendTo(member.id, event)
                 }
 
                 return
@@ -1016,26 +1172,28 @@ export class Room extends DurableObject<Env> {
     }
 
     private finishRoundIfIdle(): boolean {
-        const s = this.st
+        const state = this.st
 
-        if (s.status !== 'playing') return false
+        if (state.status !== 'playing') return false
 
-        const active = s.members.some((m) =>
-            ['ready', 'playing'].includes(s.statuses[m.id] ?? 'waiting'),
+        const active = state.members.some((member) =>
+            ['ready', 'playing'].includes(
+                state.statuses[member.id] ?? 'waiting',
+            ),
         )
 
         if (active) return false
 
-        if (Object.keys(s.results).length > 0) {
-            s.history.push(this.makeRoundRecord())
+        if (Object.keys(state.results).length > 0) {
+            state.history.push(this.makeRoundRecord())
         }
 
-        s.results = {}
-        s.round = null
-        s.status = 'selecting'
+        state.results = {}
+        state.round = null
+        state.status = 'selecting'
 
-        for (const m of s.members) {
-            s.statuses[m.id] = 'waiting'
+        for (const member of state.members) {
+            state.statuses[member.id] = 'waiting'
         }
 
         this.sendAll({
@@ -1043,8 +1201,8 @@ export class Room extends DurableObject<Env> {
             status: 'selecting',
         })
 
-        if (s.settings.type !== 'casualRoom') {
-            this.sendExcept(s.hostId, {
+        if (state.settings.type !== 'casualRoom') {
+            this.sendExcept(state.hostId, {
                 type: 'updateLevel',
                 level: null,
             })
@@ -1058,26 +1216,26 @@ export class Room extends DurableObject<Env> {
         uid: string,
         next: RoomStatus,
     ): Promise<void> {
-        const s = this.st
-        const cur = s.status
+        const state = this.st
+        const current = state.status
 
         const waitAll = () => {
-            for (const m of s.members) {
-                s.statuses[m.id] = 'waiting'
+            for (const member of state.members) {
+                state.statuses[member.id] = 'waiting'
             }
         }
 
         if (
-            cur === 'selecting' &&
+            current === 'selecting' &&
             next === 'preparing' &&
-            s.level
+            state.level
         ) {
-            s.status = 'preparing'
+            state.status = 'preparing'
             waitAll()
 
             this.sendExcept(uid, {
                 type: 'updateLevel',
-                level: s.level,
+                level: state.level,
             })
 
             this.sendAll({
@@ -1085,10 +1243,10 @@ export class Room extends DurableObject<Env> {
                 status: 'preparing',
             })
         } else if (
-            cur === 'preparing' &&
+            current === 'preparing' &&
             next === 'selecting'
         ) {
-            s.status = 'selecting'
+            state.status = 'selecting'
             waitAll()
 
             this.sendAll({
@@ -1096,40 +1254,36 @@ export class Room extends DurableObject<Env> {
                 status: 'selecting',
             })
 
-            if (s.settings.type !== 'casualRoom') {
+            if (state.settings.type !== 'casualRoom') {
                 this.sendExcept(uid, {
                     type: 'updateLevel',
                     level: null,
                 })
             }
         } else if (
-            cur === 'preparing' &&
+            current === 'preparing' &&
             next === 'playing'
         ) {
             if (
-                !s.level ||
-                (
-                    !s.members.some(
-                        (m) =>
-                            m.id !== s.hostId &&
-                            s.statuses[m.id] === 'ready',
-                    ) &&
-                    s.statuses[s.hostId] !== 'ready'
+                !state.level ||
+                !state.members.some(
+                    (member) =>
+                        state.statuses[member.id] === 'ready',
                 )
             ) {
                 return this.resync(uid)
             }
 
-            s.status = 'playing'
-            s.results = {}
-            s.round = {
+            state.status = 'playing'
+            state.results = {}
+            state.round = {
                 state: crypto.randomUUID(),
                 seed: Math.random(),
             }
 
-            for (const m of s.members) {
-                if (s.statuses[m.id] === 'skipped') {
-                    s.statuses[m.id] = 'waiting'
+            for (const member of state.members) {
+                if (state.statuses[member.id] === 'skipped') {
+                    state.statuses[member.id] = 'waiting'
                 }
             }
 
@@ -1140,28 +1294,28 @@ export class Room extends DurableObject<Env> {
 
             const start = {
                 type: 'startRound',
-                state: s.round.state,
-                seed: s.round.seed,
+                state: state.round.state,
+                seed: state.round.seed,
             }
 
-            for (const m of s.members) {
-                if (s.statuses[m.id] === 'ready') {
-                    this.sendTo(m.id, start)
+            for (const member of state.members) {
+                if (state.statuses[member.id] === 'ready') {
+                    this.sendTo(member.id, start)
                 }
             }
 
             this.pushScoreboard()
         } else if (
-            cur === 'playing' &&
+            current === 'playing' &&
             next === 'selecting'
         ) {
-            if (Object.keys(s.results).length > 0) {
-                s.history.push(this.makeRoundRecord())
+            if (Object.keys(state.results).length > 0) {
+                state.history.push(this.makeRoundRecord())
             }
 
-            s.results = {}
-            s.round = null
-            s.status = 'selecting'
+            state.results = {}
+            state.round = null
+            state.status = 'selecting'
             waitAll()
 
             this.sendAll({
@@ -1169,7 +1323,7 @@ export class Room extends DurableObject<Env> {
                 status: 'selecting',
             })
 
-            if (s.settings.type !== 'casualRoom') {
+            if (state.settings.type !== 'casualRoom') {
                 this.sendExcept(uid, {
                     type: 'updateLevel',
                     level: null,
@@ -1199,88 +1353,88 @@ export class Room extends DurableObject<Env> {
         this.socketsOf(this.st.hostId).length > 0
 
     private view(uid: string): Ev {
-        const s = this.st
-        const isHost = uid === s.hostId
+        const state = this.st
+        const isHost = uid === state.hostId
         const master = this.hostPresent()
-            ? s.hostId
+            ? state.hostId
             : null
 
         const present = new Set(
-            s.members.map((m) => m.id),
+            state.members.map((member) => member.id),
         )
 
         const canSeeLevel =
             isHost ||
-            s.settings.type === 'casualRoom' ||
-            s.status === 'preparing' ||
-            s.status === 'playing'
+            state.settings.type === 'casualRoom' ||
+            state.status === 'preparing' ||
+            state.status === 'playing'
 
         return {
             type: 'update',
             allowOtherServers: true,
             reportUserOptions: [],
-            title: getRoomTitle(s.settings, s.edition),
-            status: s.status,
+            title: getRoomTitle(state.settings, state.edition),
+            status: state.status,
             master,
             lead: master,
             options: roomForms(
-                s.members.find((m) => m.id === uid)?.handle === TOURNAMENT_HOST_HANDLE,
+                state.members.find((member) => member.id === uid)?.handle === TOURNAMENT_HOST_HANDLE,
             ),
-            optionValues: serializeSettings(s.settings),
-            level: canSeeLevel ? s.level : null,
+            optionValues: serializeSettings(state.settings),
+            level: canSeeLevel ? state.level : null,
             levelOptions: [],
             autoExit: 'off',
-            isSuggestionsLocked: s.settings.type !== 'casualRoom' && !isHost,
-            suggestions: isHost || s.settings.type === 'casualRoom'
-                ? s.suggestions
+            isSuggestionsLocked: state.settings.type !== 'casualRoom' && !isHost,
+            suggestions: isHost || state.settings.type === 'casualRoom'
+                ? state.suggestions
                 : [],
             scoreboardDescription: this.description(),
             scoreboardSections: this.sections(),
-            results: Object.entries(s.results)
+            results: Object.entries(state.results)
                 .filter(([id]) => present.has(id))
                 .map(([userId, result]) => ({
                     userId,
                     result,
                 })),
-            users: s.members.map((m) => m.roomUser),
-            userStatuses: s.members.map((m) => ({
-                userId: m.id,
-                status: s.statuses[m.id] ?? 'waiting',
+            users: state.members.map((member) => member.roomUser),
+            userStatuses: state.members.map((member) => ({
+                userId: member.id,
+                status: state.statuses[member.id] ?? 'waiting',
             })),
         }
     }
 
     private description(): string {
         const mode = this.st.settings.scoring
-        const tb = 'Tiebreakers: most perfects, then highest combo.'
+        const tieBreakers = 'Tiebreakers: most perfects, then highest combo.'
 
         if (mode === 'pp') {
             return PP_CONFIGURED
-                ? `PP scoring. Each round is rounded up before the total. ${tb}`
-                : `PP scoring unavailable. ${tb}`
+                ? `PP scoring. Each round is rounded up before the total. ${tieBreakers}`
+                : `PP scoring unavailable. ${tieBreakers}`
         }
 
-        return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tb}`
+        return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}`
     }
 
     private sections() {
-        const s = this.st
-        const mode = s.settings.scoring
+        const state = this.st
+        const mode = state.settings.scoring
 
-        const presentMembers = s.members
-        const present = new Set(presentMembers.map((m) => m.id))
+        const presentMembers = state.members
+        const present = new Set(presentMembers.map((member) => member.id))
 
         const live: RoundRecord | null =
-            s.status === 'playing' &&
-            Object.keys(s.results).length > 0
+            state.status === 'playing' &&
+            Object.keys(state.results).length > 0
                 ? this.makeRoundRecord()
                 : null
 
         const history = live
-            ? [...s.history, live]
-            : s.history
+            ? [...state.history, live]
+            : state.history
 
-        const out: {
+        const output: {
             title: string
             scores: {
                 userId: string
@@ -1292,19 +1446,19 @@ export class Room extends DurableObject<Env> {
 
         for (const division of divisions) {
             const divisionIds = new Set(
-                division.members.map((m) => m.id),
+                division.members.map((member) => member.id),
             )
 
             const divisionTotals = totals(history, mode)
-                .filter((t) => divisionIds.has(t.userId))
+                .filter((total) => divisionIds.has(total.userId))
 
-            out.push({
-                title: s.settings.type === 'casualRoom'
+            output.push({
+                title: state.settings.type === 'casualRoom'
                     ? 'Standings'
                     : `Standings · ${division.title}`,
-                scores: divisionTotals.map((t) => ({
-                    userId: t.userId,
-                    value: fmtScore(t.score, mode),
+                scores: divisionTotals.map((total) => ({
+                    userId: total.userId,
+                    value: fmtScore(total.score, mode),
                 })),
             })
         }
@@ -1327,7 +1481,7 @@ export class Room extends DurableObject<Env> {
                     value: fmtDetail(result, mode, round),
                 }))
 
-            out.push({
+            output.push({
                 title,
                 scores,
             })
@@ -1336,18 +1490,18 @@ export class Room extends DurableObject<Env> {
         if (live) {
             roundSection(
                 live,
-                `Round ${s.history.length + 1} (live)`,
+                `Round ${state.history.length + 1} (live)`,
             )
         }
 
-        for (let i = s.history.length - 1; i >= 0; i--) {
+        for (let index = state.history.length - 1; index >= 0; index--) {
             roundSection(
-                s.history[i]!,
-                `Round ${i + 1}`,
+                state.history[index]!,
+                `Round ${index + 1}`,
             )
         }
 
-        return out
+        return output
     }
 
     private getDivisions(members: Member[]) {
@@ -1361,11 +1515,22 @@ export class Room extends DurableObject<Env> {
         }
 
         if (type === 'groupStage') {
-            const groups = GROUP_ORDER.map((group) => ({
+            const groupNames = [
+                ...new Set(
+                    Object.values(this.st.divisions)
+                        .filter((division) => /^Group\s+/i.test(division))
+                        .map((division) => division.replace(/^Group\s+/i, '').trim()),
+                ),
+            ].sort((a, b) => a.localeCompare(b, undefined, {
+                numeric: true,
+                sensitivity: 'base',
+            }))
+
+            const groups = groupNames.map((group) => ({
                 title: `Group ${group}`,
                 members: members.filter(
                     (member) =>
-                        getDivision(member.handle, 'groupStage') === `Group ${group}`,
+                        this.st.divisions[member.handle] === `Group ${group}`,
                 ),
             })).filter((division) => division.members.length > 0)
 
@@ -1394,14 +1559,14 @@ export class Room extends DurableObject<Env> {
                 title: 'Upper Bracket',
                 members: members.filter(
                     (member) =>
-                        getDivision(member.handle, 'final') === 'Upper Bracket',
+                        this.st.divisions[member.handle] === 'Upper Bracket',
                 ),
             },
             {
                 title: 'Lower Bracket',
                 members: members.filter(
                     (member) =>
-                        getDivision(member.handle, 'final') === 'Lower Bracket',
+                        this.st.divisions[member.handle] === 'Lower Bracket',
                 ),
             },
         ].filter((division) => division.members.length > 0)
@@ -1438,13 +1603,13 @@ export class Room extends DurableObject<Env> {
         announce: boolean,
         retain = false,
     ): Promise<void> {
-        const s = this.st
-        const m = s.members.find((x) => x.id === uid)
+        const state = this.st
+        const member = state.members.find((entry) => entry.id === uid)
 
-        if (!m) return
+        if (!member) return
 
         if (retain) {
-            s.statuses[uid] = 'waiting'
+            state.statuses[uid] = 'waiting'
 
             if (announce) {
                 this.sendAll({
@@ -1458,13 +1623,17 @@ export class Room extends DurableObject<Env> {
 
             this.finishRoundIfIdle()
         } else {
-            s.members = s.members.filter((x) => x.id !== uid)
-            delete s.statuses[uid]
+            state.members = state.members.filter(
+                (entry) => entry.id !== uid,
+            )
+
+            delete state.statuses[uid]
+            delete state.results[uid]
 
             if (announce) {
                 this.sendAll({
                     type: 'removeUser',
-                    user: m.roomUser,
+                    user: member.roomUser,
                 })
             }
         }
@@ -1474,8 +1643,8 @@ export class Room extends DurableObject<Env> {
         await this.save()
 
         const otherSockets = this.ctx.getWebSockets().filter(
-            (w) =>
-                (w.deserializeAttachment() as {
+            (socket) =>
+                (socket.deserializeAttachment() as {
                     userId?: string
                 } | null)?.userId !== uid,
         )
@@ -1489,44 +1658,44 @@ export class Room extends DurableObject<Env> {
 
     private socketsOf = (uid: string) =>
         this.ctx.getWebSockets().filter(
-            (w) =>
+            (socket) =>
                 (
-                    w.deserializeAttachment() as {
+                    socket.deserializeAttachment() as {
                         userId?: string
                     } | null
                 )?.userId === uid,
         )
 
-    private send(ws: WebSocket, ev: Ev) {
+    private send(ws: WebSocket, event: Ev) {
         try {
-            ws.send(JSON.stringify(ev))
+            ws.send(JSON.stringify(event))
         } catch {
             // Socket already closed.
         }
     }
 
-    private sendTo(uid: string, ev: Ev) {
-        for (const ws of this.socketsOf(uid)) {
-            this.send(ws, ev)
+    private sendTo(uid: string, event: Ev) {
+        for (const socket of this.socketsOf(uid)) {
+            this.send(socket, event)
         }
     }
 
-    private sendAll(ev: Ev) {
-        for (const m of this.st.members) {
-            this.sendTo(m.id, ev)
+    private sendAll(event: Ev) {
+        for (const member of this.st.members) {
+            this.sendTo(member.id, event)
         }
     }
 
-    private sendExcept(uid: string, ev: Ev) {
-        for (const m of this.st.members) {
-            if (m.id !== uid) {
-                this.sendTo(m.id, ev)
+    private sendExcept(uid: string, event: Ev) {
+        for (const member of this.st.members) {
+            if (member.id !== uid) {
+                this.sendTo(member.id, event)
             }
         }
     }
 
-    private sendHost(ev: Ev) {
-        this.sendTo(this.st.hostId, ev)
+    private sendHost(event: Ev) {
+        this.sendTo(this.st.hostId, event)
     }
 
     private resync(uid: string) {
@@ -1538,12 +1707,12 @@ export class Room extends DurableObject<Env> {
     }
 
     private async syncLobby() {
-        const sum = await this.summary()
+        const summary = await this.summary()
 
-        if (sum) {
+        if (summary) {
             await this.env.LOBBY
                 .get(this.env.LOBBY.idFromName('main'))
-                .upsert(sum)
+                .upsert(summary)
         }
     }
 }
