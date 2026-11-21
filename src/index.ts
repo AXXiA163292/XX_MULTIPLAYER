@@ -1,4 +1,3 @@
-
 import { SERVER_DESCRIPTION, SERVER_TITLE } from './config.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
@@ -139,6 +138,14 @@ const postForm = {
 
 const canManagePosts = (session: AuthSession | null, env: Env) =>
     session?.user.handle === env.HOST_HANDLE
+
+const deletePostForm = {
+    type: 'deletePost',
+    title: 'Delete post',
+    icon: 'delete',
+    requireConfirmation: true,
+    options: [],
+}
 
 export default {
     async fetch(req: Request, env: Env): Promise<Response> {
@@ -304,6 +311,43 @@ export default {
             })
         }
 
+        const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
+
+        if (postSubmitPath && req.method === 'POST') {
+            const s = await sessionOf(req, env)
+
+            if (!s) return new Response(null, { status: 401 })
+
+            if (!canManagePosts(s, env))
+                return message(403, 'Only the designated publisher can delete posts.')
+
+            const postName = postSubmitPath[1]!
+            const post = await lobby(env).getPost(postName)
+
+            if (!post) return new Response(null, { status: 404 })
+
+            let body: any
+
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid post action.')
+            }
+
+            const values = new URLSearchParams(String(body.values ?? ''))
+
+            if (values.get('type') !== 'deletePost')
+                return message(400, 'Unknown post action.')
+
+            await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
+            await lobby(env).removePost(postName)
+
+            return json({
+                shouldRemoveItem: true,
+                shouldUpdateItem: true,
+            })
+        }
+
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
             const s = await sessionOf(req, env)
 
@@ -337,10 +381,42 @@ export default {
             if (file.size > 5 * 1024 * 1024)
                 return message(400, 'Image is too large.')
 
-            if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type))
-                return message(400, 'Unsupported image format.')
-
             const bytes = await file.arrayBuffer()
+            const image = new Uint8Array(bytes)
+
+            const isPng =
+                image.length >= 8 &&
+                image[0] === 0x89 &&
+                image[1] === 0x50 &&
+                image[2] === 0x4e &&
+                image[3] === 0x47 &&
+                image[4] === 0x0d &&
+                image[5] === 0x0a &&
+                image[6] === 0x1a &&
+                image[7] === 0x0a
+
+            const isJpeg =
+                image.length >= 3 &&
+                image[0] === 0xff &&
+                image[1] === 0xd8 &&
+                image[2] === 0xff
+
+            const isWebp =
+                image.length >= 12 &&
+                String.fromCharCode(...image.slice(0, 4)) === 'RIFF' &&
+                String.fromCharCode(...image.slice(8, 12)) === 'WEBP'
+
+            const contentType = isPng
+                ? 'image/png'
+                : isJpeg
+                    ? 'image/jpeg'
+                    : isWebp
+                        ? 'image/webp'
+                        : null
+
+            if (!contentType)
+                return message(400, 'Unsupported image format. Use PNG, JPEG, or WebP.')
+
             const digest = await crypto.subtle.digest('SHA-1', bytes)
 
             const hash = Array.from(
@@ -356,7 +432,7 @@ export default {
                 bytes,
                 {
                     httpMetadata: {
-                        contentType: file.type,
+                        contentType,
                     },
                 },
             )
@@ -399,7 +475,7 @@ export default {
             return json({
                 item: post.item,
                 description: post.description,
-                actions: [],
+                actions: canManagePosts(await sessionOf(req, env), env) ? [deletePostForm] : [],
                 hasCommunity: false,
                 leaderboards: [],
                 sections: [],
