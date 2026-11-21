@@ -24,15 +24,17 @@ export type Total = {
 }
 
 export const rankedScore = (r: GameplayResult): number =>
-    r.perfect * RANKED_POINTS.perfect +
-    r.great * RANKED_POINTS.great +
-    r.good * RANKED_POINTS.good
+    r.grade === 'X'
+        ? 0
+        : r.perfect * RANKED_POINTS.perfect +
+          r.great * RANKED_POINTS.great +
+          r.good * RANKED_POINTS.good
 
 export function ppScore(
     r: GameplayResult,
     round?: RoundRecord,
 ): number {
-    if (!round) return 0
+    if (!round || r.grade === 'X') return 0
 
     const rating = round.levelConstant ?? round.levelRating
     const noteCount = round.noteCount ?? r.totalCount
@@ -89,6 +91,8 @@ export function totals(
 
     for (const round of history) {
         for (const [userId, result] of Object.entries(round.results)) {
+            if (result.grade === 'X') continue
+
             const total = map.get(userId) ?? {
                 userId,
                 score: 0,
@@ -125,6 +129,8 @@ export function fmtDetail(
     mode: ScoringMode,
     round?: RoundRecord,
 ): string {
+    if (result.grade === 'X') return 'X'
+
     const score = roundScore(result, mode, round)
 
     const grade = result.grade === 'allPerfect'
