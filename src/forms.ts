@@ -28,8 +28,8 @@ const titleOption = {
     description: 'Choose a name for your Custom Room.',
     required: false,
     type: 'text' as const,
-    def: '',
-    placeholder: 'Room title',
+    def: 'Custom Room',
+    placeholder: 'Custom Room',
     limit: 48,
     shortcuts: [],
 }
@@ -70,5 +70,10 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
     if (type === 'groupStage' && group.length > 24) return null
     if (title.length > 48) return null
 
-    return { type: type as RoomType, scoring: scoring as ScoringMode, group, title }
+    return {
+        type: type as RoomType,
+        scoring: scoring as ScoringMode,
+        group,
+        title,
+    }
 }
