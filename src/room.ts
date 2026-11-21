@@ -4,12 +4,8 @@ import {
     EMPTY_ROOM_TTL_MS,
     RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
-    SERVER_DESCRIPTION,
-    ACTIVE_EDITION,
-    EDITIONS,
     GROUP_ORDER,
     TOURNAMENT_HOST_HANDLE,
-    getChartConstant,
     getDivision,
 } from './config.ts'
 import {
@@ -26,6 +22,7 @@ import {
     totals,
     type RoundRecord,
 } from './scoring.ts'
+import { getEditionData, getCurrentEdition } from './sheets.ts'
 import type {
     Env,
     GameplayResult,
@@ -61,6 +58,7 @@ type LevelInfo = {
 
 type RoomState = {
     name: string
+    edition: string
     reserved: Reservation | null
     configured: boolean
     hostId: string
@@ -79,6 +77,7 @@ type RoomState = {
 
 const fresh = (): RoomState => ({
     name: '',
+    edition: '',
     reserved: null,
     configured: false,
     hostId: '',
@@ -100,7 +99,7 @@ const fresh = (): RoomState => ({
     history: [],
 })
 
-const getRoomTitle = (settings: RoomSettings) => {
+const getRoomTitle = (settings: RoomSettings, edition = '') => {
     if (settings.type === 'groupStage') {
         return `Group ${settings.group || 'A'}`
     }
@@ -109,46 +108,32 @@ const getRoomTitle = (settings: RoomSettings) => {
         return settings.title || 'Custom Room'
     }
 
-    return `${SERVER_DESCRIPTION} Final`
+    return `${edition || 'Final'} Final`
 }
 
-function songPoolSuggestions(
+async function songPoolSuggestions(
     type: RoomSettings['type'],
     userId: string,
 ) {
     if (type === 'casualRoom') return []
 
-    const edition = EDITIONS[ACTIVE_EDITION]
-    const charts = type === 'groupStage'
-        ? edition?.groupStage
-        : edition?.final
+    try {
+        const edition = await getEditionData()
+        const charts = type === 'groupStage'
+            ? edition.groupStage
+            : edition.final
 
-    if (!Array.isArray(charts)) return []
-
-    return charts.flatMap((chart) => {
-        if (!chart || typeof chart.url !== 'string') return []
-
-        try {
-            const url = new URL(chart.url)
-            const match = url.pathname.match(/^\/levels\/([^/]+)\/?$/)
-
-            if (
-                url.protocol !== 'https:' ||
-                url.hostname !== 'untitledcharts.com' ||
-                !match
-            ) return []
-
-            return [{
-                userId,
-                level: {
-                    address: url.origin,
-                    name: decodeURIComponent(match[1]!),
-                },
-            }]
-        } catch {
-            return []
-        }
-    })
+        return charts.map((chart) => ({
+            userId,
+            level: {
+                address: chart.address,
+                name: chart.name,
+            },
+        }))
+    } catch (error) {
+        console.error('Could not load tournament songs', error)
+        return []
+    }
 }
 
 const localize = (value: any): string => {
@@ -277,25 +262,12 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     ? Math.round(parsedRating * 10) / 10
                     : null
 
-                const configuredConstant =
-                    getChartConstant(
-                        level.address,
-                        level.name,
-                        'groupStage',
-                    ) ??
-                    getChartConstant(
-                        level.address,
-                        level.name,
-                        'final',
-                    )
-
                 const descriptionConstant = extractDescriptionNumber(
                     description,
                     'Constant',
                 )
 
                 const constant =
-                    configuredConstant ??
                     descriptionConstant ??
                     rating
 
@@ -352,10 +324,72 @@ export class Room extends DurableObject<Env> {
         super(ctx, env)
 
         ctx.blockConcurrencyWhile(async () => {
-            this.st = (await ctx.storage.get<RoomState>('st')) ?? fresh()
+            const saved = await ctx.storage.get<RoomState>('st')
+            const base = fresh()
+
+            this.st = {
+                ...base,
+                ...(saved ?? {}),
+                settings: {
+                    ...base.settings,
+                    ...(saved?.settings ?? {}),
+                },
+                edition: typeof saved?.edition === 'string'
+                    ? saved.edition
+                    : '',
+                reserved: saved?.reserved ?? null,
+                level: saved?.level && isSil(saved.level)
+                    ? saved.level
+                    : null,
+                levelInfo: saved?.levelInfo ?? null,
+                suggestions: Array.isArray(saved?.suggestions)
+                    ? saved.suggestions.filter(
+                        (x) =>
+                            x &&
+                            typeof x.userId === 'string' &&
+                            isSil(x.level),
+                    )
+                    : [],
+                members: Array.isArray(saved?.members)
+                    ? saved.members.filter(
+                        (x) =>
+                            x &&
+                            typeof x.id === 'string' &&
+                            x.roomUser,
+                    )
+                    : [],
+                statuses: saved?.statuses && typeof saved.statuses === 'object'
+                    ? saved.statuses
+                    : {},
+                results: saved?.results && typeof saved.results === 'object'
+                    ? Object.fromEntries(
+                        Object.entries(saved.results).filter(
+                            ([, value]) => isResult(value),
+                        ),
+                    )
+                    : {},
+                history: Array.isArray(saved?.history)
+                    ? saved.history
+                    : [],
+                round: saved?.round && typeof saved.round.state === 'string'
+                    ? saved.round
+                    : null,
+            }
+
             this.st.settings.group ||= 'A'
             this.st.settings.title ??= ''
-            this.st.levelInfo ??= null
+
+            if (!['groupStage', 'final', 'casualRoom'].includes(this.st.settings.type)) {
+                this.st.settings.type = 'casualRoom'
+            }
+
+            if (!['pp', 'rankedMatch'].includes(this.st.settings.scoring)) {
+                this.st.settings.scoring = 'pp'
+            }
+
+            for (const member of this.st.members) {
+                this.st.statuses[member.id] ??= 'waiting'
+            }
         })
     }
 
@@ -386,14 +420,26 @@ export class Room extends DurableObject<Env> {
             r.hostHandle !== host.handle
         ) return false
 
-        if (host.handle !== TOURNAMENT_HOST_HANDLE && settings.type !== 'casualRoom') return false
-        if (settings.type === 'casualRoom' && !settings.title) settings.title = host.name || 'Custom Room'
+        if (
+            host.handle !== TOURNAMENT_HOST_HANDLE &&
+            settings.type !== 'casualRoom'
+        ) return false
 
+        if (settings.type === 'casualRoom' && !settings.title) {
+            settings.title = 'Custom Room'
+        }
+
+        this.st.edition = await getCurrentEdition().catch(
+            () => this.st.edition || 'Final',
+        )
         this.st.configured = true
         this.st.hostId = host.id
         this.st.hostName = host.name
         this.st.settings = settings
-        this.st.suggestions = songPoolSuggestions(settings.type, host.id)
+        this.st.suggestions = await songPoolSuggestions(
+            settings.type,
+            host.id,
+        )
         this.st.reserved = null
 
         await this.save()
@@ -411,7 +457,7 @@ export class Room extends DurableObject<Env> {
 
         return {
             name: this.st.name,
-            title: getRoomTitle(this.st.settings),
+            title: getRoomTitle(this.st.settings, this.st.edition),
             subtitle: '',
             master: this.st.hostName,
         }
@@ -445,12 +491,18 @@ export class Room extends DurableObject<Env> {
         const { 0: client, 1: server } = new WebSocketPair()
         const user = join.user
 
-        if (this.st.members.some((m) => m.id === user.id)) {
+        const existingMember = this.st.members.find(
+            (m) => m.id === user.id,
+        )
+
+        if (existingMember) {
             for (const ws of this.socketsOf(user.id)) {
                 ws.close(4000, 'replaced')
             }
 
-            await this.dropMember(user.id, false)
+            existingMember.name = user.name
+            existingMember.handle = user.handle
+            existingMember.roomUser = join.roomUser
         }
 
         this.ctx.acceptWebSocket(server)
@@ -465,17 +517,22 @@ export class Room extends DurableObject<Env> {
             roomUser: join.roomUser,
         }
 
-        this.st.members.push(member)
+        if (!existingMember) {
+            this.st.members.push(member)
+        }
+
         this.st.statuses[user.id] = 'waiting'
 
         await this.save()
 
         this.send(server, this.view(user.id))
 
-        this.sendExcept(user.id, {
-            type: 'addUser',
-            user: member.roomUser,
-        })
+        if (!existingMember) {
+            this.sendExcept(user.id, {
+                type: 'addUser',
+                user: member.roomUser,
+            })
+        }
 
         if (user.id === this.st.hostId) {
             this.sendExcept(user.id, {
@@ -590,7 +647,9 @@ export class Room extends DurableObject<Env> {
                         ? parseSettings(cmd.optionValues)
                         : null
 
-                const tournamentHost = s.members.find((m) => m.id === uid)?.handle === TOURNAMENT_HOST_HANDLE
+                const tournamentHost = s.members.find(
+                    (m) => m.id === uid,
+                )?.handle === TOURNAMENT_HOST_HANDLE
 
                 if (
                     !isHost ||
@@ -613,16 +672,25 @@ export class Room extends DurableObject<Env> {
                     next.group !== s.settings.group ||
                     next.title !== s.settings.title
 
-                if (next.type === 'casualRoom' && !next.title) next.title = s.hostName || 'Custom Room'
+                if (next.type === 'casualRoom' && !next.title) {
+                    next.title = 'Custom Room'
+                }
 
                 s.settings = next
 
                 if (typeChanged) {
-                    s.suggestions = songPoolSuggestions(next.type, uid)
+                    s.suggestions = await songPoolSuggestions(next.type, uid)
 
-                    const updateSuggestions = { type: 'updateSuggestions', suggestions: s.suggestions }
-                    if (next.type === 'casualRoom') this.sendAll(updateSuggestions)
-                    else this.sendHost(updateSuggestions)
+                    const updateSuggestions = {
+                        type: 'updateSuggestions',
+                        suggestions: s.suggestions,
+                    }
+
+                    if (next.type === 'casualRoom') {
+                        this.sendAll(updateSuggestions)
+                    } else {
+                        this.sendHost(updateSuggestions)
+                    }
 
                     this.sendAll({
                         type: 'updateIsSuggestionsLocked',
@@ -650,7 +718,7 @@ export class Room extends DurableObject<Env> {
                 if (titleChanged) {
                     this.sendAll({
                         type: 'updateTitle',
-                        title: getRoomTitle(next),
+                        title: getRoomTitle(next, s.edition),
                     })
                 }
 
@@ -1151,7 +1219,7 @@ export class Room extends DurableObject<Env> {
             type: 'update',
             allowOtherServers: true,
             reportUserOptions: [],
-            title: getRoomTitle(s.settings),
+            title: getRoomTitle(s.settings, s.edition),
             status: s.status,
             master,
             lead: master,
@@ -1163,7 +1231,9 @@ export class Room extends DurableObject<Env> {
             levelOptions: [],
             autoExit: 'off',
             isSuggestionsLocked: s.settings.type !== 'casualRoom' && !isHost,
-            suggestions: isHost || s.settings.type === 'casualRoom' ? s.suggestions : [],
+            suggestions: isHost || s.settings.type === 'casualRoom'
+                ? s.suggestions
+                : [],
             scoreboardDescription: this.description(),
             scoreboardSections: this.sections(),
             results: Object.entries(s.results)
@@ -1229,7 +1299,9 @@ export class Room extends DurableObject<Env> {
                 .filter((t) => divisionIds.has(t.userId))
 
             out.push({
-                title: `Standings · ${division.title}`,
+                title: s.settings.type === 'casualRoom'
+                    ? 'Standings'
+                    : `Standings · ${division.title}`,
                 scores: divisionTotals.map((t) => ({
                     userId: t.userId,
                     value: fmtScore(t.score, mode),
@@ -1283,7 +1355,7 @@ export class Room extends DurableObject<Env> {
 
         if (type === 'casualRoom') {
             return [{
-                title: 'All Players',
+                title: '',
                 members,
             }]
         }
@@ -1475,4 +1547,3 @@ export class Room extends DurableObject<Env> {
         }
     }
 }
-
