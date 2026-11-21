@@ -109,7 +109,7 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
             return parsed
         } catch (error) {
             lastError = error
-            console.warn(`Could not read Google Sheet tab "${tab}" from endpoint:`, error)
+            console.warn(`Could not read Google Sheet tab "${tab}":`, error)
         }
     }
 
@@ -143,23 +143,19 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
         const url = new URL(candidate)
 
         if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-            console.warn(`Invalid protocol for chart ${id}:`, raw)
             return null
         }
 
         const match = url.pathname.match(/\/levels\/([^/]+)\/?$/i)
 
         if (!match) {
-            console.warn(`Chart ${id} has no valid /levels/{name} URL:`, raw)
+            console.warn('Sheet level URL has no /levels/{name} path:', id, raw)
             return null
         }
 
         const name = decodeURIComponent(match[1]!)
 
-        if (!name) {
-            console.warn(`Chart ${id} has an empty level name:`, raw)
-            return null
-        }
+        if (!name) return null
 
         return {
             id,
@@ -168,7 +164,7 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
             name,
         }
     } catch (error) {
-        console.warn(`Invalid level URL for chart ${id}:`, raw, error)
+        console.warn('Invalid level URL in sheet:', id, raw, error)
         return null
     }
 }
@@ -207,10 +203,7 @@ async function customRows(): Promise<Row[]> {
         }))
         .filter((row) => row.id && row.input)
 
-    console.log(
-        `[Sheets] Read ${result.length} usable rows from custom tab.`,
-        `First IDs: ${result.slice(0, 10).map((row) => row.id).join(', ')}`,
-    )
+    console.log(`[Sheets] Read ${result.length} rows from custom tab.`)
 
     return result
 }
@@ -222,7 +215,6 @@ function isCustomLevelId(id: string): boolean {
 
 export async function getCustomLevels(): Promise<SheetChart[]> {
     const rows = await customRows()
-
     const matchingRows = rows.filter((row) => isCustomLevelId(row.id))
 
     const charts = matchingRows
@@ -231,8 +223,8 @@ export async function getCustomLevels(): Promise<SheetChart[]> {
         .sort(compareIdDescending)
 
     console.log(
-        `[Sheets] Custom levels: ${charts.length} valid charts from ${matchingRows.length} matching IDs.`,
-        `IDs: ${charts.map((chart) => chart.id).join(', ')}`,
+        `[Sheets] Levels: ${charts.length} valid charts from ${matchingRows.length} matching IDs.`,
+        charts.map((chart) => chart.id).join(', '),
     )
 
     return charts
@@ -243,11 +235,7 @@ function suduPlaylistName(id: string): string | null {
 
     if (!match) return null
 
-    const editionNumber = Number(match[1])
-
-    if (!Number.isFinite(editionNumber)) return null
-
-    return `SUDU-${String(editionNumber).padStart(3, '0')}`
+    return `SUDU-${match[1]!.padStart(3, '0')}`
 }
 
 export async function getPlaylists(): Promise<PlaylistData[]> {
@@ -265,7 +253,6 @@ export async function getPlaylists(): Promise<PlaylistData[]> {
 
     for (const chart of charts) {
         const id = normalizeId(chart.id).toUpperCase()
-
         let title: string | null = null
 
         if (id.startsWith('D')) {
@@ -326,69 +313,38 @@ function isGroupHeader(header: string): boolean {
 }
 
 export async function getEditionData(): Promise<EditionData> {
-    const rows = await fetchSheet(INDEX_SHEET_ID, 'index')
+    // The tournament configuration is read exclusively from the INDEX tab.
+    const rows = await fetchSheet(INDEX_SHEET_ID, 'INDEX')
 
     if (rows.length < 3) {
-        throw new Error('The index tab needs headers on row 2 and edition data below.')
+        throw new Error('The INDEX tab must contain its title, headers and edition rows.')
     }
 
-    const headers = rows[1]!.map((cell) => cell.trim())
+    // A1 contains "Index". Row 2 contains the column headers.
+    const headers = rows[1]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
-    const dataRows = rows.slice(2)
 
-    let editionColumn = normalized.findIndex((header) =>
-        ['EDITION', 'SEASON', 'TOURNAMENT'].includes(header),
-    )
-
-    if (
-        editionColumn < 0 &&
-        headers.length > 0 &&
-        !isGroupHeader(normalized[0] ?? '') &&
-        !['UB', 'LB'].includes(normalized[0] ?? '') &&
-        !/^G\d+$/.test(normalized[0] ?? '') &&
-        !/^F\d+$/.test(normalized[0] ?? '')
-    ) {
-        editionColumn = 0
-    }
-
-    const hasSongColumns = normalized.some((header) =>
-        /^G\d+$/.test(header) || /^F\d+$/.test(header),
-    )
-
+    // The current edition is always the last non-empty cell in column A.
     let activeRow: string[] | null = null
 
-    if (editionColumn >= 0) {
-        for (let i = dataRows.length - 1; i >= 0; i--) {
-            if ((dataRows[i]?.[editionColumn] ?? '').trim()) {
-                activeRow = dataRows[i]!
-                break
-            }
-        }
-    }
+    for (let i = rows.length - 1; i >= 2; i--) {
+        const row = rows[i]!
 
-    if (!activeRow && hasSongColumns) {
-        for (let i = dataRows.length - 1; i >= 0; i--) {
-            const row = dataRows[i]!
-            const hasSongs = normalized.some((header, column) =>
-                (/^G\d+$/.test(header) || /^F\d+$/.test(header)) &&
-                Boolean((row[column] ?? '').trim()),
-            )
-
-            if (hasSongs) {
-                activeRow = row
-                break
-            }
+        if (normalizeId(row[0])) {
+            activeRow = row
+            break
         }
     }
 
     if (!activeRow) {
-        throw new Error('Could not determine the current edition row in the index tab.')
+        throw new Error('No edition was found in column A of the INDEX tab.')
     }
 
-    const edition =
-        editionColumn >= 0
-            ? (activeRow[editionColumn] ?? '').trim()
-            : 'CURRENT EDITION'
+    const edition = normalizeId(activeRow[0])
+
+    if (!edition) {
+        throw new Error('The current edition name in column A is empty.')
+    }
 
     const groupStage: SheetChart[] = []
     const final: SheetChart[] = []
@@ -396,17 +352,47 @@ export async function getEditionData(): Promise<EditionData> {
 
     for (let column = 0; column < headers.length; column++) {
         const header = normalized[column] ?? ''
-        const value = (activeRow[column] ?? '').trim()
+        const value = String(activeRow[column] ?? '').trim()
 
-        if (!value) continue
+        if (!header || !value) continue
 
+        // Columns G1, G2, G3... contain Group Stage song URLs.
+        const groupMatch = header.match(/^G(\d+)$/)
+
+        // Columns F1, F2, F3... contain Final song URLs.
+        const finalMatch = header.match(/^F(\d+)$/)
+
+        if (groupMatch || finalMatch) {
+            const id = groupMatch
+                ? `G${groupMatch[1]}`
+                : `F${finalMatch![1]}`
+
+            const chart = chartFromUrl(id, value)
+
+            if (!chart) {
+                console.warn(`[INDEX] Invalid ${id} URL:`, value)
+                continue
+            }
+
+            if (groupMatch) {
+                groupStage.push(chart)
+            } else {
+                final.push(chart)
+            }
+
+            continue
+        }
+
+        // Columns A, B, C... after the song columns contain group handles.
         if (isGroupHeader(header)) {
             for (const handle of splitHandles(value)) {
                 divisions[handle] = `Group ${header}`
             }
+
             continue
         }
 
+        // UB and LB contain bracket handles.
         if (header === 'UB' || header === 'LB') {
             const division = header === 'UB'
                 ? 'Upper Bracket'
@@ -415,37 +401,25 @@ export async function getEditionData(): Promise<EditionData> {
             for (const handle of splitHandles(value)) {
                 divisions[handle] = division
             }
-            continue
-        }
-
-        const groupMatch = header.match(/^G(\d+)$/)
-        const finalMatch = header.match(/^F(\d+)$/)
-
-        if (!groupMatch && !finalMatch) continue
-
-        const id = groupMatch
-            ? `G${groupMatch[1]}`
-            : `F${finalMatch![1]}`
-
-        const chart = chartFromUrl(id, value)
-        if (!chart) continue
-
-        if (groupMatch) {
-            groupStage.push(chart)
-        } else {
-            final.push(chart)
         }
     }
 
     const sortByNumber = (a: SheetChart, b: SheetChart) =>
         Number(a.id.slice(1)) - Number(b.id.slice(1))
 
-    return {
+    const result: EditionData = {
         edition,
         groupStage: groupStage.sort(sortByNumber),
         final: final.sort(sortByNumber),
         divisions,
     }
+
+    console.log('[INDEX] Current edition:', edition)
+    console.log('[INDEX] Group Stage songs:', groupStage.length, groupStage)
+    console.log('[INDEX] Final songs:', final.length, final)
+    console.log('[INDEX] Divisions:', divisions)
+
+    return result
 }
 
 export async function getCurrentEdition(): Promise<string> {
