@@ -6,21 +6,7 @@
 
 export const ACTIVE_EDITION = 'WINTER 2027'
 
-export const GROUP_ORDER = [
-    'A',
-    'B',
-    'C',
-    'D',
-    'E',
-    'F',
-    'G',
-    'H',
-    'I',
-    'J',
-    'K',
-    'X',
-    'T',
-] as const
+export const GROUP_ORDER = ['A','B','C','D','E','F','G','H','I','J','K','X','T'] as const
 
 export type GroupName = typeof GROUP_ORDER[number]
 export type BracketName = 'Upper Bracket' | 'Lower Bracket'
