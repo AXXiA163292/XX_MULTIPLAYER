@@ -1,3 +1,4 @@
+
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
@@ -5,7 +6,13 @@ import {
     SCORING_MODES,
     SERVER_DESCRIPTION,
 } from './config.ts'
-import { ACTIVE_EDITION, EDITIONS } from './songpool.ts'
+import {
+    ACTIVE_EDITION,
+    EDITIONS,
+    GROUP_ORDER,
+    getChartConstant,
+    getDivision,
+} from './songpool.ts'
 import {
     parseSettings,
     roomForms,
@@ -48,6 +55,9 @@ type LevelInfo = {
     title: string
     firstTag: string
     rating: number | null
+    constant: number | null
+    noteCount: number | null
+    difficulty: string
 }
 
 type RoomState = {
@@ -100,17 +110,17 @@ function songPoolSuggestions(
     userId: string,
 ) {
     const edition = EDITIONS[ACTIVE_EDITION]
-    const links = type === 'groupStage'
+    const charts = type === 'groupStage'
         ? edition?.groupStage
         : edition?.final
 
-    if (!Array.isArray(links)) return []
+    if (!Array.isArray(charts)) return []
 
-    return links.flatMap((link) => {
-        if (typeof link !== 'string' || !link.trim()) return []
+    return charts.flatMap((chart) => {
+        if (!chart || typeof chart.url !== 'string') return []
 
         try {
-            const url = new URL(link)
+            const url = new URL(chart.url)
             const match = url.pathname.match(/^\/levels\/([^/]+)\/?$/)
 
             if (
@@ -148,6 +158,47 @@ const localize = (value: any): string => {
     return ''
 }
 
+function descriptionText(value: any): string {
+    if (typeof value === 'string') return value
+
+    if (Array.isArray(value)) {
+        return value.map(descriptionText).join('\n')
+    }
+
+    if (value && typeof value === 'object') {
+        if (typeof value.en === 'string') return value.en
+
+        return Object.values(value)
+            .filter((v) => typeof v === 'string')
+            .join('\n')
+    }
+
+    return ''
+}
+
+function extractDescriptionNumber(
+    description: string,
+    label: string,
+): number | null {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const match = description.match(
+        new RegExp(`${escaped}\\s*•\\s*(\\d+(?:\\.\\d+)?)`, 'i'),
+    )
+
+    if (!match) return null
+
+    const value = Number(match[1])
+    return Number.isFinite(value) ? value : null
+}
+
+function extractDifficulty(description: string): string {
+    const match = description.match(
+        /Difficulty\s*•\s*(EASY|NORMAL|HARD|EXPERT|MASTER|APPEND)/i,
+    )
+
+    return match?.[1]?.toUpperCase() ?? ''
+}
+
 async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
     try {
         const base = new URL(level.address)
@@ -181,18 +232,52 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
 
                 const data: any = await response.json()
                 const item = data.item ?? data
+                const description = descriptionText(item.description)
+
+                const firstTag = localize(
+                    item.tags?.find((tag: any) =>
+                        ['EASY', 'NORMAL', 'HARD', 'EXPERT', 'MASTER', 'APPEND']
+                            .some((difficulty) =>
+                                localize(tag?.title)
+                                    .toUpperCase()
+                                    .startsWith(difficulty),
+                            ),
+                    )?.title,
+                )
+
+                const difficulty =
+                    extractDifficulty(description) ||
+                    firstTag.toUpperCase().match(
+                        /EASY|NORMAL|HARD|EXPERT|MASTER|APPEND/,
+                    )?.[0] ||
+                    ''
+
+                const noteCount = extractDescriptionNumber(
+                    description,
+                    'Combo',
+                )
+
+                const rating = typeof item.rating === 'number'
+                    ? item.rating
+                    : null
+
+                const constant = getChartConstant(
+                    level.address,
+                    level.name,
+                    'groupStage',
+                ) ?? getChartConstant(
+                    level.address,
+                    level.name,
+                    'final',
+                ) ?? rating
 
                 return {
                     title: localize(item.title) || level.name,
-                    firstTag: localize(item.tags?.find((tag: any) =>
-                        ['EASY', 'NORMAL', 'HARD', 'EXPERT', 'MASTER', 'APPEND']
-                            .some((difficulty) =>
-                                localize(tag?.title).toUpperCase().startsWith(difficulty),
-                            ),
-                    )?.title),
-                    rating: typeof item.rating === 'number'
-                        ? item.rating
-                        : null,
+                    firstTag: difficulty || firstTag,
+                    rating,
+                    constant,
+                    noteCount,
+                    difficulty,
                 }
             } catch {
                 continue
@@ -720,30 +805,34 @@ export class Room extends DurableObject<Env> {
                     isResult(cmd.result) &&
                     !s.results[uid]
 
-                if (valid) {
-                    s.results[uid] = cmd.result
-                    s.statuses[uid] = 'waiting'
-
-                    this.sendAll({
-                        type: 'updateUserStatus',
-                        userStatus: {
-                            userId: uid,
-                            status: 'waiting',
-                        },
-                    })
-
-                    this.sendHost({
-                        type: 'addResult',
-                        result: {
-                            userId: uid,
-                            result: cmd.result,
-                        },
-                    })
-
-                    this.pushScoreboard()
+                if (!valid) {
+                    return this.resync(uid)
                 }
 
-                return this.resync(uid)
+                s.results[uid] = cmd.result
+                s.statuses[uid] = 'waiting'
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: 'waiting',
+                    },
+                })
+
+                this.sendHost({
+                    type: 'addResult',
+                    result: {
+                        userId: uid,
+                        result: cmd.result,
+                    },
+                })
+
+                this.pushScoreboard()
+
+                // Do not send a full room resync after a valid finish.
+                // The client has already received the result and status events.
+                return
             }
 
             case 'addChatMessage': {
@@ -885,13 +974,7 @@ export class Room extends DurableObject<Env> {
             next === 'selecting'
         ) {
             if (Object.keys(s.results).length > 0) {
-                s.history.push({
-                    level: s.level,
-                    levelTitle: s.levelInfo?.title,
-                    levelTag: s.levelInfo?.firstTag,
-                    levelRating: s.levelInfo?.rating ?? undefined,
-                    results: { ...s.results },
-                })
+                s.history.push(this.makeRoundRecord())
             }
 
             s.results = {}
@@ -907,6 +990,21 @@ export class Room extends DurableObject<Env> {
             this.pushScoreboard()
         } else {
             return this.resync(uid)
+        }
+    }
+
+    private makeRoundRecord(): RoundRecord {
+        const info = this.st.levelInfo
+
+        return {
+            level: this.st.level,
+            levelTitle: info?.title,
+            levelTag: info?.firstTag,
+            levelRating: info?.rating ?? undefined,
+            levelConstant: info?.constant ?? undefined,
+            noteCount: info?.noteCount ?? undefined,
+            difficulty: info?.difficulty || info?.firstTag || undefined,
+            results: { ...this.st.results },
         }
     }
 
@@ -934,26 +1032,19 @@ export class Room extends DurableObject<Env> {
             status: s.status,
             master,
             lead: master,
-
-            // Keep options present so optionValues always has valid definitions.
             options: roomForms(),
             optionValues: serializeSettings(s.settings),
-
             level: s.level,
             levelOptions: [],
             autoExit: 'off',
-
             isSuggestionsLocked: !isHost,
             suggestions: isHost ? s.suggestions : [],
-
             scoreboardDescription: isHost
                 ? this.description()
                 : undefined,
-
             scoreboardSections: isHost
                 ? this.sections()
                 : [],
-
             results: isHost
                 ? Object.entries(s.results)
                     .filter(([id]) => present.has(id))
@@ -962,9 +1053,7 @@ export class Room extends DurableObject<Env> {
                         result,
                     }))
                 : [],
-
             users: s.members.map((m) => m.roomUser),
-
             userStatuses: s.members.map((m) => ({
                 userId: m.id,
                 status: s.statuses[m.id] ?? 'waiting',
@@ -978,8 +1067,8 @@ export class Room extends DurableObject<Env> {
 
         if (mode === 'pp') {
             return PP_CONFIGURED
-                ? `PP scoring. ${tb}`
-                : `PP scoring (formula not set yet, all 0). ${tb}`
+                ? `PP scoring. Each round is rounded up before the total. ${tb}`
+                : `PP scoring unavailable. ${tb}`
         }
 
         return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tb}`
@@ -989,24 +1078,18 @@ export class Room extends DurableObject<Env> {
         const s = this.st
         const mode = s.settings.scoring
 
-        const present = new Set(
-            s.members.map((m) => m.id),
-        )
-
-        const name = (id: string) =>
-            s.members.find((m) => m.id === id)
+        const presentMembers = s.members
+        const present = new Set(presentMembers.map((m) => m.id))
 
         const live: RoundRecord | null =
             s.status === 'playing' &&
             Object.keys(s.results).length > 0
-                ? {
-                    level: s.level,
-                    levelTitle: s.levelInfo?.title,
-                    levelTag: s.levelInfo?.firstTag,
-                    levelRating: s.levelInfo?.rating ?? undefined,
-                    results: s.results,
-                }
+                ? this.makeRoundRecord()
                 : null
+
+        const history = live
+            ? [...s.history, live]
+            : s.history
 
         const out: {
             title: string
@@ -1016,69 +1099,146 @@ export class Room extends DurableObject<Env> {
             }[]
         }[] = []
 
-        out.push({
-            title: `Total · ${SCORING_MODES[mode]}`,
-            scores: totals(
-                live
-                    ? [...s.history, live]
-                    : s.history,
-                mode,
+        const divisions = this.getDivisions(presentMembers)
+
+        for (const division of divisions) {
+            const divisionIds = new Set(
+                division.members.map((m) => m.id),
             )
-                .filter((t) => present.has(t.userId))
-                .map((t) => ({
+
+            const divisionTotals = totals(history, mode)
+                .filter((t) => divisionIds.has(t.userId))
+
+            out.push({
+                title: `Total · ${division.title}`,
+                scores: divisionTotals.map((t) => ({
                     userId: t.userId,
                     value: fmtScore(t.score, mode),
                 })),
-        })
+            })
+        }
 
         const roundSection = (
-            r: RoundRecord,
+            round: RoundRecord,
             label: string,
         ) => {
-            const song = r.levelTitle || r.level?.name
+            const song = round.levelTitle || round.level?.name
 
             const title = song
-                ? `${label} · ${song}${r.levelTag ? ` ${r.levelTag}` : ''}${r.levelRating != null ? ` Lvl.${r.levelRating}` : ''}`
+                ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
                 : label
 
-            return {
-                title,
-                scores: Object.entries(r.results)
+            for (const division of divisions) {
+                const ids = new Set(
+                    division.members.map((m) => m.id),
+                )
+
+                const scores = Object.entries(round.results)
                     .filter(
                         ([id]) =>
                             present.has(id) &&
-                            name(id),
+                            ids.has(id),
                     )
                     .sort(
                         ([, a], [, b]) =>
-                            compareResults(a, b, mode),
+                            compareResults(a, b, mode, round),
                     )
-                    .map(([userId, res]) => ({
+                    .map(([userId, result]) => ({
                         userId,
-                        value: fmtDetail(res, mode),
-                    })),
+                        value: fmtDetail(result, mode, round),
+                    }))
+
+                out.push({
+                    title: `${title} · ${division.title}`,
+                    scores,
+                })
             }
         }
 
         if (live) {
-            out.push(
-                roundSection(
-                    live,
-                    `Round ${s.history.length + 1} (live)`,
-                ),
+            roundSection(
+                live,
+                `Round ${s.history.length + 1} (live)`,
             )
         }
 
         for (let i = s.history.length - 1; i >= 0; i--) {
-            out.push(
-                roundSection(
-                    s.history[i]!,
-                    `Round ${i + 1}`,
-                ),
+            roundSection(
+                s.history[i]!,
+                `Round ${i + 1}`,
             )
         }
 
         return out
+    }
+
+    private getDivisions(members: Member[]) {
+        const type = this.st.settings.type
+
+        if (type === 'groupStage') {
+            const groups = GROUP_ORDER.map((group) => ({
+                title: `Group ${group}`,
+                members: members.filter(
+                    (member) =>
+                        getDivision(member.handle, 'groupStage') === `Group ${group}`,
+                ),
+            })).filter((division) => division.members.length > 0)
+
+            const assigned = new Set(
+                groups.flatMap((division) =>
+                    division.members.map((member) => member.id),
+                ),
+            )
+
+            const unassigned = members.filter(
+                (member) => !assigned.has(member.id),
+            )
+
+            if (unassigned.length > 0) {
+                groups.push({
+                    title: 'Unassigned',
+                    members: unassigned,
+                })
+            }
+
+            return groups
+        }
+
+        const brackets = [
+            {
+                title: 'Upper Bracket',
+                members: members.filter(
+                    (member) =>
+                        getDivision(member.handle, 'final') === 'Upper Bracket',
+                ),
+            },
+            {
+                title: 'Lower Bracket',
+                members: members.filter(
+                    (member) =>
+                        getDivision(member.handle, 'final') === 'Lower Bracket',
+                ),
+            },
+        ].filter((division) => division.members.length > 0)
+
+        const assigned = new Set(
+            brackets.flatMap((division) =>
+                division.members.map((member) => member.id),
+            ),
+        )
+
+        const unassigned = members.filter(
+            (member) => !assigned.has(member.id),
+        )
+
+        if (unassigned.length > 0) {
+            brackets.push({
+                title: 'Unassigned',
+                members: unassigned,
+            })
+        }
+
+        return brackets
     }
 
     private pushScoreboard(): void {
