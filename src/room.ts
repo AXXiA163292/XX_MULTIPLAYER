@@ -555,41 +555,27 @@ export class Room extends DurableObject<Env> {
 
         switch (cmd.type) {
             case 'updateLevel': {
-                if (
-                    !isHost ||
-                    s.status !== 'selecting' ||
-                    !isSil(cmd.level)
-                ) {
-                    return this.resync(uid)
-                }
+    if (!isHost || s.status !== 'selecting' || !isSil(cmd.level)) {
+        return this.resync(uid)
+    }
 
-                s.level = {
-                    address: cmd.level.address,
-                    name: cmd.level.name,
-                }
+    s.level = {
+        address: cmd.level.address,
+        name: cmd.level.name,
+    }
+    s.levelInfo = null
 
-                s.levelInfo = await fetchLevelInfo(s.level)
+    this.sendHost({
+        type: 'updateLevel',
+        level: s.level,
+    })
 
-                this.sendHost({
-                    type: 'updateLevel',
-                    level: s.level,
-                })
+    this.pushScoreboard()
 
-                if (s.settings.type === 'casualRoom') {
-                    this.sendExcept(uid, {
-                        type: 'updateLevel',
-                        level: s.level,
-                    })
-                } else {
-                    this.sendExcept(uid, {
-                        type: 'updateLevel',
-                        level: null,
-                    })
-                }
-
-                this.pushScoreboard()
-                return
-            }
+    s.levelInfo = await fetchLevelInfo(s.level)
+    this.pushScoreboard()
+    return
+}
 
             case 'updateOptionValues': {
                 const next =
