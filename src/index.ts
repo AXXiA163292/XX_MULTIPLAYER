@@ -516,7 +516,6 @@ export default {
 
             const postName = postSubmitPath[1]!
             const post = await lobby(env).getPost(postName)
-
             if (!post) return new Response(null, { status: 404 })
 
             let body: any
@@ -833,7 +832,6 @@ export default {
                 return message(502, 'Could not read the playlists sheet.')
             }
         }
-
         if (path === '/sonolus/playlists/list' && req.method === 'GET') {
             try {
                 const items = await makePlaylistItems()
