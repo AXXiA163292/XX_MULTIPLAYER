@@ -1,3 +1,4 @@
+
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
@@ -7,6 +8,7 @@ import {
     ACTIVE_EDITION,
     EDITIONS,
     GROUP_ORDER,
+    TOURNAMENT_HOST_HANDLE,
     getChartConstant,
     getDivision,
 } from './config.ts'
@@ -104,7 +106,7 @@ const getRoomTitle = (settings: RoomSettings) => {
     }
 
     if (settings.type === 'casualRoom') {
-        return settings.title || 'Casual Room'
+        return settings.title || 'Custom Room'
     }
 
     return `${SERVER_DESCRIPTION} Final`
@@ -384,8 +386,8 @@ export class Room extends DurableObject<Env> {
             r.hostHandle !== host.handle
         ) return false
 
-        if (host.handle !== this.env.HOST_HANDLE && settings.type !== 'casualRoom') return false
-        if (settings.type === 'casualRoom' && !settings.title) settings.title = host.name || 'Casual Room'
+        if (host.handle !== TOURNAMENT_HOST_HANDLE && settings.type !== 'casualRoom') return false
+        if (settings.type === 'casualRoom' && !settings.title) settings.title = host.name || 'Custom Room'
 
         this.st.configured = true
         this.st.hostId = host.id
@@ -588,7 +590,7 @@ export class Room extends DurableObject<Env> {
                         ? parseSettings(cmd.optionValues)
                         : null
 
-                const tournamentHost = s.members.find((m) => m.id === uid)?.handle === this.env.HOST_HANDLE
+                const tournamentHost = s.members.find((m) => m.id === uid)?.handle === TOURNAMENT_HOST_HANDLE
 
                 if (
                     !isHost ||
@@ -611,7 +613,7 @@ export class Room extends DurableObject<Env> {
                     next.group !== s.settings.group ||
                     next.title !== s.settings.title
 
-                if (next.type === 'casualRoom' && !next.title) next.title = s.hostName || 'Casual Room'
+                if (next.type === 'casualRoom' && !next.title) next.title = s.hostName || 'Custom Room'
 
                 s.settings = next
 
@@ -944,6 +946,7 @@ export class Room extends DurableObject<Env> {
                 return
         }
     }
+
     private finishRoundIfIdle(): boolean {
         const s = this.st
 
@@ -1153,7 +1156,7 @@ export class Room extends DurableObject<Env> {
             master,
             lead: master,
             options: roomForms(
-                s.members.find((m) => m.id === uid)?.handle === this.env.HOST_HANDLE,
+                s.members.find((m) => m.id === uid)?.handle === TOURNAMENT_HOST_HANDLE,
             ),
             optionValues: serializeSettings(s.settings),
             level: canSeeLevel ? s.level : null,
@@ -1472,3 +1475,4 @@ export class Room extends DurableObject<Env> {
         }
     }
 }
+
