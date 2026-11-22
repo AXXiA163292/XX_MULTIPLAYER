@@ -1,4 +1,3 @@
-
 export const PP_SETTINGS = {
     enabled: true,
     defaultSpeed: 1,
@@ -85,28 +84,28 @@ export function calculateArc(
     const gdV = c.goodCoefficient / Math.pow(rating, c.ratingExponent)
     const brV = c.badCoefficient / Math.pow(rating, c.ratingExponent)
 
-    const grR = great / nc
-    const gdR = good / nc
-    const brR = (bad + miss) / nc
+    const grR = Math.max(0, great) / nc
+    const gdR = Math.max(0, good) / nc
+    const brR = Math.max(0, bad + miss) / nc
 
-    return Math.max(
-        0,
-        (
-            perfect +
-            nc * grV * Math.pow(grR, c.greatExponent) +
-            nc * gdV * Math.pow(gdR, c.goodExponent) +
-            nc * brV * Math.pow(brR, c.badExponent)
-        ) / nc,
-    )
+    const value = (
+        perfect +
+        nc * grV * Math.pow(grR, c.greatExponent) +
+        nc * gdV * Math.pow(gdR, c.goodExponent) +
+        nc * brV * Math.pow(brR, c.badExponent)
+    ) / nc
+
+    return Number.isFinite(value) ? Math.max(0, value) : 0
 }
 
 export function calculateAim(combo: number, nc: number): number {
     if (!nc) return 0
 
-    const ratio = combo / nc
+    const ratio = Math.max(0, Math.min(1, combo / nc))
     const c = PP_SETTINGS.aim
 
-    return Math.pow(ratio, c.exponent) * (c.multiplier - ratio)
+    const value = Math.pow(ratio, c.exponent) * (c.multiplier - ratio)
+    return Number.isFinite(value) ? Math.max(0, value) : 0
 }
 
 export function calculateSkill(
@@ -121,23 +120,20 @@ export function calculateSkill(
     const c = PP_SETTINGS.skill
 
     if (combo === nc) {
-        return Math.pow(
-            (rating - c.fullComboOffset) / c.fullComboDivisor,
-            c.fullComboExponent,
-        )
+        const base = Math.max(0, (rating - c.fullComboOffset) / c.fullComboDivisor)
+        const value = Math.pow(base, c.fullComboExponent)
+        return Number.isFinite(value) ? value : 0
     }
 
     if (miss <= c.failedMissThreshold) {
-        return Math.pow(
-            (rating - c.clearOffset) / c.clearDivisor,
-            c.clearExponent,
-        )
+        const base = Math.max(0, (rating - c.clearOffset) / c.clearDivisor)
+        const value = Math.pow(base, c.clearExponent)
+        return Number.isFinite(value) ? value : 0
     }
 
-    return Math.pow(
-        (rating - c.failedOffset) / c.failedDivisor,
-        c.failedExponent,
-    )
+    const base = Math.max(0, (rating - c.failedOffset) / c.failedDivisor)
+    const value = Math.pow(base, c.failedExponent)
+    return Number.isFinite(value) ? value : 0
 }
 
 export function calculatePP(input: PPInput): PPResult {
@@ -207,7 +203,7 @@ export function calculatePP(input: PPInput): PPResult {
     )
 
     const chartRating = rating * Math.pow(
-        speedMultiplier * appendMultiplier,
+        Math.max(0, speedMultiplier * appendMultiplier),
         c.speed.constantExponent,
     )
 
@@ -235,8 +231,8 @@ export function calculatePP(input: PPInput): PPResult {
 
     return {
         pp: Number.isFinite(pp) ? pp : 0,
-        chartWeight,
-        chartRating,
+        chartWeight: Number.isFinite(chartWeight) ? chartWeight : 0,
+        chartRating: Number.isFinite(chartRating) ? chartRating : rating,
         arc,
         aim,
         skill,
@@ -246,16 +242,18 @@ export function calculatePP(input: PPInput): PPResult {
 }
 
 export function roundPP(value: number): number {
+    const safe = Number.isFinite(value) ? value : 0
     switch (PP_SETTINGS.totalRounding) {
         case 'round':
-            return Math.round(value)
+            return Math.round(safe)
         case 'floor':
-            return Math.floor(value)
+            return Math.floor(safe)
         default:
-            return Math.ceil(value)
+            return Math.ceil(safe)
     }
 }
 
 export function formatPP(value: number): string {
-    return `${value.toFixed(PP_SETTINGS.displayDecimals)}pp`
+    const safe = Number.isFinite(value) ? value : 0
+    return `${safe.toFixed(PP_SETTINGS.displayDecimals)}pp`
 }
