@@ -49,6 +49,12 @@ export const ROOM_TYPES = {
 
 export const TOURNAMENT_HOST_HANDLE = '163292'
 
+/**
+ * false = in Group Stage / Final rooms only the host sees the scoreboard and everyone's results;
+ * players only get their own result. Custom Rooms always show the scoreboard to everybody.
+ */
+export const SCOREBOARD_PUBLIC = false
+
 export type RoomType = keyof typeof ROOM_TYPES
 
 export const SCORING_MODES = {
