@@ -471,3 +471,124 @@ export async function getCurrentEdition(): Promise<string> {
 export function clearSheetCache(): void {
     // Sheets are read fresh on every request.
 }
+
+
+// ───────────────────────── Ranked Match song pool (append to src/sheets.ts) ─────────────────────────
+
+const METADATA_TAB = 'METADATA_RAW'
+
+/** [min, max] play level per tier. `append` = range for APPEND charts (only master and diamond use them). */
+export const RANKED_TIERS = {
+    master:   { main: [30, 37] as const, append: [28, 99] as const },
+    diamond:  { main: [29, 32] as const, append: [27, 30] as const },
+    platinum: { main: [28, 31] as const, append: null },
+    gold:     { main: [26, 30] as const, append: null },
+    silver:   { main: [25, 28] as const, append: null },
+    bronze:   { main: [23, 27] as const, append: null },
+    beginner: { main: [18, 25] as const, append: null },
+} as const
+
+export type RankedTier = keyof typeof RANKED_TIERS
+
+const OFFICIAL_DIFFS = ['ez', 'nm', 'hr', 'ex', 'ms', 'ap'] as const
+
+function inRange(level: number, range: readonly [number, number] | null): boolean {
+    return !!range && level >= range[0] && level <= range[1]
+}
+
+/** Official songs: every difficulty whose play level fits the tier (links from <diff>LevelLinkSbuga). */
+async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
+    const values = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+
+    const headerIndex = values.findIndex((row) =>
+        row.some((cell) => normalizeId(cell).toLowerCase() === 'hrlevellinksbuga'),
+    )
+
+    if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
+
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+    const idCol = headers.indexOf('id')
+    const rules = RANKED_TIERS[tier]
+    const pool: SheetChart[] = []
+
+    for (const cells of values.slice(headerIndex + 1)) {
+        for (const diff of OFFICIAL_DIFFS) {
+            const levelCol = headers.indexOf(`${diff}playlevel`)
+            const linkCol = headers.indexOf(`${diff}levellinksbuga`)
+
+            if (levelCol < 0 || linkCol < 0) continue
+
+            const level = Number(normalizeId(cells[levelCol]))
+            const link = normalizeId(cells[linkCol])
+
+            if (!Number.isFinite(level) || !link || link === '-') continue
+
+            const fits = diff === 'ap'
+                ? inRange(level, rules.append)
+                : inRange(level, rules.main)
+
+            if (!fits) continue
+
+            const chart = chartFromUrl(`${normalizeId(cells[idCol])}-${diff}`, link)
+            if (chart) pool.push(chart)
+        }
+    }
+
+    return pool
+}
+
+/** Custom songs: rows of the custom tab with Ranked = true (playLevel + difficulty columns). */
+async function customRankedPool(tier: RankedTier): Promise<SheetChart[]> {
+    const values = await fetchSheet(CUSTOM_SHEET_ID, 'custom')
+
+    const headerIndex = values.findIndex((row) =>
+        row.some((cell) => normalizeId(cell).toLowerCase() === 'ranked'),
+    )
+
+    if (headerIndex < 0) return []
+
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+    const col = (name: string) => headers.indexOf(name)
+    const rules = RANKED_TIERS[tier]
+    const pool: SheetChart[] = []
+
+    for (const cells of values.slice(headerIndex + 1)) {
+        const id = normalizeId(cells[col('id')])
+
+        if (!isCustomLevelId(id)) continue
+        if (normalizeId(cells[col('ranked')]).toLowerCase() !== 'true') continue
+
+        const row: Row = {
+            id,
+            input: normalizeId(cells[col('input')]),
+            serverId: normalizeId(cells[col('serverid')]),
+            privacy: normalizeId(cells[col('privacy')]),
+        }
+
+        if (!isPublicLevel(row)) continue
+
+        const level = Number(normalizeId(cells[col('playlevel')]))
+        const isAppend = normalizeId(cells[col('difficulty')]).toLowerCase() === 'append'
+
+        if (!inRange(level, isAppend ? rules.append : rules.main)) continue
+
+        const chart = chartFromUrl(id, row.input)
+        if (chart) pool.push(chart)
+    }
+
+    return pool
+}
+
+export async function pickRankedLevel(
+    tier: RankedTier,
+    includeCustom: boolean,
+): Promise<SheetChart | null> {
+    const pool = [
+        ...(await officialRankedPool(tier)),
+        ...(includeCustom ? await customRankedPool(tier) : []),
+    ]
+
+    if (pool.length === 0) return null
+
+    return pool[Math.floor(Math.random() * pool.length)]!
+}
