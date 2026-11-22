@@ -9,6 +9,14 @@ import {
     type ScoringMode,
 } from './config.ts'
 
+export type CustomSongsMode = 'off' | 'on' | 'customOnly'
+
+export const CUSTOM_SONGS_MODES: Record<CustomSongsMode, string> = {
+    off: 'Off',
+    on: 'On',
+    customOnly: 'Custom only',
+}
+
 const tournamentScoringOption = {
     query: 'scoring',
     name: 'Round scoring',
@@ -49,7 +57,7 @@ const titleOption = {
 
 const tierOption = {
     query: 'tier',
-    name: 'Rank',
+    name: 'Room title',
     description: 'Pick the rank of this room.',
     required: false,
     type: 'select' as const,
@@ -60,18 +68,16 @@ const tierOption = {
     })),
 }
 
-const customModeOption = {
-    query: 'customMode',
+const customSongsOption = {
+    query: 'customSongs',
     name: 'Custom songs',
-    description: 'Choose which songs can appear in Ranked Match.',
     required: false,
     type: 'select' as const,
-    def: 'off',
-    values: [
-        { name: 'off', title: 'Off' },
-        { name: 'on', title: 'On' },
-        { name: 'only', title: 'Custom only' },
-    ],
+    def: 'off' as CustomSongsMode,
+    values: (Object.keys(CUSTOM_SONGS_MODES) as CustomSongsMode[]).map((name) => ({
+        name,
+        title: CUSTOM_SONGS_MODES[name],
+    })),
 }
 
 const tournamentVisibilityOption = {
@@ -117,9 +123,9 @@ export const closeRoomForm = {
 const isOpenType = (type: RoomType) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-export const roomForms = (isTournamentHost = false, only?: RoomType) =>
+export const roomForms = (isTournamentHost = false) =>
     (Object.keys(ROOM_TYPES) as RoomType[])
-        .filter((type) => (only ? type === only : isTournamentHost || isOpenType(type)))
+        .filter((type) => isTournamentHost || isOpenType(type))
         .map((type) => ({
             type,
             title: ROOM_TYPES[type],
@@ -129,7 +135,8 @@ export const roomForms = (isTournamentHost = false, only?: RoomType) =>
                 : type === 'casualRoom'
                     ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
                     : type === 'rankedRoom'
-                        ? [tierOption, customModeOption]
+                        // Ranked Match: always public, always Ranked scoring, never random.
+                        ? [tierOption, customSongsOption]
                         : [tournamentScoringOption, tournamentVisibilityOption],
         }))
 
@@ -141,35 +148,24 @@ export type RoomSettings = {
     visibility: 'public' | 'private' | 'locked'
     random: boolean
     tier: string
-    customSongs: boolean
-    customOnly: boolean
+    customSongs: CustomSongsMode
 }
 
 export const serializeSettings = (s: RoomSettings) => {
-    const values = [`type=${s.type}`]
+    const values = [
+        `type=${s.type}`,
+        `scoring=${s.scoring}`,
+        `visibility=${s.visibility}`,
+    ]
 
-    if (s.type !== 'rankedRoom') {
-        values.push(`scoring=${s.scoring}`)
-        values.push(`visibility=${s.visibility}`)
-    }
-
-    if (s.type === 'groupStage') {
-        values.push(`group=${encodeURIComponent(s.group || 'A')}`)
-    }
-
+    if (s.type === 'groupStage') values.push(`group=${encodeURIComponent(s.group || 'A')}`)
     if (s.type === 'casualRoom') {
         values.push(`title=${encodeURIComponent(s.title || '')}`)
         values.push(`random=${s.random ? '1' : '0'}`)
     }
-
     if (s.type === 'rankedRoom') {
         values.push(`tier=${encodeURIComponent(s.tier || 'master')}`)
-        const customMode = !s.customSongs
-            ? 'off'
-            : s.customOnly
-                ? 'only'
-                : 'on'
-        values.push(`customMode=${customMode}`)
+        values.push(`customSongs=${encodeURIComponent(s.customSongs || 'off')}`)
     }
 
     return values.join('&')
@@ -178,24 +174,16 @@ export const serializeSettings = (s: RoomSettings) => {
 const isOn = (value: string | null) =>
     ['true', '1', 'on'].includes((value || '').toLowerCase())
 
-const normalizeCustomMode = (
-    value: string | null,
-    legacyCustomSongs: string | null,
-    legacyCustomOnly: string | null,
-): 'off' | 'on' | 'only' => {
-    if (value === 'off' || value === 'on' || value === 'only') {
-        return value
+export function normalizeCustomSongsMode(value: unknown): CustomSongsMode {
+    if (typeof value === 'boolean') return value ? 'on' : 'off'
+    const normalized = String(value ?? '').trim().toLowerCase()
+    if (normalized === 'customonly' || normalized === 'custom_only' || normalized === 'only') {
+        return 'customOnly'
     }
-
-    const enabled = isOn(legacyCustomSongs)
-    const customOnly = enabled && isOn(legacyCustomOnly)
-
-    return !enabled ? 'off' : customOnly ? 'only' : 'on'
-}
-
-const normalizeGroup = (value: string | null) => {
-    const cleaned = (value || '').trim().replace(/^group\s*/i, '').trim()
-    return (cleaned.length === 1 ? cleaned.toUpperCase() : cleaned) || 'A'
+    if (normalized === 'on' || normalized === 'true' || normalized === '1') {
+        return 'on'
+    }
+    return 'off'
 }
 
 export function parseSettings(input: string | URLSearchParams): RoomSettings | null {
@@ -207,7 +195,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
 
     const open = isOpenType(type as RoomType)
     const scoring = p.get('scoring') || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
-    const group = normalizeGroup(p.get('group'))
+    const group = (p.get('group') || 'A').trim() || 'A'
     const title = (p.get('title') || '').trim()
     const rawVisibility = p.get('visibility')
     const rawTier = (p.get('tier') || 'master').trim().toLowerCase()
@@ -216,6 +204,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
         ? rawTier
         : 'master'
 
+    // Ranked Match rooms are always public.
     const visibility = type === 'rankedRoom'
         ? 'public'
         : type === 'casualRoom'
@@ -223,17 +212,9 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
             : (rawVisibility === 'public' ? 'public' : 'locked')
 
     const random = type === 'casualRoom' && isOn(p.get('random'))
-
-    const customMode = type === 'rankedRoom'
-        ? normalizeCustomMode(
-            p.get('customMode'),
-            p.get('customSongs'),
-            p.get('customOnly'),
-        )
+    const customSongs: CustomSongsMode = type === 'rankedRoom'
+        ? normalizeCustomSongsMode(p.get('customSongs'))
         : 'off'
-
-    const customSongs = customMode !== 'off'
-    const customOnly = customMode === 'only'
 
     if (!(scoring in SCORING_MODES)) return null
     if (type === 'groupStage' && group.length > 24) return null
@@ -241,6 +222,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
 
     return {
         type: type as RoomType,
+        // Ranked Match rooms always use Ranked scoring.
         scoring: type === 'rankedRoom' ? 'rankedMatch' : (scoring as ScoringMode),
         group,
         title,
@@ -248,6 +230,5 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
         random,
         tier,
         customSongs,
-        customOnly,
     }
 }
