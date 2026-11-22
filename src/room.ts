@@ -11,7 +11,6 @@ import {
     parseSettings,
     roomForms,
     serializeSettings,
-    type CustomSongsMode,
     type RoomSettings,
 } from './forms.ts'
 import {
@@ -22,7 +21,13 @@ import {
     totals,
     type RoundRecord,
 } from './scoring.ts'
-import { getEditionData, pickRankedLevel, type EditionData, type RankedTier, type SheetChart } from './sheets.ts'
+import {
+    getEditionData,
+    pickRankedLevel,
+    type EditionData,
+    type RankedTier,
+    type SheetChart,
+} from './sheets.ts'
 import type {
     Env,
     GameplayResult,
@@ -527,6 +532,7 @@ export class Room extends DurableObject<Env> {
 
         console.log(`[Room:${this.st.name || 'init'}] ${event}`, {
             type: this.st.settings.type,
+            scoring: this.st.settings.scoring,
             status: this.st.status,
             round: this.st.round?.state ?? null,
             historyLen: this.st.history.length,
@@ -744,6 +750,7 @@ export class Room extends DurableObject<Env> {
 
         this.diag('ws-join', { userId: user.id, wasConnected })
         await this.maybeFinishRound(true)
+        await this.save()
 
         return new Response(null, {
             status: 101,
@@ -773,7 +780,11 @@ export class Room extends DurableObject<Env> {
             await this.handle(attachment.userId, command)
         } catch (error) {
             console.error('Room command failed:', command?.type, error)
-            this.diag('command-error', { userId: attachment.userId, cmdType: command?.type })
+            this.diag('command-error', {
+                userId: attachment.userId,
+                cmdType: command?.type,
+                error: error instanceof Error ? error.message : String(error),
+            })
             this.resync(attachment.userId)
         }
 
@@ -1262,7 +1273,7 @@ export class Room extends DurableObject<Env> {
                 this.pushScoreboard()
                 this.diag('finishGameplay-accepted', { userId: uid, grade: result.grade })
 
-                await this.maybeFinishRound(false)
+                await this.maybeFinishRound(true)
                 return
             }
 
@@ -1452,6 +1463,7 @@ export class Room extends DurableObject<Env> {
             if (state.settings.type === 'rankedRoom') {
                 state.level = null
                 state.levelInfo = null
+                this.sendAll({ type: 'updateLevel', level: null })
             }
 
             this.sendAll({
@@ -1461,6 +1473,13 @@ export class Room extends DurableObject<Env> {
 
             this.pushScoreboard()
             await this.applyRandomLevel(true)
+
+            for (const member of state.members) {
+                if (this.socketsOf(member.id).length > 0) {
+                    this.resync(member.id)
+                }
+            }
+
             this.diag('status-selecting-from-playing')
         } else {
             return this.resync(uid)
@@ -1652,90 +1671,95 @@ export class Room extends DurableObject<Env> {
     }
 
     private sections() {
-        const state = this.st
-        const mode = state.settings.scoring
+        try {
+            const state = this.st
+            const mode = state.settings.scoring
 
-        const presentMembers = state.members.filter(
-            (member) => this.socketsOf(member.id).length > 0,
-        )
-        const present = new Set(presentMembers.map((member) => member.id))
+            const presentMembers = state.members.filter(
+                (member) => this.socketsOf(member.id).length > 0,
+            )
+            const present = new Set(presentMembers.map((member) => member.id))
 
-        const live: RoundRecord | null =
-            state.status === 'playing' &&
-            Object.keys(state.results).length > 0
-                ? this.makeRoundRecord()
-                : null
+            const live: RoundRecord | null =
+                state.status === 'playing' &&
+                Object.keys(state.results).length > 0
+                    ? this.makeRoundRecord()
+                    : null
 
-        const history = live ? [...state.history, live] : state.history
+            const history = live ? [...state.history, live] : state.history
 
-        const output: {
-            title: string
-            scores: {
-                userId: string
-                value: string
-            }[]
-        }[] = []
+            const output: {
+                title: string
+                scores: {
+                    userId: string
+                    value: string
+                }[]
+            }[] = []
 
-        const divisions = this.getDivisions(presentMembers)
+            const divisions = this.getDivisions(presentMembers)
 
-        for (const division of divisions) {
-            const divisionIds = new Set(division.members.map((member) => member.id))
-            const divisionTotals = totals(history, mode)
-                .filter((total) => divisionIds.has(total.userId) && present.has(total.userId))
-
-            output.push({
-                title: isOpenType(state.settings.type) && state.settings.type === 'casualRoom'
-                    ? 'Standings'
-                    : `Standings · ${division.title}`,
-                scores: divisionTotals.map((total) => ({
-                    userId: total.userId,
-                    value: fmtScore(total.score, mode),
-                })),
-            })
-        }
-
-        if (state.settings.type !== 'casualRoom') {
-            const allTotals = totals(history, mode)
-
-            for (const member of state.members) {
-                if (present.has(member.id)) continue
-
-                const total = allTotals.find((t) => t.userId === member.id)
-                if (!total) continue
+            for (const division of divisions) {
+                const divisionIds = new Set(division.members.map((member) => member.id))
+                const divisionTotals = totals(history, mode)
+                    .filter((total) => divisionIds.has(total.userId) && present.has(total.userId))
 
                 output.push({
-                    title: `Left · ${member.name || member.handle} · ${fmtScore(total.score, mode)}`,
-                    scores: [],
+                    title: division.title
+                        ? `Standings · ${division.title}`
+                        : 'Standings',
+                    scores: divisionTotals.map((total) => ({
+                        userId: total.userId,
+                        value: fmtScore(total.score, mode),
+                    })),
                 })
             }
+
+            if (state.settings.type !== 'casualRoom') {
+                const allTotals = totals(history, mode)
+
+                for (const member of state.members) {
+                    if (present.has(member.id)) continue
+
+                    const total = allTotals.find((t) => t.userId === member.id)
+                    if (!total) continue
+
+                    output.push({
+                        title: `Left · ${member.name || member.handle} · ${fmtScore(total.score, mode)}`,
+                        scores: [],
+                    })
+                }
+            }
+
+            const roundSection = (round: RoundRecord, label: string) => {
+                const song = round.levelTitle || round.level?.name
+                const title = song
+                    ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
+                    : label
+
+                const scores = Object.entries(round.results)
+                    .filter(([id]) => present.has(id))
+                    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
+                    .map(([userId, result]) => ({
+                        userId,
+                        value: fmtDetail(result, mode, round),
+                    }))
+
+                output.push({ title, scores })
+            }
+
+            if (live) {
+                roundSection(live, `Round ${state.history.length + 1} (live)`)
+            }
+
+            for (let index = state.history.length - 1; index >= 0; index--) {
+                roundSection(state.history[index]!, `Round ${index + 1}`)
+            }
+
+            return output
+        } catch (error) {
+            console.error('[Room] Failed building scoreboard sections:', error)
+            return []
         }
-
-        const roundSection = (round: RoundRecord, label: string) => {
-            const song = round.levelTitle || round.level?.name
-            const title = song
-                ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
-                : label
-
-            const scores = Object.entries(round.results)
-                .filter(([id]) => present.has(id))
-                .sort(([, a], [, b]) => compareResults(a, b, mode, round))
-                .map(([userId, result]) => ({
-                    userId,
-                    value: fmtDetail(result, mode, round),
-                }))
-
-            output.push({ title, scores })
-        }
-
-        if (live) {
-            roundSection(live, `Round ${state.history.length + 1} (live)`)
-        }
-
-        for (let index = state.history.length - 1; index >= 0; index--) {
-            roundSection(state.history[index]!, `Round ${index + 1}`)
-        }
-
-        return output
     }
 
     private getDivisions(members: Member[]) {
@@ -1871,7 +1895,8 @@ export class Room extends DurableObject<Env> {
         if (announce) this.pushScoreboard()
 
         await this.save()
-        await this.maybeFinishRound(false)
+        await this.maybeFinishRound(true)
+        await this.save()
 
         const otherSockets = this.ctx.getWebSockets().filter(
             (socket) =>
