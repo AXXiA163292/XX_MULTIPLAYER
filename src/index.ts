@@ -1,5 +1,11 @@
 import { SERVER_DESCRIPTION, SERVER_TITLE, TOURNAMENT_HOST_HANDLE } from './config.ts'
-import { getCustomLevelPage, getCustomLevels, getPlaylists, type SheetChart } from './sheets.ts'
+import {
+    getCustomLevelPage,
+    getCustomLevels,
+    getPlaylists,
+    refreshDailyAssets,
+    type SheetChart,
+} from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
 import type { AuthSession, Env, JoinSession, UserProfile } from './types.ts'
@@ -49,14 +55,12 @@ async function verifySigned(
     }
 
     const p = body.userProfile
-
     if (typeof p?.id !== 'string' || typeof p?.handle !== 'string') {
         return null
     }
 
     if (!env.DEV_SKIP_SIGNATURE) {
         const sig = req.headers.get('Sonolus-Signature')
-
         if (!sig || !(await verifySonolusSignature(raw, sig))) {
             return null
         }
@@ -93,12 +97,10 @@ async function roomItems(env: Env, session: AuthSession | null) {
             const current = await roomStub(env, room.name).summary()
 
             if (!current) {
-                // The room no longer exists (expired or closed): clean the stale entry.
                 await lobby(env).remove(room.name)
                 return null
             }
 
-            // Private rooms are never listed: players join them through the room link only.
             if (current.visibility === 'private') return null
 
             return {
@@ -149,8 +151,7 @@ function postForm(category: PostKind) {
     const label = POST_LABELS[category]
 
     return {
-        // The form type is the category, so the create request says where the post goes.
-        type: category,
+        type: 'post',
         title: label.create,
         requireConfirmation: false,
         options: [
@@ -200,26 +201,18 @@ const deletePostForm = {
     options: [],
 }
 
-const POST_KINDS: PostKind[] = ['announcements', 'posts', 'results']
+function postCategory(url: URL): PostKind {
+    const type =
+        url.searchParams.get('type') ??
+        url.searchParams.get('infoType') ??
+        url.searchParams.get('category')
 
-const asKind = (value: string | null | undefined): PostKind | null =>
-    POST_KINDS.includes(value as PostKind) ? (value as PostKind) : null
-
-/** Category of a post request: `?type=` / `?infoType=` / `?category=` or the same keys in the submitted values. */
-function postCategory(url: URL, values?: URLSearchParams): PostKind {
-    for (const key of ['type', 'infoType', 'category']) {
-        const kind = asKind(url.searchParams.get(key)) ?? asKind(values?.get(key))
-        if (kind) return kind
-    }
-
-    return 'posts'
+    return type === 'announcements' || type === 'results' ? type : 'posts'
 }
 
-/** True when the request names a post category at all (the info request of some clients does not). */
 const hasPostCategory = (url: URL) =>
-    ['type', 'infoType', 'category'].some((key) => asKind(url.searchParams.get(key)) !== null)
+    ['type', 'infoType', 'category'].some((key) => url.searchParams.has(key))
 
-/** Keeps the original case (SUDU-001) so the top-left tag is uppercase. */
 function playlistSlug(name: string): string {
     return name
         .replace(/[^A-Za-z0-9]+/g, '-')
@@ -250,13 +243,7 @@ async function remoteLevelDetails(
             signal: AbortSignal.timeout(12000),
         })
 
-        if (!response.ok) {
-            console.warn(
-                `Level ${chart.id} could not be fetched: HTTP ${response.status}`,
-                endpoint,
-            )
-            return null
-        }
+        if (!response.ok) return null
 
         const data: any = await response.json()
         const item = data.item ?? data
@@ -268,7 +255,6 @@ async function remoteLevelDetails(
             typeof item.engine === 'undefined' ||
             typeof item.data === 'undefined'
         ) {
-            console.warn('Invalid Sonolus LevelItem returned for', chart.id, item)
             return null
         }
 
@@ -290,26 +276,6 @@ async function remoteLevelItem(
 ): Promise<RemoteLevelItem | null> {
     const details = await remoteLevelDetails(chart)
     return details?.item ?? null
-}
-
-function descriptionText(value: any): string {
-    if (typeof value === 'string') return value.trim()
-
-    if (Array.isArray(value)) {
-        return value.map(descriptionText).filter(Boolean).join('\n')
-    }
-
-    if (value && typeof value === 'object') {
-        if (typeof value.en === 'string') return value.en.trim()
-
-        return Object.values(value)
-            .filter((entry): entry is string => typeof entry === 'string')
-            .map((entry) => entry.trim())
-            .filter(Boolean)
-            .join('\n')
-    }
-
-    return ''
 }
 
 function localizedTitle(value: any): string {
@@ -357,10 +323,10 @@ const isUnch = (chart: SheetChart) => {
     }
 }
 
-async function findChart(name: string): Promise<SheetChart | null> {
+async function findChart(name: string, env: Env): Promise<SheetChart | null> {
     const [customCharts, playlists] = await Promise.all([
-        getCustomLevels(),
-        getPlaylists(),
+        getCustomLevels(env),
+        getPlaylists(env),
     ])
 
     return [
@@ -369,7 +335,6 @@ async function findChart(name: string): Promise<SheetChart | null> {
     ].find((entry) => entry.name === name || entry.id === name) ?? null
 }
 
-/** Forwards community / leaderboard requests to the server that owns the level (Untitled Charts only). */
 async function proxyToUnch(
     req: Request,
     url: URL,
@@ -400,7 +365,6 @@ async function proxyToUnch(
         const type = response.headers.get('Content-Type') ?? 'application/json'
 
         if (type.includes('json')) {
-            // Relative repository urls would resolve against this server: make them absolute.
             const text = (await response.text()).replace(
                 /"url":"\/(?!\/)/g,
                 `"url":"${chart.address.replace(/\/+$/, '')}/`,
@@ -430,27 +394,7 @@ async function proxyToUnch(
     }
 }
 
-// Level search (title, artist, author + rating filter), like Untitled Charts.
-
 const LEVEL_SEARCHES = [
-    {
-        type: 'quick',
-        title: '#QUICK',
-        icon: 'search',
-        requireConfirmation: false,
-        options: [
-            {
-                query: 'keywords',
-                name: '#KEYWORDS',
-                required: false,
-                type: 'text',
-                def: '',
-                placeholder: '#KEYWORDS',
-                limit: 0,
-                shortcuts: [],
-            },
-        ],
-    },
     {
         type: 'advanced',
         title: '#ADVANCED',
@@ -506,12 +450,11 @@ const LEVEL_SEARCHES = [
 
 let levelIndex: { at: number; entries: { chart: SheetChart; item: RemoteLevelItem }[] } | null = null
 
-async function allLevelEntries() {
-    if (levelIndex && Date.now() - levelIndex.at < 5 * 60_000) return levelIndex.entries
+async function allLevelEntries(env: Env) {
+    if (levelIndex && Date.now() - levelIndex.at < 15 * 60_000) return levelIndex.entries
 
-    const entries = await loadLevelItems(await getCustomLevels())
+    const entries = await loadLevelItems(await getCustomLevels(env))
     levelIndex = { at: Date.now(), entries }
-
     return entries
 }
 
@@ -524,7 +467,7 @@ function hasLevelFilters(url: URL) {
     return !!keywords || min > 0 || (Number.isFinite(max) && max < 40) || sort !== 'newest'
 }
 
-async function searchLevels(url: URL, page: number) {
+async function searchLevels(url: URL, page: number, env: Env) {
     const keywords = (url.searchParams.get('keywords') ?? '').trim().toLowerCase()
     const min = Number(url.searchParams.get('minRating') ?? '0')
     const max = Number(url.searchParams.get('maxRating') ?? '40')
@@ -538,7 +481,7 @@ async function searchLevels(url: URL, page: number) {
             String(item.name ?? ''),
         ].join(' ').toLowerCase()
 
-    let entries = (await allLevelEntries()).filter(({ item }) => {
+    let entries = (await allLevelEntries(env)).filter(({ item }) => {
         const rating = Number(item.rating)
 
         if (Number.isFinite(rating)) {
@@ -564,11 +507,19 @@ async function searchLevels(url: URL, page: number) {
 
     return {
         pageCount,
-        items: entries.slice(start, start + 10).map((entry) => entry.item),
+        items: page >= pageCount ? [] : entries.slice(start, start + 10).map((entry) => entry.item),
     }
 }
 
 export default {
+    async scheduled(
+        _event: ScheduledEvent,
+        env: Env,
+        ctx: ExecutionContext,
+    ): Promise<void> {
+        ctx.waitUntil(refreshDailyAssets(env))
+    },
+
     async fetch(req: Request, env: Env): Promise<Response> {
         const url = new URL(req.url)
         const path = url.pathname.replace(/\/+$/, '') || '/'
@@ -676,7 +627,6 @@ export default {
             if (!body) return new Response(null, { status: 401 })
 
             const expiration = Date.now() + 30 * 60_000
-
             const session = await signToken(env.SESSION_SECRET, {
                 user: profileOf(body.userProfile),
                 exp: expiration,
@@ -687,7 +637,6 @@ export default {
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
             const object = await env.POSTS_BUCKET.get('server/banner.png')
-
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -698,11 +647,7 @@ export default {
             })
         }
 
-        // Posts: Announcements, Posts and Results (only the tournament host can create / delete)
-
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
-            console.log('[Posts] info request query:', url.search)
-
             const session = await sessionOf(req, env)
             const kinds: PostKind[] = hasPostCategory(url)
                 ? [postCategory(url)]
@@ -717,17 +662,16 @@ export default {
             )
 
             return json({
-                // One create form per category shown (all three on the combined page).
-                creates: canManagePosts(session) ? kinds.map(postForm) : [],
+                creates: canManagePosts(session)
+                    ? [postForm(kinds.length === 1 ? kinds[0]! : 'posts')]
+                    : [],
                 searches: [],
                 sections,
             })
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const posts = await lobby(env).listPosts(
-                hasPostCategory(url) ? postCategory(url) : undefined,
-            )
+            const posts = await lobby(env).listPosts(postCategory(url))
 
             return json({
                 pageCount: 1,
@@ -745,7 +689,6 @@ export default {
             }
 
             let body: any
-
             try {
                 body = await req.json()
             } catch {
@@ -753,7 +696,7 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            const category = postCategory(url, values)
+            const category = postCategory(url)
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
             const thumbnailHash = (values.get('thumbnail') ?? '').trim()
@@ -792,13 +735,10 @@ export default {
             })
         }
 
-        const postSubmitPath = path.match(
-            /^\/sonolus\/posts\/([\w-]+)\/submit$/,
-        )
+        const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
 
         if (postSubmitPath && req.method === 'POST') {
             const session = await sessionOf(req, env)
-
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -810,7 +750,6 @@ export default {
             if (!post) return new Response(null, { status: 404 })
 
             let body: any
-
             try {
                 body = await req.json()
             } catch {
@@ -818,7 +757,6 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-
             if (values.get('type') !== 'deletePost') {
                 return message(400, 'Unknown post action.')
             }
@@ -831,7 +769,6 @@ export default {
 
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
             const session = await sessionOf(req, env)
-
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -839,17 +776,14 @@ export default {
             }
 
             const key = req.headers.get('Sonolus-Upload-Key')
-
             if (!key) return message(400, 'Missing upload key.')
 
             const post = await lobby(env).findPostByUploadKey(key)
-
             if (!post || !post.thumbnailHash) {
                 return message(403, 'Invalid upload key.')
             }
 
             let form: FormData
-
             try {
                 form = await req.formData()
             } catch {
@@ -861,10 +795,7 @@ export default {
                 .find((value): value is File => value instanceof File)
 
             if (!file) return message(400, 'No image was uploaded.')
-
-            if (file.size > 5 * 1024 * 1024) {
-                return message(400, 'Image is too large.')
-            }
+            if (file.size > 5 * 1024 * 1024) return message(400, 'Image is too large.')
 
             const bytes = await file.arrayBuffer()
             const image = new Uint8Array(bytes)
@@ -900,14 +831,10 @@ export default {
                         : null
 
             if (!contentType) {
-                return message(
-                    400,
-                    'Unsupported image format. Use PNG, JPEG, or WebP.',
-                )
+                return message(400, 'Unsupported image format. Use PNG, JPEG, or WebP.')
             }
 
             const digest = await crypto.subtle.digest('SHA-1', bytes)
-
             const hash = Array.from(
                 new Uint8Array(digest),
                 (byte) => byte.toString(16).padStart(2, '0'),
@@ -920,9 +847,7 @@ export default {
             await env.POSTS_BUCKET.put(
                 `posts/${post.item.name}/thumbnail`,
                 bytes,
-                {
-                    httpMetadata: { contentType },
-                },
+                { httpMetadata: { contentType } },
             )
 
             await lobby(env).setPostThumbnail(
@@ -934,15 +859,10 @@ export default {
             return json({})
         }
 
-        const thumbnailPath = path.match(
-            /^\/sonolus\/posts\/([\w-]+)\/thumbnail$/,
-        )
+        const thumbnailPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/thumbnail$/)
 
         if (thumbnailPath && req.method === 'GET') {
-            const object = await env.POSTS_BUCKET.get(
-                `posts/${thumbnailPath[1]}/thumbnail`,
-            )
-
+            const object = await env.POSTS_BUCKET.get(`posts/${thumbnailPath[1]}/thumbnail`)
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -957,7 +877,6 @@ export default {
 
         if (postPath && req.method === 'GET') {
             const post = await lobby(env).getPost(postPath[1]!)
-
             if (!post) return new Response(null, { status: 404 })
 
             return json({
@@ -972,11 +891,9 @@ export default {
             })
         }
 
-        // Levels
-
         if (path === '/sonolus/levels/info' && req.method === 'GET') {
             try {
-                const { charts, pageCount } = await getCustomLevelPage(0)
+                const { charts, pageCount } = await getCustomLevelPage(0, env)
                 const loaded = await loadLevelItems(charts)
 
                 console.log(
@@ -1008,16 +925,16 @@ export default {
                     : 0
 
                 if (hasLevelFilters(url)) {
-                    const found = await searchLevels(url, page)
+                    const found = await searchLevels(url, page, env)
 
                     return json({
                         pageCount: found.pageCount,
-                        items: page >= found.pageCount ? [] : found.items,
+                        items: found.items,
                         searches: LEVEL_SEARCHES,
                     })
                 }
 
-                const { charts, pageCount } = await getCustomLevelPage(page)
+                const { charts, pageCount } = await getCustomLevelPage(page, env)
 
                 if (page >= pageCount) {
                     return json({
@@ -1028,10 +945,6 @@ export default {
                 }
 
                 const loaded = await loadLevelItems(charts)
-
-                console.log(
-                    `[Levels] List page ${page}: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
-                )
 
                 return json({
                     pageCount,
@@ -1049,11 +962,8 @@ export default {
         )
 
         if (levelSub) {
-            const chart = await findChart(decodeURIComponent(levelSub[1]!)).catch(() => null)
-
-            // Only Untitled Charts levels have a community / leaderboards.
+            const chart = await findChart(decodeURIComponent(levelSub[1]!), env).catch(() => null)
             if (!chart || !isUnch(chart)) return new Response(null, { status: 404 })
-
             return proxyToUnch(req, url, chart, levelSub[2]!)
         }
 
@@ -1064,8 +974,8 @@ export default {
 
             try {
                 const [customCharts, playlists] = await Promise.all([
-                    getCustomLevels(),
-                    getPlaylists(),
+                    getCustomLevels(env),
+                    getPlaylists(env),
                 ])
 
                 const allCharts = [
@@ -1082,7 +992,6 @@ export default {
                 if (!chart) return new Response(null, { status: 404 })
 
                 const details = await remoteLevelDetails(chart)
-
                 if (!details) return new Response(null, { status: 502 })
 
                 return json({
@@ -1090,7 +999,6 @@ export default {
                     item: details.item,
                     description: details.description ?? details.item.description ?? '',
                     actions: isUnch(chart) && Array.isArray(details.actions) ? details.actions : [],
-                    // Community / leaderboard only exist on Untitled Charts levels. They are proxied below.
                     hasCommunity: isUnch(chart) ? details.hasCommunity ?? false : false,
                     leaderboards: isUnch(chart) && Array.isArray(details.leaderboards)
                         ? details.leaderboards
@@ -1103,10 +1011,8 @@ export default {
             }
         }
 
-        // Playlists
-
         const makePlaylistItems = async () => {
-            const playlists = await getPlaylists()
+            const playlists = await getPlaylists(env)
 
             return Promise.all(
                 playlists.map(async (playlist) => {
@@ -1145,6 +1051,7 @@ export default {
                 return message(502, 'Could not read the playlists sheet.')
             }
         }
+
         if (path === '/sonolus/playlists/list' && req.method === 'GET') {
             try {
                 const items = await makePlaylistItems()
@@ -1160,15 +1067,13 @@ export default {
             }
         }
 
-        const playlistPath = path.match(
-            /^\/sonolus\/playlists\/([^/]+)$/,
-        )
+        const playlistPath = path.match(/^\/sonolus\/playlists\/([\w-]+)$/)
 
         if (playlistPath && req.method === 'GET') {
             const requestedName = decodeURIComponent(playlistPath[1]!)
 
             try {
-                const playlists = await getPlaylists()
+                const playlists = await getPlaylists(env)
                 const playlist = playlists.find(
                     (entry) => samePlaylist(playlistSlug(entry.name), requestedName),
                 )
@@ -1201,8 +1106,6 @@ export default {
             }
         }
 
-        // Rooms
-
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
             const session = await sessionOf(req, env)
             const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
@@ -1232,7 +1135,6 @@ export default {
 
         if (path === '/sonolus/rooms/create' && req.method === 'POST') {
             const session = await sessionOf(req, env)
-
             if (!session) return new Response(null, { status: 401 })
 
             const name = randomId(8)
@@ -1252,7 +1154,6 @@ export default {
 
         if (roomPath && req.method === 'GET') {
             const item = await roomStub(env, roomPath[1]!).summary()
-
             if (!item) return new Response(null, { status: 404 })
 
             return json({
@@ -1291,7 +1192,6 @@ export default {
 
             if (key) {
                 const settings = parseSettings(url.searchParams)
-
                 if (!settings) {
                     return new Response(null, { status: 400 })
                 }
@@ -1311,9 +1211,7 @@ export default {
                     return new Response(null, { status: 404 })
                 }
 
-                // Locked rooms only accept registered players of that stage.
                 const denied = await stub.canJoin(user)
-
                 if (denied) return message(403, denied)
             }
 
