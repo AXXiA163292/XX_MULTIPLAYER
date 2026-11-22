@@ -187,7 +187,7 @@ function extractDescriptionNumber(
 ): number | null {
     const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const match = description.match(
-        new RegExp(`${escaped}\\s*•\\s*(\\d+(?:\\.\\d+)?)`, 'i'),
+        new RegExp(`${escaped}\\s*(?:•|:)\\s*(\\d+(?:\\.\\d+)?)`, 'i'),
     )
 
     if (!match) return null
@@ -255,7 +255,10 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
 
                 if (!item || typeof item !== 'object') continue
 
-                const description = descriptionText(item.description)
+                // Sbuga places description beside item, not inside item.
+                const description = descriptionText(
+                    data.description ?? item.description,
+                )
 
                 const difficultyTags = Array.isArray(item.tags)
                     ? item.tags
@@ -273,8 +276,6 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     )?.[0] ||
                     ''
 
-                // Ignore tags such as "Spoiler". The difficulty is the
-                // actual chart tag, not necessarily the first tag.
                 const firstTag = difficulty || taggedDifficulty
                 const noteCount = extractComboCount(description)
 
@@ -645,10 +646,8 @@ export class Room extends DurableObject<Env> {
 
         await this.save()
 
-        // Send the complete room state to the reconnecting client.
         this.send(server, this.view(user.id))
 
-        // Existing users are not removed and re-added on reconnect.
         if (!existingMember) {
             this.sendExcept(user.id, {
                 type: 'addUser',
@@ -715,7 +714,6 @@ export class Room extends DurableObject<Env> {
 
         if (!attachment) return
 
-        // A replaced socket must not affect the new connection.
         if (this.socketsOf(attachment.userId).some((socket) => socket !== ws)) {
             return
         }
@@ -746,8 +744,6 @@ export class Room extends DurableObject<Env> {
         const roomName = this.st.name
         const sockets = this.ctx.getWebSockets()
 
-        // Clear the member list before closing sockets. Their close callbacks
-        // then cannot create disconnect results or alter the closed room.
         this.st = fresh()
         await this.save()
         await this.ctx.storage.deleteAlarm()
@@ -785,7 +781,8 @@ export class Room extends DurableObject<Env> {
                 }
                 state.levelInfo = null
 
-                this.sendAll({
+                // Only the host receives the selected level before the game.
+                this.sendHost({
                     type: 'updateLevel',
                     level: state.level,
                 })
@@ -886,7 +883,7 @@ export class Room extends DurableObject<Env> {
                     })
 
                     if (state.level) {
-                        this.sendAll({
+                        this.sendHost({
                             type: 'updateLevel',
                             level: state.level,
                         })
@@ -934,7 +931,6 @@ export class Room extends DurableObject<Env> {
 
                 const target = cmd.userId as string
 
-                // Keep kicked users in the room's member list and standings.
                 for (const socket of this.socketsOf(target)) {
                     try {
                         socket.close(4001, 'kicked')
@@ -1296,13 +1292,11 @@ export class Room extends DurableObject<Env> {
             current === 'preparing' &&
             next === 'playing'
         ) {
-            if (
-                !state.level ||
-                !state.members.some(
-                    (member) =>
-                        state.statuses[member.id] === 'ready',
-                )
-            ) {
+            const readyMembers = state.members.filter(
+                (member) => state.statuses[member.id] === 'ready',
+            )
+
+            if (!state.level || readyMembers.length === 0) {
                 return this.resync(uid)
             }
 
@@ -1319,10 +1313,14 @@ export class Room extends DurableObject<Env> {
                 }
             }
 
-            this.sendAll({
-                type: 'updateLevel',
-                level: state.level,
-            })
+            // Send the selected level once, only to players who are starting.
+            // The host already has the level in their own room view.
+            for (const member of readyMembers) {
+                this.sendTo(member.id, {
+                    type: 'updateLevel',
+                    level: state.level,
+                })
+            }
 
             this.sendAll({
                 type: 'updateStatus',
@@ -1335,10 +1333,8 @@ export class Room extends DurableObject<Env> {
                 seed: state.round.seed,
             }
 
-            for (const member of state.members) {
-                if (state.statuses[member.id] === 'ready') {
-                    this.sendTo(member.id, start)
-                }
+            for (const member of readyMembers) {
+                this.sendTo(member.id, start)
             }
 
             this.pushScoreboard()
@@ -1408,7 +1404,11 @@ export class Room extends DurableObject<Env> {
                 ...(isHost ? [closeRoomForm] : []),
             ],
             optionValues: serializeSettings(state.settings),
-            level: state.level,
+
+            // Only the host receives the selected level before gameplay.
+            // Participants receive it through updateLevel when the round starts.
+            ...(isHost && state.level ? { level: state.level } : {}),
+
             levelOptions: [],
             autoExit: 'off',
             isSuggestionsLocked: state.settings.type !== 'casualRoom' && !isHost,
@@ -1636,9 +1636,6 @@ export class Room extends DurableObject<Env> {
         if (!member) return
 
         if (retain) {
-            // A player who disconnects after gameplay started receives X.
-            // The server cannot inspect the client's remaining note chart,
-            // so an active gameplay disconnect is treated as an incomplete run.
             if (
                 state.status === 'playing' &&
                 state.statuses[uid] === 'playing' &&
