@@ -1,4 +1,3 @@
-
 export interface Env {
     ROOM: DurableObjectNamespace<import('./room.ts').Room>
     LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
@@ -16,6 +15,7 @@ export type Sil = {
 
 export type GameplayResult = {
     grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
+    disqualified?: boolean
     arcadeScore: number
     accuracyScore: number
     combo: number
