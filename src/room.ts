@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import {
     EMPTY_ROOM_TTL_MS,
+    MAX_ROOM_LIFESPAN_MS,
     RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
     TOURNAMENT_HOST_HANDLE,
@@ -9,7 +10,7 @@ import {
     closeRoomForm,
     normalizeCustomSongsMode,
     parseSettings,
-    roomForms,
+    roomFormsForType,
     serializeSettings,
     type RoomSettings,
 } from './forms.ts'
@@ -63,6 +64,7 @@ type LevelInfo = {
 
 type RoomState = {
     name: string
+    createdAt: number
     edition: string
     divisions: Record<string, string>
     reserved: Reservation | null
@@ -84,6 +86,7 @@ type RoomState = {
 
 const fresh = (): RoomState => ({
     name: '',
+    createdAt: 0,
     edition: '',
     divisions: {},
     reserved: null,
@@ -114,8 +117,6 @@ const fresh = (): RoomState => ({
 
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
-
-const KEEP_LEFT_RESULTS_MS = 6 * 60 * 60 * 1000
 
 const getRoomTitle = (settings: RoomSettings, edition = '') => {
     if (settings.type === 'rankedRoom') {
@@ -417,6 +418,9 @@ export class Room extends DurableObject<Env> {
             this.st = {
                 ...base,
                 ...(saved ?? {}),
+                createdAt: typeof saved?.createdAt === 'number' && saved.createdAt > 0
+                    ? saved.createdAt
+                    : Date.now(),
                 settings: {
                     ...base.settings,
                     ...(saved?.settings ?? {}),
@@ -435,7 +439,8 @@ export class Room extends DurableObject<Env> {
                         (x) =>
                             x &&
                             typeof x.name === 'string' &&
-                            typeof x.value === 'number',
+                            typeof x.value === 'number' &&
+                            Number.isFinite(x.value),
                     )
                     : [],
                 suggestions: Array.isArray(saved?.suggestions)
@@ -547,6 +552,54 @@ export class Room extends DurableObject<Env> {
         })
     }
 
+    private remainingLifespanMs(now = Date.now()): number {
+        if (!this.st.createdAt) return MAX_ROOM_LIFESPAN_MS
+        return Math.max(0, this.st.createdAt + MAX_ROOM_LIFESPAN_MS - now)
+    }
+
+    private isExpired(now = Date.now()): boolean {
+        return this.st.createdAt > 0 && now >= this.st.createdAt + MAX_ROOM_LIFESPAN_MS
+    }
+
+    private async scheduleNextAlarm(delayMs?: number): Promise<void> {
+        const now = Date.now()
+        const maxRemaining = this.remainingLifespanMs(now)
+
+        if (maxRemaining <= 0) {
+            await this.expireAndDestroy()
+            return
+        }
+
+        const targetDelay = delayMs === undefined
+            ? maxRemaining
+            : Math.min(Math.max(1000, delayMs), maxRemaining)
+
+        await this.ctx.storage.setAlarm(now + targetDelay)
+    }
+
+    private async expireAndDestroy(): Promise<void> {
+        const roomName = this.st.name
+        const sockets = this.ctx.getWebSockets()
+
+        this.st = fresh()
+        await this.ctx.storage.deleteAll()
+
+        if (roomName) {
+            await this.env.LOBBY
+                .get(this.env.LOBBY.idFromName('main'))
+                .remove(roomName)
+                .catch(() => {})
+        }
+
+        for (const socket of sockets) {
+            try {
+                socket.close(4002, 'room expired (3m max)')
+            } catch {
+                // Socket may already be closed.
+            }
+        }
+    }
+
     private diag(event: string, extra?: Record<string, unknown>) {
         const connectedIds = this.st.members
             .filter((m) => this.socketsOf(m.id).length > 0)
@@ -569,11 +622,12 @@ export class Room extends DurableObject<Env> {
         this.st = {
             ...fresh(),
             name,
+            createdAt: Date.now(),
             reserved: reservation,
         }
 
         await this.save()
-        await this.ctx.storage.setAlarm(Date.now() + RESERVED_ROOM_TTL_MS)
+        await this.scheduleNextAlarm(RESERVED_ROOM_TTL_MS)
     }
 
     async configure(
@@ -581,6 +635,11 @@ export class Room extends DurableObject<Env> {
         settings: RoomSettings,
         host: { id: string; name: string; handle: string },
     ): Promise<boolean> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return false
+        }
+
         const reservation = this.st.reserved
 
         if (
@@ -624,6 +683,7 @@ export class Room extends DurableObject<Env> {
             this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
         }
 
+        this.st.createdAt = Date.now()
         this.st.configured = true
         this.st.hostId = host.id
         this.st.hostName = host.name
@@ -637,19 +697,28 @@ export class Room extends DurableObject<Env> {
         this.st.results = {}
         this.st.history = []
 
-        await this.ctx.storage.deleteAlarm()
         await this.save()
         await this.syncLobby()
+        await this.scheduleNextAlarm(MAX_ROOM_LIFESPAN_MS)
         this.diag('configured')
 
         return true
     }
 
     async isOpen(): Promise<boolean> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return false
+        }
         return this.st.configured
     }
 
     async summary() {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return null
+        }
+
         if (!this.st.configured) return null
 
         return {
@@ -663,6 +732,11 @@ export class Room extends DurableObject<Env> {
     }
 
     async canJoin(user: { id: string; handle: string }): Promise<string | null> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return 'This room has expired.'
+        }
+
         if (!this.st.configured) return 'This room does not exist.'
 
         const s = this.st.settings
@@ -679,6 +753,11 @@ export class Room extends DurableObject<Env> {
     }
 
     async fetch(request: Request): Promise<Response> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return new Response('Room expired', { status: 404 })
+        }
+
         if (request.headers.get('Upgrade') !== 'websocket') {
             return new Response('Expected WebSocket', { status: 426 })
         }
@@ -739,7 +818,6 @@ export class Room extends DurableObject<Env> {
             }
         }
 
-        await this.ctx.storage.deleteAlarm()
         await this.save()
 
         this.send(server, this.view(user.id))
@@ -773,6 +851,7 @@ export class Room extends DurableObject<Env> {
         this.diag('ws-join', { userId: user.id, wasConnected })
         await this.maybeFinishRound(true)
         await this.save()
+        await this.scheduleNextAlarm()
 
         return new Response(null, {
             status: 101,
@@ -784,6 +863,11 @@ export class Room extends DurableObject<Env> {
         ws: WebSocket,
         raw: string | ArrayBuffer,
     ): Promise<void> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return
+        }
+
         const attachment = ws.deserializeAttachment() as { userId: string } | null
         if (!attachment || typeof raw !== 'string') return
 
@@ -811,6 +895,7 @@ export class Room extends DurableObject<Env> {
         }
 
         await this.save()
+        await this.scheduleNextAlarm()
     }
 
     async webSocketClose(ws: WebSocket): Promise<void> {
@@ -834,17 +919,21 @@ export class Room extends DurableObject<Env> {
 
     async alarm(): Promise<void> {
         this.diag('alarm-fired')
+
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return
+        }
+
         await this.maybeFinishRound(true)
         await this.save()
 
-        if (this.ctx.getWebSockets().length > 0) return
+        if (this.ctx.getWebSockets().length === 0) {
+            await this.expireAndDestroy()
+            return
+        }
 
-        await this.env.LOBBY
-            .get(this.env.LOBBY.idFromName('main'))
-            .remove(this.st.name)
-
-        await this.ctx.storage.deleteAll()
-        this.st = fresh()
+        await this.scheduleNextAlarm()
     }
 
     private async closeRoom(uid: string): Promise<void> {
@@ -852,24 +941,7 @@ export class Room extends DurableObject<Env> {
             return this.resync(uid)
         }
 
-        const roomName = this.st.name
-        const sockets = this.ctx.getWebSockets()
-
-        this.st = fresh()
-        await this.save()
-        await this.ctx.storage.deleteAlarm()
-
-        await this.env.LOBBY
-            .get(this.env.LOBBY.idFromName('main'))
-            .remove(roomName)
-
-        for (const socket of sockets) {
-            try {
-                socket.close(4002, 'room closed')
-            } catch {
-                // Socket may already be closed.
-            }
-        }
+        await this.expireAndDestroy()
     }
 
     private async handle(uid: string, cmd: Cmd): Promise<void> {
@@ -922,36 +994,25 @@ export class Room extends DurableObject<Env> {
 
                 const next =
                     typeof cmd.optionValues === 'string'
-                        ? parseSettings(cmd.optionValues)
+                        ? parseSettings(cmd.optionValues, state.settings)
                         : null
 
                 const member = state.members.find((entry) => entry.id === uid)
                 const tournamentHost = member?.handle === TOURNAMENT_HOST_HANDLE
 
-                const structural =
-                    !!next &&
-                    (next.type !== state.settings.type ||
-                        next.scoring !== state.settings.scoring ||
-                        next.group !== state.settings.group ||
-                        next.title !== state.settings.title ||
-                        next.tier !== state.settings.tier ||
-                        next.customSongs !== state.settings.customSongs)
-
                 if (
                     !isHost ||
                     !next ||
+                    next.type !== state.settings.type ||
                     (!tournamentHost && !isOpenType(next.type)) ||
-                    state.status !== 'selecting' ||
-                    (structural && state.history.length > 0)
+                    state.status !== 'selecting'
                 ) {
                     return this.resync(uid)
                 }
 
                 const randomChanged = next.random !== state.settings.random
                 const modeChanged = next.scoring !== state.settings.scoring
-                const typeChanged = next.type !== state.settings.type
                 const titleChanged =
-                    typeChanged ||
                     next.group !== state.settings.group ||
                     next.title !== state.settings.title ||
                     next.tier !== state.settings.tier
@@ -961,52 +1022,6 @@ export class Room extends DurableObject<Env> {
                 }
 
                 state.settings = next
-
-                if (typeChanged) {
-                    let editionData: EditionData | null = null
-
-                    if (!isOpenType(next.type)) {
-                        try {
-                            editionData = await getEditionData()
-                        } catch (error) {
-                            console.error('Could not reload edition sheet:', error)
-                        }
-                    }
-
-                    if (editionData) {
-                        state.edition = editionData.edition
-                        state.divisions = cleanDivisions(editionData.divisions)
-                        state.suggestions = suggestionsFromCharts(
-                            chartsForType(editionData, next.type),
-                            uid,
-                        )
-                    } else {
-                        state.suggestions = await songPoolSuggestions(next.type, uid)
-                    }
-
-                    const updateSuggestions = {
-                        type: 'updateSuggestions',
-                        suggestions: state.suggestions,
-                    }
-
-                    if (isOpenType(next.type)) {
-                        this.sendAll(updateSuggestions)
-                    } else {
-                        this.sendHost(updateSuggestions)
-                    }
-
-                    this.sendAll({
-                        type: 'updateIsSuggestionsLocked',
-                        isSuggestionsLocked: next.type !== 'casualRoom',
-                    })
-
-                    if (state.levelOptions.length > 0) {
-                        state.levelOptions = []
-                        this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
-                    }
-
-                    if (state.level) this.sendLevel()
-                }
 
                 this.sendAll({
                     type: 'updateOptionValues',
@@ -1628,7 +1643,7 @@ export class Room extends DurableObject<Env> {
 
         if (!immediate) {
             if (this.ctx.getWebSockets().length > 0) {
-                await this.ctx.storage.setAlarm(Date.now() + 8000)
+                await this.scheduleNextAlarm(8000)
             }
             return
         }
@@ -1648,6 +1663,7 @@ export class Room extends DurableObject<Env> {
             (member) => this.socketsOf(member.id).length > 0,
         )
         const activeIds = new Set(activeMembers.map((member) => member.id))
+        const canEditLevelOptions = state.settings.type === 'casualRoom' && state.status === 'selecting'
 
         return {
             type: 'update',
@@ -1658,7 +1674,7 @@ export class Room extends DurableObject<Env> {
             master,
             lead: master,
             options: [
-                ...roomForms(this.hostIsTournament()),
+                ...roomFormsForType(state.settings.type, this.hostIsTournament()),
                 ...(isHost ? [closeRoomForm] : []),
             ],
             optionValues: serializeSettings(state.settings),
@@ -1667,7 +1683,7 @@ export class Room extends DurableObject<Env> {
                 state.status !== 'selecting'
                 ? state.level
                 : null,
-            levelOptions: state.settings.type === 'casualRoom'
+            levelOptions: canEditLevelOptions
                 ? state.levelOptions
                 : [],
             autoExit: 'off',
@@ -1940,12 +1956,9 @@ export class Room extends DurableObject<Env> {
         )
 
         if (otherSockets.length === 0) {
-            await this.ctx.storage.setAlarm(
-                Date.now() +
-                    (state.settings.type === 'casualRoom'
-                        ? EMPTY_ROOM_TTL_MS
-                        : KEEP_LEFT_RESULTS_MS),
-            )
+            await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
+        } else {
+            await this.scheduleNextAlarm()
         }
     }
 
