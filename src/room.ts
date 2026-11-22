@@ -3,6 +3,7 @@ import {
     EMPTY_ROOM_TTL_MS,
     RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
+    SERVER_TITLE,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import {
@@ -109,9 +110,6 @@ const fresh = (): RoomState => ({
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-/** Group Stage / Final / Ranked rooms keep the results of players who left. */
-const KEEP_LEFT_RESULTS_MS = 6 * 60 * 60 * 1000
-
 const getRoomTitle = (settings: RoomSettings, edition = '') => {
     if (settings.type === 'rankedRoom') {
         return String(settings.tier || 'master').toUpperCase()
@@ -125,7 +123,9 @@ const getRoomTitle = (settings: RoomSettings, edition = '') => {
         return settings.title || 'Custom Room'
     }
 
-    return `${edition || 'Final'} Final`
+    return edition
+        ? `${SERVER_TITLE} • ${edition} Final`
+        : `${SERVER_TITLE} • Final`
 }
 
 function chartsForType(
@@ -331,6 +331,11 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
     }
 
     return null
+}
+
+type ScoreboardSection = {
+    title: string
+    scores: { userId: string; value: string }[]
 }
 
 type Ev = Record<string, unknown>
@@ -631,6 +636,9 @@ export class Room extends DurableObject<Env> {
         this.st.results = {}
         this.st.history = []
 
+        // Ranked Match: the room starts with a random ranked level already in place.
+        if (settings.type === 'rankedRoom') await this.rollRankedLevel(false)
+
         await this.ctx.storage.deleteAlarm()
         await this.save()
         await this.syncLobby()
@@ -840,10 +848,11 @@ export class Room extends DurableObject<Env> {
     }
 
     async alarm(): Promise<void> {
-        await this.maybeFinishRound(true)
-        await this.save()
-
-        if (this.ctx.getWebSockets().length > 0) return
+        if (this.ctx.getWebSockets().length > 0) {
+            await this.maybeFinishRound(true)
+            await this.save()
+            return
+        }
 
         await this.env.LOBBY
             .get(this.env.LOBBY.idFromName('main'))
@@ -892,16 +901,14 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                if (
-                    state.settings.type === 'rankedRoom' ||
-                    (state.settings.type === 'casualRoom' && state.settings.random)
-                ) {
-                    return this.resync(uid)
+                // Ranked Match: "select" always gives a random level of the room's tier.
+                if (state.settings.type === 'rankedRoom') {
+                    if (!(await this.rollRankedLevel(true))) return this.resync(uid)
+                    return
                 }
 
-                if (state.levelOptions.length > 0) {
-                    state.levelOptions = []
-                    this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+                if (state.settings.type === 'casualRoom' && state.settings.random) {
+                    return this.resync(uid)
                 }
 
                 state.level = {
@@ -931,101 +938,46 @@ export class Room extends DurableObject<Env> {
                         ? parseSettings(cmd.optionValues)
                         : null
 
-                const member = state.members.find(
-                    (entry) => entry.id === uid,
-                )
-
-                const tournamentHost =
-                    member?.handle === TOURNAMENT_HOST_HANDLE
-
-                const structural =
-                    !!next &&
-                    (next.type !== state.settings.type ||
-                        next.scoring !== state.settings.scoring ||
-                        next.group !== state.settings.group ||
-                        next.title !== state.settings.title ||
-                        next.tier !== state.settings.tier ||
-                        next.customSongs !== state.settings.customSongs)
-
+                // Only the form of the current room type is offered: the type never changes.
                 if (
                     !isHost ||
                     !next ||
-                    (!tournamentHost && !isOpenType(next.type)) ||
-                    state.status !== 'selecting' ||
-                    (structural && state.history.length > 0)
+                    next.type !== state.settings.type ||
+                    state.status !== 'selecting'
                 ) {
                     return this.resync(uid)
                 }
-
-                const randomChanged =
-                    next.random !== state.settings.random
-
-                const modeChanged =
-                    next.scoring !== state.settings.scoring
-
-                const typeChanged =
-                    next.type !== state.settings.type
-
-                const titleChanged =
-                    typeChanged ||
-                    next.group !== state.settings.group ||
-                    next.title !== state.settings.title ||
-                    next.tier !== state.settings.tier
 
                 if (next.type === 'casualRoom' && !next.title) {
                     next.title = 'Custom Room'
                 }
 
-                state.settings = next
+                const prev = state.settings
 
-                if (typeChanged) {
-                    let editionData: EditionData | null = null
+                const structural =
+                    next.scoring !== prev.scoring ||
+                    next.group !== prev.group ||
+                    next.title !== prev.title ||
+                    next.tier !== prev.tier ||
+                    next.customSongs !== prev.customSongs
 
-                    if (!isOpenType(next.type)) {
-                        try {
-                            editionData = await getEditionData()
-                        } catch (error) {
-                            console.error('Could not reload edition sheet:', error)
-                        }
-                    }
-
-                    if (editionData) {
-                        state.edition = editionData.edition
-                        state.divisions = cleanDivisions(editionData.divisions)
-                        state.suggestions = suggestionsFromCharts(
-                            chartsForType(editionData, next.type),
-                            uid,
-                        )
-                    } else {
-                        state.suggestions = await songPoolSuggestions(
-                            next.type,
-                            uid,
-                        )
-                    }
-
-                    const updateSuggestions = {
-                        type: 'updateSuggestions',
-                        suggestions: state.suggestions,
-                    }
-
-                    if (isOpenType(next.type)) {
-                        this.sendAll(updateSuggestions)
-                    } else {
-                        this.sendHost(updateSuggestions)
-                    }
-
-                    this.sendAll({
-                        type: 'updateIsSuggestionsLocked',
-                        isSuggestionsLocked: next.type !== 'casualRoom',
-                    })
-
-                    if (state.levelOptions.length > 0) {
-                        state.levelOptions = []
-                        this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
-                    }
-
-                    if (state.level) this.sendLevel()
+                if (structural && state.history.length > 0) {
+                    return this.resync(uid)
                 }
+
+                const randomChanged = next.random !== prev.random
+                const modeChanged = next.scoring !== prev.scoring
+
+                const poolChanged =
+                    next.tier !== prev.tier ||
+                    next.customSongs !== prev.customSongs
+
+                const titleChanged =
+                    next.group !== prev.group ||
+                    next.title !== prev.title ||
+                    next.tier !== prev.tier
+
+                state.settings = next
 
                 this.sendAll({
                     type: 'updateOptionValues',
@@ -1046,6 +998,10 @@ export class Room extends DurableObject<Env> {
                     })
 
                     this.pushScoreboard()
+                }
+
+                if (poolChanged && next.type === 'rankedRoom') {
+                    await this.rollRankedLevel(true)
                 }
 
                 if (randomChanged) await this.applyRandomLevel(true)
@@ -1208,10 +1164,10 @@ export class Room extends DurableObject<Env> {
             case 'updateLevelOption': {
                 const entry = cmd.levelOption
 
-                // Level options (speed, ...) can only be changed in Custom Rooms.
+                // Level options (speed, ...): Group Stage, Final and Ranked Match only (not Custom Rooms).
                 if (
                     !isHost ||
-                    state.settings.type !== 'casualRoom' ||
+                    state.settings.type === 'casualRoom' ||
                     state.status !== 'selecting' ||
                     !entry ||
                     typeof entry.name !== 'string' ||
@@ -1393,28 +1349,12 @@ export class Room extends DurableObject<Env> {
 
         if (current === 'selecting' && next === 'preparing') {
             if (state.settings.type === 'rankedRoom') {
-                // Ranked Match: pressing play picks a random ranked level of the room's tier.
-                let pick: SheetChart | null = null
+                // The level is normally already there (select / previous round); pick one if not.
+                if (!state.level) await this.rollRankedLevel(true)
 
-                try {
-                    pick = await pickRankedLevel(
-                        state.settings.tier as RankedTier,
-                        state.settings.customSongs,
-                    )
-                } catch (error) {
-                    console.error('Could not pick a ranked level:', error)
-                }
-
-                if (state.status !== 'selecting' || !pick) {
+                if (state.status !== 'selecting' || !state.level) {
                     return this.resync(uid)
                 }
-
-                state.level = { address: pick.address, name: pick.name }
-                state.levelInfo = null
-                state.levelOptions = []
-
-                this.sendAll({ type: 'updateLevel', level: state.level })
-                this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
             } else if (
                 state.settings.type === 'casualRoom' &&
                 state.settings.random
@@ -1515,18 +1455,15 @@ export class Room extends DurableObject<Env> {
             state.status = 'selecting'
             waitAll()
 
-            if (state.settings.type === 'rankedRoom') {
-                state.level = null
-                state.levelInfo = null
-            }
-
             this.sendAll({
                 type: 'updateStatus',
                 status: 'selecting',
             })
 
             this.pushScoreboard()
-            await this.applyRandomLevel(true)
+
+            if (state.settings.type === 'rankedRoom') await this.rollRankedLevel(true)
+            else await this.applyRandomLevel(true)
         } else {
             return this.resync(uid)
         }
@@ -1601,16 +1538,59 @@ export class Room extends DurableObject<Env> {
         s.level = { address: pick.address, name: pick.name }
         s.levelInfo = null
 
-        if (s.levelOptions.length > 0) {
-            s.levelOptions = []
-            this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
-        }
-
         this.sendLevel()
         this.pushScoreboard()
 
         s.levelInfo = await fetchLevelInfo(s.level)
         this.pushScoreboard()
+    }
+
+    /** Ranked Match: put a random level of the room's tier (from the ranked list) as the current level. */
+    private async rollRankedLevel(announce: boolean): Promise<boolean> {
+        if (this.st.settings.type !== 'rankedRoom') return false
+
+        let pick: SheetChart | null = null
+
+        try {
+            pick = await pickRankedLevel(
+                this.st.settings.tier as RankedTier,
+                this.st.settings.customSongs,
+                this.st.level,
+            )
+        } catch (error) {
+            console.error('Could not pick a ranked level:', error)
+        }
+
+        if (!pick) {
+            console.warn('Ranked pool is empty for tier', this.st.settings.tier)
+            return false
+        }
+
+        if (this.st.status !== 'selecting' || this.st.settings.type !== 'rankedRoom') {
+            return false
+        }
+
+        const level = { address: pick.address, name: pick.name }
+
+        this.st.level = level
+        this.st.levelInfo = null
+
+        if (announce) {
+            this.sendLevel()
+            this.pushScoreboard()
+        }
+
+        // Metadata is loaded later (when playing) if the room is only being created.
+        if (announce) {
+            const info = await fetchLevelInfo(level)
+
+            if (this.st.level === level) {
+                this.st.levelInfo = info
+                this.pushScoreboard()
+            }
+        }
+
+        return true
     }
 
     private hostIsTournament(): boolean {
@@ -1679,7 +1659,8 @@ export class Room extends DurableObject<Env> {
             // Every client receives the form matching the room's settings.
             // Server-side checks below still restrict who can change settings.
             options: [
-                ...roomForms(this.hostIsTournament()),
+                // Only the settings of the current room type (+ the close button for the host).
+                ...roomForms(this.hostIsTournament(), state.settings.type),
                 ...(isHost ? [closeRoomForm] : []),
             ],
 
@@ -1692,9 +1673,10 @@ export class Room extends DurableObject<Env> {
                 ? state.level
                 : null,
 
+            // Level options exist in Group Stage, Final and Ranked Match only.
             levelOptions: state.settings.type === 'casualRoom'
-                ? state.levelOptions
-                : [],
+                ? []
+                : state.levelOptions,
             autoExit: 'off',
             isSuggestionsLocked: state.settings.type === 'rankedRoom' ||
                 (state.settings.type !== 'casualRoom' && !isHost),
@@ -1702,7 +1684,7 @@ export class Room extends DurableObject<Env> {
                 ? state.suggestions
                 : [],
             scoreboardDescription: this.description(),
-            scoreboardSections: this.canSee(uid) ? this.sections() : [],
+            scoreboardSections: this.canSee(uid) ? this.safeSections() : [],
 
             // Players always get their own result, everyone's only if they may see the scoreboard.
             results: Object.entries(state.results)
@@ -1735,7 +1717,17 @@ export class Room extends DurableObject<Env> {
         return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}`
     }
 
-    private sections() {
+    /** A scoring error must never break the room (the client would show a fatal error). */
+    private safeSections(): ScoreboardSection[] {
+        try {
+            return this.sections()
+        } catch (error) {
+            console.error('Could not build the scoreboard:', error)
+            return []
+        }
+    }
+
+    private sections(): ScoreboardSection[] {
         const state = this.st
         const mode = state.settings.scoring
 
@@ -1932,7 +1924,7 @@ export class Room extends DurableObject<Env> {
     }
 
     private pushScoreboard(): void {
-        const scoreboardSections = this.sections()
+        const scoreboardSections = this.safeSections()
 
         for (const member of this.st.members) {
             if (this.canSee(member.id)) {
@@ -2016,13 +2008,8 @@ export class Room extends DurableObject<Env> {
         )
 
         if (otherSockets.length === 0) {
-            // Tournament / ranked rooms stay available so the scoreboard can still be checked later.
-            await this.ctx.storage.setAlarm(
-                Date.now() +
-                    (state.settings.type === 'casualRoom'
-                        ? EMPTY_ROOM_TTL_MS
-                        : KEEP_LEFT_RESULTS_MS),
-            )
+            // Empty room: kept (with the results of players who left) for EMPTY_ROOM_TTL_MS, then deleted.
+            await this.ctx.storage.setAlarm(Date.now() + EMPTY_ROOM_TTL_MS)
         }
     }
 
