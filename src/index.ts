@@ -288,28 +288,30 @@ function localizedTitle(value: any): string {
     return ''
 }
 
-async function loadLevelItems(charts: SheetChart[]) {
-    const loaded: { chart: SheetChart; item: RemoteLevelItem }[] = []
+async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
+    const results: ({ chart: SheetChart; item: RemoteLevelItem } | null)[] =
+        new Array(charts.length).fill(null)
+    let cursor = 0
 
-    for (let i = 0; i < charts.length; i += 5) {
-        const batch = charts.slice(i, i + 5)
-
-        const results = await Promise.all(
-            batch.map(async (chart) => ({
-                chart,
-                item: await remoteLevelItem(chart),
-            })),
-        )
-
-        loaded.push(
-            ...results.filter(
-                (entry): entry is { chart: SheetChart; item: RemoteLevelItem } =>
-                    entry.item !== null,
-            ),
-        )
+    const worker = async () => {
+        while (cursor < charts.length) {
+            const idx = cursor++
+            const chart = charts[idx]!
+            const item = await remoteLevelItem(chart)
+            results[idx] = item ? { chart, item } : null
+        }
     }
 
-    return loaded
+    const workers = Array.from(
+        { length: Math.min(concurrency, charts.length) },
+        () => worker(),
+    )
+    await Promise.all(workers)
+
+    return results.filter(
+        (entry): entry is { chart: SheetChart; item: RemoteLevelItem } =>
+            entry !== null,
+    )
 }
 
 const UNCH_HOST = 'untitledcharts.com'
@@ -467,6 +469,23 @@ function hasLevelFilters(url: URL) {
     return !!keywords || min > 0 || (Number.isFinite(max) && max < 40) || sort !== 'newest'
 }
 
+function sortLevelEntries(
+    entries: { chart: SheetChart; item: RemoteLevelItem }[],
+    sort: string,
+) {
+    if (sort === 'ratingDesc') {
+        return [...entries].sort((a, b) => Number(b.item.rating) - Number(a.item.rating))
+    }
+    if (sort === 'ratingAsc') {
+        return [...entries].sort((a, b) => Number(a.item.rating) - Number(b.item.rating))
+    }
+    if (sort === 'title') {
+        return [...entries].sort((a, b) =>
+            localizedTitle(a.item.title).localeCompare(localizedTitle(b.item.title)))
+    }
+    return entries
+}
+
 async function searchLevels(url: URL, page: number, env: Env) {
     const keywords = (url.searchParams.get('keywords') ?? '').trim().toLowerCase()
     const min = Number(url.searchParams.get('minRating') ?? '0')
@@ -481,7 +500,7 @@ async function searchLevels(url: URL, page: number, env: Env) {
             String(item.name ?? ''),
         ].join(' ').toLowerCase()
 
-    let entries = (await allLevelEntries(env)).filter(({ item }) => {
+    const filtered = (await allLevelEntries(env)).filter(({ item }) => {
         const rating = Number(item.rating)
 
         if (Number.isFinite(rating)) {
@@ -495,19 +514,13 @@ async function searchLevels(url: URL, page: number, env: Env) {
             .every((word) => haystack(item).includes(word))
     })
 
-    if (sort === 'ratingDesc') entries = [...entries].sort((a, b) => Number(b.item.rating) - Number(a.item.rating))
-    else if (sort === 'ratingAsc') entries = [...entries].sort((a, b) => Number(a.item.rating) - Number(b.item.rating))
-    else if (sort === 'title') {
-        entries = [...entries].sort((a, b) =>
-            localizedTitle(a.item.title).localeCompare(localizedTitle(b.item.title)))
-    }
-
-    const pageCount = Math.max(1, Math.ceil(entries.length / 10))
+    const sorted = sortLevelEntries(filtered, sort)
+    const pageCount = Math.max(1, Math.ceil(sorted.length / 10))
     const start = page * 10
 
     return {
         pageCount,
-        items: page >= pageCount ? [] : entries.slice(start, start + 10).map((entry) => entry.item),
+        items: page >= pageCount ? [] : sorted.slice(start, start + 10).map((entry) => entry.item),
     }
 }
 
