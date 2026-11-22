@@ -57,8 +57,8 @@ const titleOption = {
 
 const tierOption = {
     query: 'tier',
-    name: 'Room title',
-    description: 'Pick the rank of this room.',
+    name: 'Ranked tier',
+    description: 'Pick the rank tier of this room.',
     required: false,
     type: 'select' as const,
     def: 'master',
@@ -123,6 +123,15 @@ export const closeRoomForm = {
 const isOpenType = (type: RoomType) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
+const optionsForType = (type: RoomType) =>
+    type === 'groupStage'
+        ? [groupOption, tournamentScoringOption, tournamentVisibilityOption]
+        : type === 'casualRoom'
+            ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
+            : type === 'rankedRoom'
+                ? [tierOption, customSongsOption]
+                : [tournamentScoringOption, tournamentVisibilityOption]
+
 export const roomForms = (isTournamentHost = false) =>
     (Object.keys(ROOM_TYPES) as RoomType[])
         .filter((type) => isTournamentHost || isOpenType(type))
@@ -130,14 +139,21 @@ export const roomForms = (isTournamentHost = false) =>
             type,
             title: ROOM_TYPES[type],
             requireConfirmation: false,
-            options: type === 'groupStage'
-                ? [groupOption, tournamentScoringOption, tournamentVisibilityOption]
-                : type === 'casualRoom'
-                    ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
-                    : type === 'rankedRoom'
-                        ? [tierOption, customSongsOption]
-                        : [tournamentScoringOption, tournamentVisibilityOption],
+            options: optionsForType(type),
         }))
+
+export const roomFormsForType = (type: RoomType, isTournamentHost = false) => {
+    if (!isTournamentHost && !isOpenType(type)) return []
+
+    return [
+        {
+            type,
+            title: ROOM_TYPES[type],
+            requireConfirmation: false,
+            options: optionsForType(type),
+        },
+    ]
+}
 
 export type RoomSettings = {
     type: RoomType
@@ -185,18 +201,22 @@ export function normalizeCustomSongsMode(value: unknown): CustomSongsMode {
     return 'off'
 }
 
-export function parseSettings(input: string | URLSearchParams): RoomSettings | null {
+export function parseSettings(
+    input: string | URLSearchParams,
+    fallback?: RoomSettings,
+): RoomSettings | null {
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
 
-    const type = p.get('type') || DEFAULT_TYPE
-    if (!(type in ROOM_TYPES)) return null
+    const rawType = p.get('type') || fallback?.type || DEFAULT_TYPE
+    if (!(rawType in ROOM_TYPES)) return null
+    const type = rawType as RoomType
 
-    const open = isOpenType(type as RoomType)
-    const scoring = p.get('scoring') || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
-    const group = (p.get('group') || 'A').trim() || 'A'
-    const title = (p.get('title') || '').trim()
-    const rawVisibility = p.get('visibility')
-    const rawTier = (p.get('tier') || 'master').trim().toLowerCase()
+    const open = isOpenType(type)
+    const scoring = p.get('scoring') || fallback?.scoring || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
+    const group = (p.get('group') ?? fallback?.group ?? 'A').trim() || 'A'
+    const title = (p.get('title') ?? fallback?.title ?? '').trim()
+    const rawVisibility = p.get('visibility') ?? fallback?.visibility ?? (type === 'casualRoom' ? 'public' : 'locked')
+    const rawTier = (p.get('tier') ?? fallback?.tier ?? 'master').trim().toLowerCase()
 
     const tier = (RANKED_TIER_NAMES as readonly string[]).includes(rawTier)
         ? rawTier
@@ -208,9 +228,14 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
             ? (rawVisibility === 'private' ? 'private' : 'public')
             : (rawVisibility === 'public' ? 'public' : 'locked')
 
-    const random = type === 'casualRoom' && isOn(p.get('random'))
+    const random = type === 'casualRoom'
+        ? (p.has('random') ? isOn(p.get('random')) : Boolean(fallback?.random))
+        : false
+
     const customSongs: CustomSongsMode = type === 'rankedRoom'
-        ? normalizeCustomSongsMode(p.get('customSongs'))
+        ? (p.has('customSongs')
+            ? normalizeCustomSongsMode(p.get('customSongs'))
+            : (fallback?.customSongs ?? 'off'))
         : 'off'
 
     if (!(scoring in SCORING_MODES)) return null
@@ -218,7 +243,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
     if (title.length > 48) return null
 
     return {
-        type: type as RoomType,
+        type,
         scoring: type === 'rankedRoom' ? 'rankedMatch' : (scoring as ScoringMode),
         group,
         title,
