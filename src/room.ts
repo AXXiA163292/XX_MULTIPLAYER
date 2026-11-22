@@ -21,7 +21,16 @@ import {
     totals,
     type RoundRecord,
 } from './scoring.ts'
-import { getEditionData, pickRankedLevel, type EditionData, type RankedTier, type SheetChart } from './sheets.ts'
+import {
+    getEditionData,
+    loadRankedPool,
+    pickFromPool,
+    refreshRankedBucket,
+    type EditionData,
+    type RankedCustomMode,
+    type RankedTier,
+    type SheetChart,
+} from './sheets.ts'
 import type {
     Env,
     GameplayResult,
@@ -74,6 +83,8 @@ type RoomState = {
     round: { state: string; seed: number } | null
     results: Record<string, GameplayResult>
     history: RoundRecord[]
+    /** Ranked Match: a new song must be picked before the next match can start. */
+    rankedNeedsRoll: boolean
 }
 
 const fresh = (): RoomState => ({
@@ -93,6 +104,7 @@ const fresh = (): RoomState => ({
         random: false,
         tier: 'master',
         customSongs: false,
+        customOnly: false,
     },
     status: 'selecting',
     level: null,
@@ -104,6 +116,7 @@ const fresh = (): RoomState => ({
     round: null,
     results: {},
     history: [],
+    rankedNeedsRoll: false,
 })
 
 /** Room types anyone can create (no tournament host needed). */
@@ -396,6 +409,9 @@ function cleanDivisions(value: unknown): Record<string, string> {
 export class Room extends DurableObject<Env> {
     st: RoomState = fresh()
 
+    /** Ranked Match song list, loaded when the room opens (kept in storage under 'rankedPool'). */
+    private rankedPool: Sil[] | null = null
+
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
 
@@ -499,6 +515,7 @@ export class Room extends DurableObject<Env> {
             }
 
             this.st.settings.customSongs = this.st.settings.customSongs === true
+            this.st.settings.customOnly = this.st.settings.customOnly === true
 
             if (this.st.settings.type === 'rankedRoom') {
                 this.st.settings.scoring = 'rankedMatch'
@@ -636,8 +653,25 @@ export class Room extends DurableObject<Env> {
         this.st.results = {}
         this.st.history = []
 
-        // Ranked Match: the room starts with a random ranked level already in place.
-        if (settings.type === 'rankedRoom') await this.rollRankedLevel(false)
+        // Ranked Match: load the song list from the bucket once (room open) and put a first song.
+        if (settings.type === 'rankedRoom') {
+            this.rankedPool = null
+            this.st.rankedNeedsRoll = false
+
+            await this.loadRankedSongs()
+            await this.rollRankedLevel(false)
+
+            // Refresh the bucket from the sheets in the background; the next rooms use it.
+            const bucket = this.rankedBucket()
+
+            if (bucket) {
+                this.ctx.waitUntil(
+                    refreshRankedBucket(bucket, settings.tier as RankedTier).catch((error) =>
+                        console.error('Could not refresh the ranked bucket:', error),
+                    ),
+                )
+            }
+        }
 
         await this.ctx.storage.deleteAlarm()
         await this.save()
@@ -848,6 +882,15 @@ export class Room extends DurableObject<Env> {
     }
 
     async alarm(): Promise<void> {
+        try {
+            await this.runAlarm()
+        } catch (error) {
+            // Never rethrow: a failing alarm is retried by Cloudflare and would repeat the failure.
+            console.error('Room alarm failed:', error)
+        }
+    }
+
+    private async runAlarm(): Promise<void> {
         if (this.ctx.getWebSockets().length > 0) {
             await this.maybeFinishRound(true)
             await this.save()
@@ -859,6 +902,7 @@ export class Room extends DurableObject<Env> {
             .remove(this.st.name)
 
         await this.ctx.storage.deleteAll()
+        this.rankedPool = null
         this.st = fresh()
     }
 
@@ -869,6 +913,9 @@ export class Room extends DurableObject<Env> {
 
         const roomName = this.st.name
         const sockets = this.ctx.getWebSockets()
+
+        this.rankedPool = null
+        await this.ctx.storage.delete('rankedPool')
 
         this.st = fresh()
         await this.save()
@@ -959,7 +1006,8 @@ export class Room extends DurableObject<Env> {
                     next.group !== prev.group ||
                     next.title !== prev.title ||
                     next.tier !== prev.tier ||
-                    next.customSongs !== prev.customSongs
+                    next.customSongs !== prev.customSongs ||
+                    next.customOnly !== prev.customOnly
 
                 if (structural && state.history.length > 0) {
                     return this.resync(uid)
@@ -970,7 +1018,8 @@ export class Room extends DurableObject<Env> {
 
                 const poolChanged =
                     next.tier !== prev.tier ||
-                    next.customSongs !== prev.customSongs
+                    next.customSongs !== prev.customSongs ||
+                    next.customOnly !== prev.customOnly
 
                 const titleChanged =
                     next.group !== prev.group ||
@@ -1001,6 +1050,7 @@ export class Room extends DurableObject<Env> {
                 }
 
                 if (poolChanged && next.type === 'rankedRoom') {
+                    await this.loadRankedSongs()
                     await this.rollRankedLevel(true)
                 }
 
@@ -1164,10 +1214,11 @@ export class Room extends DurableObject<Env> {
             case 'updateLevelOption': {
                 const entry = cmd.levelOption
 
-                // Level options (speed, ...): Group Stage, Final and Ranked Match only (not Custom Rooms).
+                // Level options (speed, ...) can only be changed in Custom Rooms.
+                // Group Stage / Final / Ranked Match always use the default options.
                 if (
                     !isHost ||
-                    state.settings.type === 'casualRoom' ||
+                    state.settings.type !== 'casualRoom' ||
                     state.status !== 'selecting' ||
                     !entry ||
                     typeof entry.name !== 'string' ||
@@ -1341,6 +1392,8 @@ export class Room extends DurableObject<Env> {
         const state = this.st
         const current = state.status
 
+        console.log('[Room] status', state.name, state.settings.type, current, '->', next)
+
         const waitAll = () => {
             for (const member of state.members) {
                 state.statuses[member.id] = 'waiting'
@@ -1349,10 +1402,14 @@ export class Room extends DurableObject<Env> {
 
         if (current === 'selecting' && next === 'preparing') {
             if (state.settings.type === 'rankedRoom') {
-                // The level is normally already there (select / previous round); pick one if not.
-                if (!state.level) await this.rollRankedLevel(true)
+                // A match never starts with an old song: after each round a new one from the ranked list is needed.
+                if (!state.level || state.rankedNeedsRoll) await this.rollRankedLevel(true)
 
-                if (state.status !== 'selecting' || !state.level) {
+                if (
+                    state.status !== 'selecting' ||
+                    !state.level ||
+                    state.rankedNeedsRoll
+                ) {
                     return this.resync(uid)
                 }
             } else if (
@@ -1404,6 +1461,8 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'selecting',
             })
+
+            this.sendLevelOptions()
         } else if (current === 'preparing' && next === 'playing') {
             const readyMembers = state.members.filter(
                 (member) =>
@@ -1455,11 +1514,14 @@ export class Room extends DurableObject<Env> {
             state.status = 'selecting'
             waitAll()
 
+            state.rankedNeedsRoll = state.settings.type === 'rankedRoom'
+
             this.sendAll({
                 type: 'updateStatus',
                 status: 'selecting',
             })
 
+            this.sendLevelOptions()
             this.pushScoreboard()
 
             if (state.settings.type === 'rankedRoom') await this.rollRankedLevel(true)
@@ -1497,6 +1559,18 @@ export class Room extends DurableObject<Env> {
 
         if (isOpenType(this.st.settings.type)) this.sendAll(event)
         else this.sendHost(event)
+
+        this.sendLevelOptions()
+    }
+
+    /** Custom Rooms: re-send the chosen level options so a client never falls back to the defaults. */
+    private sendLevelOptions(): void {
+        if (this.st.settings.type !== 'casualRoom' || this.st.levelOptions.length === 0) return
+
+        this.sendAll({
+            type: 'updateLevelOptions',
+            levelOptions: this.st.levelOptions,
+        })
     }
 
     private sendResult(uid: string, result: GameplayResult): void {
@@ -1545,43 +1619,71 @@ export class Room extends DurableObject<Env> {
         this.pushScoreboard()
     }
 
-    /** Ranked Match: put a random level of the room's tier (from the ranked list) as the current level. */
+    private rankedBucket(): R2Bucket | undefined {
+        return (this.env as Env & { RANKED_BUCKET?: R2Bucket }).RANKED_BUCKET
+    }
+
+    private rankedMode(): RankedCustomMode {
+        const s = this.st.settings
+
+        return !s.customSongs ? 'off' : s.customOnly ? 'only' : 'on'
+    }
+
+    /** Loads the song list of the room's tier from the bucket. Only when the room opens / its ranked options change. */
+    private async loadRankedSongs(): Promise<void> {
+        try {
+            const charts = await loadRankedPool(
+                this.rankedBucket(),
+                this.st.settings.tier as RankedTier,
+                this.rankedMode(),
+            )
+
+            this.rankedPool = charts.map((chart) => ({
+                address: chart.address,
+                name: chart.name,
+            }))
+
+            await this.ctx.storage.put('rankedPool', this.rankedPool)
+        } catch (error) {
+            console.error('Could not load the ranked song list:', error)
+        }
+    }
+
+    private async rankedSongs(): Promise<Sil[]> {
+        if (!this.rankedPool) {
+            this.rankedPool = (await this.ctx.storage.get<Sil[]>('rankedPool')) ?? null
+        }
+
+        if (!this.rankedPool || this.rankedPool.length === 0) {
+            await this.loadRankedSongs()
+        }
+
+        return this.rankedPool ?? []
+    }
+
+    /** Ranked Match: put a random song of the room's song list as the current level. */
     private async rollRankedLevel(announce: boolean): Promise<boolean> {
         if (this.st.settings.type !== 'rankedRoom') return false
 
-        let pick: SheetChart | null = null
-
-        try {
-            pick = await pickRankedLevel(
-                this.st.settings.tier as RankedTier,
-                this.st.settings.customSongs,
-                this.st.level,
-            )
-        } catch (error) {
-            console.error('Could not pick a ranked level:', error)
-        }
+        const pick = pickFromPool(await this.rankedSongs(), this.st.level)
 
         if (!pick) {
-            console.warn('Ranked pool is empty for tier', this.st.settings.tier)
+            console.warn('Ranked song list is empty for tier', this.st.settings.tier)
             return false
         }
 
-        if (this.st.status !== 'selecting' || this.st.settings.type !== 'rankedRoom') {
-            return false
-        }
+        if (this.st.status !== 'selecting') return false
 
         const level = { address: pick.address, name: pick.name }
 
         this.st.level = level
         this.st.levelInfo = null
+        this.st.rankedNeedsRoll = false
 
         if (announce) {
             this.sendLevel()
             this.pushScoreboard()
-        }
 
-        // Metadata is loaded later (when playing) if the room is only being created.
-        if (announce) {
             const info = await fetchLevelInfo(level)
 
             if (this.st.level === level) {
@@ -1673,10 +1775,10 @@ export class Room extends DurableObject<Env> {
                 ? state.level
                 : null,
 
-            // Level options exist in Group Stage, Final and Ranked Match only.
+            // Custom Rooms keep their level options. The other room types always use the defaults.
             levelOptions: state.settings.type === 'casualRoom'
-                ? []
-                : state.levelOptions,
+                ? state.levelOptions
+                : [],
             autoExit: 'off',
             isSuggestionsLocked: state.settings.type === 'rankedRoom' ||
                 (state.settings.type !== 'casualRoom' && !isHost),
