@@ -17,6 +17,14 @@ type Row = {
     input: string
     serverId: string
     privacy: string
+    ranked: string
+    playLevel: string
+    difficulty: string
+}
+
+export type RankedCustomChart = SheetChart & {
+    playLevel: number
+    isAppend: boolean
 }
 
 export type SheetChart = {
@@ -92,7 +100,7 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
                 Accept: 'text/csv,text/plain,*/*',
                 'Cache-Control': 'no-cache',
             },
-            signal: AbortSignal.timeout(15000),
+            signal: AbortSignal.timeout(20000),
             cache: 'no-store',
         })
 
@@ -176,9 +184,7 @@ function compareIdDescending(a: SheetChart, b: SheetChart): number {
     })
 }
 
-async function customRows(): Promise<Row[]> {
-    const values = await fetchSheet(CUSTOM_SHEET_ID, 'custom')
-
+function parseCustomRows(values: string[][]): Row[] {
     const headerIndex = values.findIndex((row) => {
         const headers = row.map((cell) => normalizeId(cell).toLowerCase())
         return (
@@ -194,10 +200,15 @@ async function customRows(): Promise<Row[]> {
     }
 
     const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
-    const idIndex = headers.indexOf('id')
-    const inputIndex = headers.indexOf('input')
-    const serverIdIndex = headers.indexOf('serverid')
-    const privacyIndex = headers.indexOf('privacy')
+    const col = (name: string) => headers.indexOf(name)
+
+    const idIndex = col('id')
+    const inputIndex = col('input')
+    const serverIdIndex = col('serverid')
+    const privacyIndex = col('privacy')
+    const rankedIndex = col('ranked')
+    const playLevelIndex = col('playlevel')
+    const difficultyIndex = col('difficulty')
 
     return values
         .slice(headerIndex + 1)
@@ -206,8 +217,15 @@ async function customRows(): Promise<Row[]> {
             input: normalizeId(cells[inputIndex]),
             serverId: normalizeId(cells[serverIdIndex]),
             privacy: normalizeId(cells[privacyIndex]),
+            ranked: rankedIndex >= 0 ? normalizeId(cells[rankedIndex]) : '',
+            playLevel: playLevelIndex >= 0 ? normalizeId(cells[playLevelIndex]) : '',
+            difficulty: difficultyIndex >= 0 ? normalizeId(cells[difficultyIndex]) : '',
         }))
         .filter((row) => row.id && row.input)
+}
+
+async function customRows(): Promise<Row[]> {
+    return parseCustomRows(await fetchSheet(CUSTOM_SHEET_ID, 'custom'))
 }
 
 function isCustomLevelId(id: string): boolean {
@@ -215,7 +233,7 @@ function isCustomLevelId(id: string): boolean {
     return normalized.startsWith('60') || normalized.startsWith('X')
 }
 
-function isPublicLevel(row: Row): boolean {
+function isPublicLevel(row: Pick<Row, 'privacy' | 'serverId'>): boolean {
     const privacy = normalizeId(row.privacy).toLowerCase()
     const serverId = normalizeId(row.serverId)
     return privacy !== 'unlisted' && serverId !== '-'
@@ -257,7 +275,7 @@ async function writeBucketJson<T>(
     data: T,
 ): Promise<void> {
     const bucket = env?.POSTS_BUCKET
-    if (!bucket) return
+    if (!bucket) throw new Error('POSTS_BUCKET R2 binding is missing.')
 
     const payload: StoredSnapshot<T> = {
         updatedAt: Date.now(),
@@ -269,8 +287,7 @@ async function writeBucketJson<T>(
     })
 }
 
-async function fetchCustomLevelsFromSheet(): Promise<SheetChart[]> {
-    const rows = await customRows()
+function buildCustomLevels(rows: Row[]): SheetChart[] {
     return rows
         .filter((row) => isCustomLevelId(row.id) && isPublicLevel(row))
         .map((row) => chartFromUrl(row.id, row.input))
@@ -282,8 +299,10 @@ export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
     const cached = await readBucketJson<SheetChart[]>(env, R2_LEVEL_LIST_KEY)
     if (cached) return cached
 
-    const charts = await fetchCustomLevelsFromSheet()
-    await writeBucketJson(env, R2_LEVEL_LIST_KEY, charts)
+    const charts = buildCustomLevels(await customRows())
+    await writeBucketJson(env, R2_LEVEL_LIST_KEY, charts).catch((e) =>
+        console.warn('[R2] Could not cache level list:', e),
+    )
     return charts
 }
 
@@ -308,8 +327,7 @@ function suduPlaylistName(id: string): string | null {
     return `SUDU-${match[1]!.padStart(3, '0')}`
 }
 
-async function fetchPlaylistsFromSheet(): Promise<PlaylistData[]> {
-    const rows = await customRows()
+function buildPlaylists(rows: Row[]): PlaylistData[] {
     const charts = rows
         .filter((row) => {
             const id = normalizeId(row.id).toUpperCase()
@@ -358,8 +376,10 @@ export async function getPlaylists(env?: Env): Promise<PlaylistData[]> {
     const cached = await readBucketJson<PlaylistData[]>(env, R2_PLAYLISTS_KEY)
     if (cached) return cached
 
-    const playlists = await fetchPlaylistsFromSheet()
-    await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists)
+    const playlists = buildPlaylists(await customRows())
+    await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists).catch((e) =>
+        console.warn('[R2] Could not cache playlists:', e),
+    )
     return playlists
 }
 
@@ -483,10 +503,10 @@ function inRange(level: number, range: readonly [number, number] | null): boolea
     return !!range && level >= range[0] && level <= range[1]
 }
 
-async function officialRankedPoolFromSheet(
+function officialRankedPoolFromSheet(
     values: string[][],
     tier: RankedTier,
-): Promise<SheetChart[]> {
+): SheetChart[] {
     const headerIndex = values.findIndex((row) =>
         row.some((cell) => normalizeId(cell).toLowerCase() === 'hrlevellinksbuga'),
     )
@@ -520,72 +540,38 @@ async function officialRankedPoolFromSheet(
     return pool
 }
 
-async function customRankedPoolFromSheet(
-    values: string[][],
-    tier: RankedTier,
-): Promise<SheetChart[]> {
-    const headerIndex = values.findIndex((row) =>
-        row.some((cell) => normalizeId(cell).toLowerCase() === 'ranked'),
-    )
-    if (headerIndex < 0) return []
+function buildAllCustomRanked(rows: Row[]): RankedCustomChart[] {
+    const pool: RankedCustomChart[] = []
 
-    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
-    const col = (name: string) => headers.indexOf(name)
-    const rules = RANKED_TIERS[tier]
-    const pool: SheetChart[] = []
-
-    for (const cells of values.slice(headerIndex + 1)) {
-        const id = normalizeId(cells[col('id')])
-        if (!isCustomLevelId(id)) continue
-        if (normalizeId(cells[col('ranked')]).toLowerCase() !== 'true') continue
-
-        const row: Row = {
-            id,
-            input: normalizeId(cells[col('input')]),
-            serverId: normalizeId(cells[col('serverid')]),
-            privacy: normalizeId(cells[col('privacy')]),
-        }
+    for (const row of rows) {
+        if (!isCustomLevelId(row.id)) continue
+        if (row.ranked.toLowerCase() !== 'true') continue
         if (!isPublicLevel(row)) continue
 
-        const level = Number(normalizeId(cells[col('playlevel')]))
-        const isAppend = normalizeId(cells[col('difficulty')]).toLowerCase() === 'append'
-        if (!inRange(level, isAppend ? rules.append : rules.main)) continue
+        const playLevel = Number(row.playLevel)
+        if (!Number.isFinite(playLevel)) continue
 
-        const chart = chartFromUrl(id, row.input)
-        if (chart) pool.push(chart)
+        const chart = chartFromUrl(row.id, row.input)
+        if (!chart) continue
+
+        pool.push({
+            ...chart,
+            playLevel,
+            isAppend: row.difficulty.toLowerCase() === 'append',
+        })
     }
 
     return pool
 }
 
-async function allCustomRankedPoolFromSheet(values: string[][]): Promise<SheetChart[]> {
-    const headerIndex = values.findIndex((row) =>
-        row.some((cell) => normalizeId(cell).toLowerCase() === 'ranked'),
+function filterCustomRankedForTier(
+    allCustom: RankedCustomChart[],
+    tier: RankedTier,
+): SheetChart[] {
+    const rules = RANKED_TIERS[tier]
+    return allCustom.filter((item) =>
+        inRange(item.playLevel, item.isAppend ? rules.append : rules.main),
     )
-    if (headerIndex < 0) return []
-
-    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
-    const col = (name: string) => headers.indexOf(name)
-    const pool: SheetChart[] = []
-
-    for (const cells of values.slice(headerIndex + 1)) {
-        const id = normalizeId(cells[col('id')])
-        if (!isCustomLevelId(id)) continue
-        if (normalizeId(cells[col('ranked')]).toLowerCase() !== 'true') continue
-
-        const row: Row = {
-            id,
-            input: normalizeId(cells[col('input')]),
-            serverId: normalizeId(cells[col('serverid')]),
-            privacy: normalizeId(cells[col('privacy')]),
-        }
-        if (!isPublicLevel(row)) continue
-
-        const chart = chartFromUrl(id, row.input)
-        if (chart) pool.push(chart)
-    }
-
-    return pool
 }
 
 async function getRankedTierOfficialPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
@@ -593,52 +579,81 @@ async function getRankedTierOfficialPool(tier: RankedTier, env?: Env): Promise<S
     if (cached) return cached
 
     const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
-    const charts = await officialRankedPoolFromSheet(metaRows, tier)
-    await writeBucketJson(env, rankedTierKey(tier), charts)
+    const charts = officialRankedPoolFromSheet(metaRows, tier)
+    await writeBucketJson(env, rankedTierKey(tier), charts).catch((e) =>
+        console.warn(`[R2] Could not cache ranked tier ${tier}:`, e),
+    )
     return charts
 }
 
 async function getRankedCustomPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
-    const allCustom = await readBucketJson<SheetChart[]>(env, R2_RANKED_CUSTOM_KEY)
-    const customSheetRows = allCustom ? null : await fetchSheet(CUSTOM_SHEET_ID, 'custom')
+    const cached = await readBucketJson<RankedCustomChart[]>(env, R2_RANKED_CUSTOM_KEY)
+    if (cached) return filterCustomRankedForTier(cached, tier)
 
-    if (!allCustom && customSheetRows) {
-        const builtAll = await allCustomRankedPoolFromSheet(customSheetRows)
-        await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, builtAll)
-    }
-
-    const sourceRows = customSheetRows ?? await fetchSheet(CUSTOM_SHEET_ID, 'custom')
-    return customRankedPoolFromSheet(sourceRows, tier)
+    const allCustom = buildAllCustomRanked(await customRows())
+    await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustom).catch((e) =>
+        console.warn('[R2] Could not cache ranked custom pool:', e),
+    )
+    return filterCustomRankedForTier(allCustom, tier)
 }
 
-export async function refreshDailyAssets(env: Env): Promise<void> {
-    console.log('[Cron] Refreshing daily R2 assets...')
+export type RefreshSummary = {
+    levels: number | null
+    playlists: number | null
+    rankedCustom: number | null
+    rankedTiers: Partial<Record<RankedTier, number>>
+    errors: string[]
+}
 
-    const [customCharts, playlists, metaRows, customSheetRows] = await Promise.all([
-        fetchCustomLevelsFromSheet(),
-        fetchPlaylistsFromSheet(),
-        fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB),
-        fetchSheet(CUSTOM_SHEET_ID, 'custom'),
-    ])
-
-    const tiers = Object.keys(RANKED_TIERS) as RankedTier[]
-    const allCustomRanked = await allCustomRankedPoolFromSheet(customSheetRows)
-
-    const writes: Promise<void>[] = [
-        writeBucketJson(env, R2_LEVEL_LIST_KEY, customCharts),
-        writeBucketJson(env, R2_PLAYLISTS_KEY, playlists),
-        writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustomRanked),
-    ]
-
-    for (const tier of tiers) {
-        const officialPool = await officialRankedPoolFromSheet(metaRows, tier)
-        writes.push(writeBucketJson(env, rankedTierKey(tier), officialPool))
+export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
+    console.log('[Refresh] Starting R2 refresh...')
+    const summary: RefreshSummary = {
+        levels: null,
+        playlists: null,
+        rankedCustom: null,
+        rankedTiers: {},
+        errors: [],
     }
 
-    await Promise.all(writes)
-    console.log(
-        `[Cron] Refreshed R2 assets: ${customCharts.length} levels, ${playlists.length} playlists, ${tiers.length} ranked tiers + CUSTOM.`,
-    )
+    // 1. Read "custom" tab once for level-list, playlists, and ranked/CUSTOM.
+    try {
+        const rows = await customRows()
+
+        const customCharts = buildCustomLevels(rows)
+        await writeBucketJson(env, R2_LEVEL_LIST_KEY, customCharts)
+        summary.levels = customCharts.length
+
+        const playlists = buildPlaylists(rows)
+        await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists)
+        summary.playlists = playlists.length
+
+        const allCustomRanked = buildAllCustomRanked(rows)
+        await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustomRanked)
+        summary.rankedCustom = allCustomRanked.length
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        console.error('[Refresh] Failed custom tab step:', msg)
+        summary.errors.push(`custom: ${msg}`)
+    }
+
+    // 2. Read "METADATA_RAW" once and write ranked-match/<TIER>/pool.json for each tier.
+    try {
+        const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+        const tiers = Object.keys(RANKED_TIERS) as RankedTier[]
+
+        for (const tier of tiers) {
+            const officialPool = officialRankedPoolFromSheet(metaRows, tier)
+            await writeBucketJson(env, rankedTierKey(tier), officialPool)
+            summary.rankedTiers[tier] = officialPool.length
+        }
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        console.error('[Refresh] Failed METADATA_RAW step:', msg)
+        summary.errors.push(`METADATA_RAW: ${msg}`)
+    }
+
+    console.log('[Refresh] Finished R2 refresh:', summary)
+    return summary
 }
 
 export async function pickRankedLevel(
