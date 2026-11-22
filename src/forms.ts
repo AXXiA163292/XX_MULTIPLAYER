@@ -106,7 +106,7 @@ export const serializeSettings = (s: RoomSettings) => {
     if (s.type === 'groupStage') values.push(`group=${encodeURIComponent(s.group || 'A')}`)
     if (s.type === 'casualRoom') {
         values.push(`title=${encodeURIComponent(s.title || '')}`)
-        values.push(`random=${s.random ? 'true' : 'false'}`)
+        values.push(`random=${s.random ? '1' : '0'}`)
     }
 
     return values.join('&')
