@@ -28,6 +28,14 @@ export type LobbyPost = {
     thumbnailHash: string
 }
 
+export type ChatMessage = {
+    id: string
+    handle: string
+    author: string
+    text: string
+    time: number
+}
+
 export class Lobby extends DurableObject<Env> {
     async upsert(room: LobbyRoom): Promise<void> {
         await this.ctx.storage.put(`room:${room.name}`, room)
@@ -88,5 +96,42 @@ export class Lobby extends DurableObject<Env> {
 
     async removePost(name: string): Promise<void> {
         await this.ctx.storage.delete(`post:${name}`)
+    }
+
+    async listChatMessages(): Promise<ChatMessage[]> {
+        const messages = await this.ctx.storage.get<ChatMessage[]>('staff_chat_messages')
+        return Array.isArray(messages) ? messages : []
+    }
+
+    async addChatMessage(msg: Omit<ChatMessage, 'id' | 'time'>): Promise<ChatMessage[]> {
+        const current = await this.listChatMessages()
+        const entry: ChatMessage = {
+            id: crypto.randomUUID(),
+            handle: msg.handle,
+            author: msg.author,
+            text: msg.text.slice(0, 500),
+            time: Date.now(),
+        }
+
+        const updated = [...current.slice(-99), entry]
+        await this.ctx.storage.put('staff_chat_messages', updated)
+        await this.markChatRead(msg.handle, entry.time)
+        return updated
+    }
+
+    async markChatRead(handle: string, timestamp = Date.now()): Promise<void> {
+        const reads = (await this.ctx.storage.get<Record<string, number>>('staff_chat_reads')) ?? {}
+        reads[handle] = timestamp
+        await this.ctx.storage.put('staff_chat_reads', reads)
+    }
+
+    async getChatUnreadCount(handle: string): Promise<number> {
+        const [messages, reads] = await Promise.all([
+            this.listChatMessages(),
+            this.ctx.storage.get<Record<string, number>>('staff_chat_reads'),
+        ])
+
+        const lastRead = reads?.[handle] ?? 0
+        return messages.filter((m) => m.handle !== handle && m.time > lastRead).length
     }
 }
