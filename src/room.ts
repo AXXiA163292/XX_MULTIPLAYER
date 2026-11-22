@@ -255,7 +255,6 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
 
                 if (!item || typeof item !== 'object') continue
 
-                // Sbuga places description beside item, not inside item.
                 const description = descriptionText(
                     data.description ?? item.description,
                 )
@@ -781,7 +780,6 @@ export class Room extends DurableObject<Env> {
                 }
                 state.levelInfo = null
 
-                // Only the host receives the selected level before the game.
                 this.sendHost({
                     type: 'updateLevel',
                     level: state.level,
@@ -1097,7 +1095,7 @@ export class Room extends DurableObject<Env> {
                     cmd.state !== state.round.state ||
                     state.statuses[uid] !== 'ready'
                 ) {
-                    return
+                    return this.resync(uid)
                 }
 
                 state.statuses[uid] = 'playing'
@@ -1313,8 +1311,6 @@ export class Room extends DurableObject<Env> {
                 }
             }
 
-            // Send the selected level once, only to players who are starting.
-            // The host already has the level in their own room view.
             for (const member of readyMembers) {
                 this.sendTo(member.id, {
                     type: 'updateLevel',
@@ -1405,9 +1401,11 @@ export class Room extends DurableObject<Env> {
             ],
             optionValues: serializeSettings(state.settings),
 
-            // Only the host receives the selected level before gameplay.
-            // Participants receive it through updateLevel when the round starts.
-            ...(isHost && state.level ? { level: state.level } : {}),
+            // Keep the level field present to avoid invalid room updates.
+            // Non-hosts receive null until the round is underway.
+            level: isHost || state.status === 'playing'
+                ? state.level
+                : null,
 
             levelOptions: [],
             autoExit: 'off',
@@ -1759,17 +1757,20 @@ export class Room extends DurableObject<Env> {
         this.sendTo(uid, this.view(uid))
     }
 
-    private save() {
-        return this.ctx.storage.put('st', this.st)
+    private async save(): Promise<void> {
+        await this.ctx.storage.put('st', this.st)
     }
 
-    private async syncLobby() {
-        const summary = await this.summary()
+    private async syncLobby(): Promise<void> {
+        const lobby = this.env.LOBBY.get(
+            this.env.LOBBY.idFromName('main'),
+        )
 
-        if (summary) {
-            await this.env.LOBBY
-                .get(this.env.LOBBY.idFromName('main'))
-                .upsert(summary)
-        }
+        await lobby.upsert({
+            name: this.st.name,
+            title: getRoomTitle(this.st.settings, this.st.edition),
+            subtitle: '',
+            master: this.st.hostName,
+        })
     }
 }
