@@ -57,6 +57,16 @@ export const RANKED_TIER_NAMES = [
     'beginner',
 ] as const
 
+export const RANKED_MIN_RATING = 18
+export const RANKED_MAX_RATING = 39
+
+export const RANKED_ALLOWED_DIFFICULTIES = new Set([
+    'HARD',
+    'EXPERT',
+    'MASTER',
+    'APPEND',
+])
+
 export const TOURNAMENT_HOST_HANDLE = '163292'
 
 export const STAFF_CHAT_HANDLES = [
@@ -89,6 +99,7 @@ export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 export const SERVER_TITLE = 'XX!'
 export const SERVER_DESCRIPTION = "AXX!A's server!\n\nhttps://discord.gg/xxsrG9G6f"
 
+/** Maximum room lifespan is 3 minutes. */
 export const MAX_ROOM_LIFESPAN_MS = 3 * 60 * 1000
 export const EMPTY_ROOM_TTL_MS = 3 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 3 * 60 * 1000
