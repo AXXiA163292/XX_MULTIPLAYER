@@ -49,7 +49,7 @@ const titleOption = {
 
 const tierOption = {
     query: 'tier',
-    name: 'Room title',
+    name: 'Rank',
     description: 'Pick the rank of this room.',
     required: false,
     type: 'select' as const,
@@ -111,9 +111,10 @@ export const closeRoomForm = {
 const isOpenType = (type: RoomType) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-export const roomForms = (isTournamentHost = false) =>
+/** `only` = just the form of that room type (used inside a room: current type settings only). */
+export const roomForms = (isTournamentHost = false, only?: RoomType) =>
     (Object.keys(ROOM_TYPES) as RoomType[])
-        .filter((type) => isTournamentHost || isOpenType(type))
+        .filter((type) => (only ? type === only : isTournamentHost || isOpenType(type)))
         .map((type) => ({
             type,
             title: ROOM_TYPES[type],
@@ -140,11 +141,13 @@ export type RoomSettings = {
 }
 
 export const serializeSettings = (s: RoomSettings) => {
-    const values = [
-        `type=${s.type}`,
-        `scoring=${s.scoring}`,
-        `visibility=${s.visibility}`,
-    ]
+    const values = [`type=${s.type}`]
+
+    // Only the options that exist in the form of this room type.
+    if (s.type !== 'rankedRoom') {
+        values.push(`scoring=${s.scoring}`)
+        values.push(`visibility=${s.visibility}`)
+    }
 
     if (s.type === 'groupStage') values.push(`group=${encodeURIComponent(s.group || 'A')}`)
     if (s.type === 'casualRoom') {
@@ -162,6 +165,12 @@ export const serializeSettings = (s: RoomSettings) => {
 const isOn = (value: string | null) =>
     ['true', '1', 'on'].includes((value || '').toLowerCase())
 
+/** "Group B", "group b" and "b" all become "B" (the title adds the word Group itself). */
+const normalizeGroup = (value: string | null) => {
+    const cleaned = (value || '').trim().replace(/^group\s*/i, '').trim()
+    return (cleaned.length === 1 ? cleaned.toUpperCase() : cleaned) || 'A'
+}
+
 export function parseSettings(input: string | URLSearchParams): RoomSettings | null {
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
 
@@ -171,7 +180,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
 
     const open = isOpenType(type as RoomType)
     const scoring = p.get('scoring') || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
-    const group = (p.get('group') || 'A').trim() || 'A'
+    const group = normalizeGroup(p.get('group'))
     const title = (p.get('title') || '').trim()
     const rawVisibility = p.get('visibility')
     const rawTier = (p.get('tier') || 'master').trim().toLowerCase()
