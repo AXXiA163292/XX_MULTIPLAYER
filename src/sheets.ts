@@ -473,7 +473,7 @@ export function clearSheetCache(): void {
 }
 
 
-// ───────────────────────── Ranked Match song pool (append to src/sheets.ts) ─────────────────────────
+// ───────────────────────── Ranked Match song pool ─────────────────────────
 
 const METADATA_TAB = 'METADATA_RAW'
 
@@ -496,12 +496,27 @@ function inRange(level: number, range: readonly [number, number] | null): boolea
     return !!range && level >= range[0] && level <= range[1]
 }
 
+// Short cache so clicking "select" several times does not re-download the whole metadata sheet.
+const METADATA_CACHE_MS = 2 * 60_000
+let metadataCache: { at: number; values: string[][] } | null = null
+
+async function metadataRows(): Promise<string[][]> {
+    if (metadataCache && Date.now() - metadataCache.at < METADATA_CACHE_MS) {
+        return metadataCache.values
+    }
+
+    const values = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+    metadataCache = { at: Date.now(), values }
+
+    return values
+}
+
 /** Official songs: every difficulty whose play level fits the tier (links from <diff>LevelLinkSbuga). */
 async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
-    const values = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+    const values = await metadataRows()
 
     const headerIndex = values.findIndex((row) =>
-        row.some((cell) => normalizeId(cell).toLowerCase() === 'hrlevellinksbuga'),
+        row.some((cell) => normalizeId(cell).toLowerCase().endsWith('levellinksbuga')),
     )
 
     if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
@@ -511,17 +526,25 @@ async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
     const rules = RANKED_TIERS[tier]
     const pool: SheetChart[] = []
 
+    const usable = OFFICIAL_DIFFS.filter(
+        (diff) =>
+            headers.includes(`${diff}playlevel`) &&
+            headers.includes(`${diff}levellinksbuga`),
+    )
+
     for (const cells of values.slice(headerIndex + 1)) {
-        for (const diff of OFFICIAL_DIFFS) {
+        for (const diff of usable) {
             const levelCol = headers.indexOf(`${diff}playlevel`)
             const linkCol = headers.indexOf(`${diff}levellinksbuga`)
 
-            if (levelCol < 0 || linkCol < 0) continue
-
-            const level = Number(normalizeId(cells[levelCol]))
+            const rawLevel = normalizeId(cells[levelCol])
             const link = normalizeId(cells[linkCol])
 
-            if (!Number.isFinite(level) || !link || link === '-') continue
+            if (!rawLevel || !link || link === '-') continue
+
+            const level = Number(rawLevel)
+
+            if (!Number.isFinite(level)) continue
 
             const fits = diff === 'ap'
                 ? inRange(level, rules.append)
@@ -533,6 +556,10 @@ async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
             if (chart) pool.push(chart)
         }
     }
+
+    console.log(
+        `[Ranked] Official pool for ${tier}: ${pool.length} charts (difficulty columns found: ${usable.join(', ') || 'none'}).`,
+    )
 
     return pool
 }
@@ -570,25 +597,47 @@ async function customRankedPool(tier: RankedTier): Promise<SheetChart[]> {
         const level = Number(normalizeId(cells[col('playlevel')]))
         const isAppend = normalizeId(cells[col('difficulty')]).toLowerCase() === 'append'
 
+        if (!Number.isFinite(level)) continue
         if (!inRange(level, isAppend ? rules.append : rules.main)) continue
 
         const chart = chartFromUrl(id, row.input)
         if (chart) pool.push(chart)
     }
 
+    console.log(`[Ranked] Custom pool for ${tier}: ${pool.length} charts.`)
+
     return pool
 }
 
+/** Random level of the ranked list for this tier. `exclude` (the current level) is avoided when possible. */
 export async function pickRankedLevel(
     tier: RankedTier,
     includeCustom: boolean,
+    exclude?: { address: string; name: string } | null,
 ): Promise<SheetChart | null> {
-    const pool = [
-        ...(await officialRankedPool(tier)),
-        ...(includeCustom ? await customRankedPool(tier) : []),
-    ]
+    const official = await officialRankedPool(tier)
 
-    if (pool.length === 0) return null
+    let custom: SheetChart[] = []
+
+    if (includeCustom) {
+        try {
+            custom = await customRankedPool(tier)
+        } catch (error) {
+            console.error('[Ranked] Could not read the custom ranked pool:', error)
+        }
+    }
+
+    const all = [...official, ...custom]
+
+    if (all.length === 0) return null
+
+    const others = exclude
+        ? all.filter(
+            (chart) => !(chart.address === exclude.address && chart.name === exclude.name),
+        )
+        : all
+
+    const pool = others.length > 0 ? others : all
 
     return pool[Math.floor(Math.random() * pool.length)]!
 }
