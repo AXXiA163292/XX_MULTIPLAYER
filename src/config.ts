@@ -1,4 +1,3 @@
-
 import type { EditionData, SheetChart } from './sheets.ts'
 
 export const GROUP_ORDER = [
@@ -45,15 +44,24 @@ export const ROOM_TYPES = {
     groupStage: 'Group Stage',
     final: 'Final',
     casualRoom: 'Custom Room',
+    rankedRoom: 'Ranked Match',
 } as const
+
+/** Ranked Match room titles (shown in UPPER case). The level ranges live in sheets.ts. */
+export const RANKED_TIER_NAMES = [
+    'master',
+    'diamond',
+    'platinum',
+    'gold',
+    'silver',
+    'bronze',
+    'beginner',
+] as const
 
 export const TOURNAMENT_HOST_HANDLE = '163292'
 
-/**
- * false = in Group Stage / Final rooms only the host sees the scoreboard and everyone's results;
- * players only get their own result. Custom Rooms always show the scoreboard to everybody.
- */
-export const SCOREBOARD_PUBLIC = false
+/** Everybody sees the scoreboard (kept for reference, room.ts always shows it now). */
+export const SCOREBOARD_PUBLIC = true
 
 export type RoomType = keyof typeof ROOM_TYPES
 
@@ -66,6 +74,8 @@ export type ScoringMode = keyof typeof SCORING_MODES
 
 export const DEFAULT_TYPE: RoomType = 'groupStage'
 export const DEFAULT_SCORING: ScoringMode = 'pp'
+/** Custom Rooms and Ranked Match rooms default to Ranked scoring. */
+export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 
 export const SERVER_TITLE = 'XX! Championship'
 export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\nAXX!A's server!"
