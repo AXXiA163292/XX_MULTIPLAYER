@@ -8,6 +8,7 @@ export type LobbyRoom = {
     title: string
     subtitle: string
     master: string
+    hostId?: string
     visibility?: 'public' | 'private' | 'locked'
 }
 
