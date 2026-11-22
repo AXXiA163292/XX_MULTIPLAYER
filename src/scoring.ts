@@ -4,6 +4,8 @@ import type { GameplayResult } from './types.ts'
 
 export const PP_CONFIGURED = true
 
+export type RoundKind = 'tournament' | 'rewind' | 'warmup' | 'freeplay'
+
 export type RoundRecord = {
     level: { address: string; name: string } | null
     levelTitle?: string
@@ -12,6 +14,10 @@ export type RoundRecord = {
     levelConstant?: number
     noteCount?: number
     difficulty?: string
+    roundKind?: RoundKind
+    roundLabel?: string
+    countsTowardScore?: boolean
+    isReplay?: boolean
     results: Record<string, GameplayResult>
 }
 
@@ -22,7 +28,7 @@ export type Total = {
     bestCombo: number
 }
 
-const isXResult = (r: GameplayResult) =>
+export const isXResult = (r: GameplayResult) =>
     r.disqualified === true || r.grade === 'X'
 
 export const rankedScore = (r: GameplayResult): number =>
@@ -93,32 +99,64 @@ export function compareResults(
     )
 }
 
+function levelKey(level: RoundRecord['level']): string {
+    if (!level) return ''
+    return `${level.address.replace(/\/+$/, '')}::${level.name}`
+}
+
+/**
+ * Computes cumulative totals across rounds:
+ * - Warmup rounds never add to score.
+ * - When a song is played more than once:
+ *   - Only the first result counts UNLESS that first result was 0 due to X,
+ *     in which case the first non-X result counts instead.
+ */
 export function totals(
     history: RoundRecord[],
     mode: ScoringMode,
 ): Total[] {
     const map = new Map<string, Total>()
+    const countedSongForUser = new Set<string>()
+    const hadFirstXForSongUser = new Set<string>()
 
     for (const round of history) {
-        for (const [userId, result] of Object.entries(round.results)) {
-            if (isXResult(result)) continue
+        if (round.roundKind === 'warmup' || round.countsTowardScore === false) {
+            continue
+        }
 
+        const songKey = levelKey(round.level) || round.levelTitle || 'unknown'
+
+        for (const [userId, result] of Object.entries(round.results)) {
             const total = map.get(userId) ?? {
                 userId,
                 score: 0,
                 perfect: 0,
                 bestCombo: 0,
             }
-
-            const added = mode === 'pp'
-                ? roundPP(ppScore(result, round))
-                : rankedScore(result)
-
-            total.score += Number.isFinite(added) ? added : 0
-            total.perfect += Number(result.perfect) || 0
-            total.bestCombo = Math.max(total.bestCombo, Number(result.combo) || 0)
-
             map.set(userId, total)
+
+            const pairKey = `${userId}::${songKey}`
+            const isX = isXResult(result)
+            const rawPoints = roundScore(result, mode, round)
+            const added = mode === 'pp' ? roundPP(rawPoints) : rawPoints
+            const validPoints = !isX && Number.isFinite(added) ? added : 0
+
+            if (!countedSongForUser.has(pairKey)) {
+                if (isX || validPoints === 0) {
+                    hadFirstXForSongUser.add(pairKey)
+                } else {
+                    total.score += validPoints
+                    total.perfect += Number(result.perfect) || 0
+                    total.bestCombo = Math.max(total.bestCombo, Number(result.combo) || 0)
+                    countedSongForUser.add(pairKey)
+                }
+            } else if (hadFirstXForSongUser.has(pairKey) && !isX && validPoints > 0) {
+                total.score += validPoints
+                total.perfect += Number(result.perfect) || 0
+                total.bestCombo = Math.max(total.bestCombo, Number(result.combo) || 0)
+                countedSongForUser.add(pairKey)
+                hadFirstXForSongUser.delete(pairKey)
+            }
         }
     }
 
