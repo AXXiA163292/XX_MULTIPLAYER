@@ -37,7 +37,14 @@ type LevelItem = {
     [key: string]: unknown
 }
 
+type ConstantRow = {
+    input: string
+    Constant: number
+    Difficulty?: string
+}
+
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000
+const stripTrailingSlash = (value: string) => value.trim().replace(/\/+$/, '')
 
 const getSessionSecret = (env: Env): string =>
     String((env as Record<string, unknown>).SESSION_SECRET ?? 'xx-championship-session-secret')
@@ -113,10 +120,99 @@ function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: s
     }
 }
 
-/**
- * Loads levels exclusively from the R2 bucket when available so /sonolus/levels/list
- * and constant lookups do not hit Google Sheets directly on every request.
- */
+function normalizeConstantRows(raw: any): ConstantRow[] {
+    const rows = Array.isArray(raw)
+        ? raw
+        : Array.isArray(raw?.rows)
+            ? raw.rows
+            : Array.isArray(raw?.customSongs)
+                ? raw.customSongs
+                : []
+
+    const normalized: ConstantRow[] = []
+    for (const entry of rows) {
+        if (!entry || typeof entry !== 'object') continue
+        const rawInput = String(entry.input ?? entry.Input ?? entry.url ?? '').trim()
+        if (!rawInput) continue
+
+        const c = Number(entry.Constant ?? entry.constant)
+        if (!Number.isFinite(c) || c <= 0) continue
+
+        const diffRaw = String(entry.Difficulty ?? entry.difficulty ?? '').trim().toUpperCase()
+        normalized.push({
+            input: stripTrailingSlash(rawInput),
+            Constant: Math.round(c * 10) / 10,
+            ...(diffRaw ? { Difficulty: diffRaw } : {}),
+        })
+    }
+    return normalized
+}
+
+async function refreshR2FromSource(env: Env, url: URL): Promise<{
+    ok: boolean
+    constantsCount: number
+    levelsCount: number
+    sourceUsed: string | null
+}> {
+    if (!env.R2) {
+        return { ok: false, constantsCount: 0, levelsCount: 0, sourceUsed: null }
+    }
+
+    const envAny = env as Record<string, unknown>
+    const sourceUrl =
+        url.searchParams.get('source') ||
+        String(envAny.REFRESH_SOURCE_URL ?? envAny.SHEET_EXPORT_URL ?? '').trim()
+
+    let constantsRows: ConstantRow[] = []
+    let levelItems: LevelItem[] | null = null
+
+    if (sourceUrl) {
+        const res = await fetch(sourceUrl, {
+            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+            cache: 'no-store',
+        })
+        if (res.ok) {
+            const payload = await res.json<any>().catch(() => null)
+            constantsRows = normalizeConstantRows(payload)
+            if (Array.isArray(payload?.levels)) {
+                levelItems = payload.levels
+            } else if (Array.isArray(payload?.items)) {
+                levelItems = payload.items
+            }
+        }
+    }
+
+    if (constantsRows.length === 0) {
+        const existingConst = await env.R2.get('constants.json').catch(() => null)
+        if (existingConst) {
+            const existingJson = await existingConst.json<any>().catch(() => null)
+            constantsRows = normalizeConstantRows(existingJson)
+        }
+    }
+
+    await env.R2.put('constants.json', JSON.stringify(constantsRows), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+
+    let levelsCount = 0
+    if (levelItems && levelItems.length > 0) {
+        await env.R2.put('levels/index.json', JSON.stringify({ items: levelItems }), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+        levelsCount = levelItems.length
+    } else {
+        const currentLevels = await getAllCatalogLevels(env, url)
+        levelsCount = currentLevels.length
+    }
+
+    return {
+        ok: true,
+        constantsCount: constantsRows.length,
+        levelsCount,
+        sourceUsed: sourceUrl || 'existing-r2',
+    }
+}
+
 async function getAllCatalogLevels(env: Env, url: URL): Promise<LevelItem[]> {
     if (env.R2) {
         for (const indexKey of ['levels/index.json', 'catalog/levels.json']) {
@@ -367,6 +463,11 @@ function renderStaffChatHtml(user: SonolusUser, sessionToken: string): string {
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url)
+
+        if (url.pathname === '/refresh' || url.pathname === '/admin/refresh') {
+            const result = await refreshR2FromSource(env, url)
+            return Response.json(result, { status: result.ok ? 200 : 500 })
+        }
 
         if (url.pathname === '/sonolus/authenticate' && request.method === 'POST') {
             const rawBody = new Uint8Array(await request.arrayBuffer())
