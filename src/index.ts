@@ -1,4 +1,7 @@
 import {
+    RANKED_ALLOWED_DIFFICULTIES,
+    RANKED_MAX_RATING,
+    RANKED_MIN_RATING,
     SERVER_DESCRIPTION,
     SERVER_TITLE,
     STAFF_CHAT_HANDLES,
@@ -52,7 +55,6 @@ async function parseUserFromRequest(
 ): Promise<SonolusUser | null> {
     const secret = getSessionSecret(env)
 
-    // 1. Official Sonolus-Session header (issued by POST /sonolus/authenticate)
     const sonolusSession =
         request.headers.get('Sonolus-Session') ??
         request.headers.get('sonolus-session') ??
@@ -69,7 +71,6 @@ async function parseUserFromRequest(
         }
     }
 
-    // 2. Fallback headers / query params (for direct browser / API testing)
     const handleHeader = request.headers.get('x-user-handle') ?? url.searchParams.get('handle')
     const idHeader = request.headers.get('x-user-id') ?? url.searchParams.get('userId') ?? handleHeader
     const nameHeader = request.headers.get('x-user-name') ?? url.searchParams.get('name') ?? handleHeader
@@ -112,13 +113,26 @@ function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: s
     }
 }
 
+/**
+ * Loads levels exclusively from the R2 bucket when available so /sonolus/levels/list
+ * and constant lookups do not hit Google Sheets directly on every request.
+ */
 async function getAllCatalogLevels(env: Env, url: URL): Promise<LevelItem[]> {
     if (env.R2) {
+        for (const indexKey of ['levels/index.json', 'catalog/levels.json']) {
+            const indexObj = await env.R2.get(indexKey).catch(() => null)
+            if (indexObj) {
+                const parsed = await indexObj.json<any>().catch(() => null)
+                if (Array.isArray(parsed?.items)) return parsed.items
+                if (Array.isArray(parsed)) return parsed
+            }
+        }
+
         const listed = await env.R2.list({ prefix: 'levels/' })
         const items: LevelItem[] = []
 
         for (const obj of listed.objects) {
-            if (!obj.key.endsWith('.json')) continue
+            if (!obj.key.endsWith('.json') || obj.key.endsWith('index.json')) continue
             const raw = await env.R2.get(obj.key)
             if (!raw) continue
             try {
@@ -156,6 +170,22 @@ async function getAllCatalogLevels(env: Env, url: URL): Promise<LevelItem[]> {
     return []
 }
 
+function isRankedEligibleLevel(lvl: LevelItem): boolean {
+    const rating = typeof lvl.rating === 'number' && Number.isFinite(lvl.rating)
+        ? lvl.rating
+        : NaN
+
+    if (!Number.isFinite(rating) || rating < RANKED_MIN_RATING || rating > RANKED_MAX_RATING) {
+        return false
+    }
+
+    const tags = Array.isArray(lvl.tags)
+        ? lvl.tags.map((t) => String(t?.title ?? '').trim().toUpperCase())
+        : []
+
+    return tags.some((tag) => RANKED_ALLOWED_DIFFICULTIES.has(tag))
+}
+
 function filterCatalogLevels(levels: LevelItem[], searchParams: URLSearchParams): LevelItem[] {
     const keywords = (searchParams.get('keywords') ?? '').trim().toLowerCase()
     const hasMinRating = searchParams.has('minRating') && searchParams.get('minRating') !== ''
@@ -163,10 +193,15 @@ function filterCatalogLevels(levels: LevelItem[], searchParams: URLSearchParams)
     const minRating = hasMinRating ? Number(searchParams.get('minRating')) : NaN
     const maxRating = hasMaxRating ? Number(searchParams.get('maxRating')) : NaN
     const difficulty = (searchParams.get('difficulty') ?? '').trim().toUpperCase()
+    const rankedOnly = searchParams.get('ranked') === '1' || searchParams.get('bucket') === 'ranked'
 
     const terms = keywords ? keywords.split(/\s+/).filter(Boolean) : []
 
     return levels.filter((lvl) => {
+        if (rankedOnly && !isRankedEligibleLevel(lvl)) {
+            return false
+        }
+
         if (terms.length > 0) {
             const tagTitles = Array.isArray(lvl.tags)
                 ? lvl.tags.map((t) => String(t?.title ?? ''))
@@ -333,7 +368,6 @@ export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url)
 
-        // Official Sonolus Authentication endpoint (issues signed Sonolus-Session)
         if (url.pathname === '/sonolus/authenticate' && request.method === 'POST') {
             const rawBody = new Uint8Array(await request.arrayBuffer())
             const signature =
@@ -463,8 +497,6 @@ export default {
                                     def: 'ALL',
                                     values: [
                                         { name: 'ALL', title: 'All' },
-                                        { name: 'EASY', title: 'EASY' },
-                                        { name: 'NORMAL', title: 'NORMAL' },
                                         { name: 'HARD', title: 'HARD' },
                                         { name: 'EXPERT', title: 'EXPERT' },
                                         { name: 'MASTER', title: 'MASTER' },
@@ -476,7 +508,7 @@ export default {
                                     name: 'Min Level',
                                     required: false,
                                     type: 'number',
-                                    def: 0,
+                                    def: RANKED_MIN_RATING,
                                     min: 0,
                                     max: 50,
                                     step: 0.1,
@@ -486,7 +518,7 @@ export default {
                                     name: 'Max Level',
                                     required: false,
                                     type: 'number',
-                                    def: 50,
+                                    def: RANKED_MAX_RATING,
                                     min: 0,
                                     max: 50,
                                     step: 0.1,
@@ -593,7 +625,7 @@ export default {
             }
 
             const body = await request.json<{ optionValues?: string }>().catch(() => ({}))
-            const parsed = parseSettings(body?.optionValues ?? '')
+            const parsed = parseSettings(body?.optionValues ?? '', undefined, user.name || user.handle)
             if (!parsed) {
                 return new Response('Invalid room options', { status: 400 })
             }
