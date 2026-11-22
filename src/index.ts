@@ -5,6 +5,11 @@ import {
     STAFF_CHAT_SHORTCUTS,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
+import {
+    signToken,
+    verifySonolusSignature,
+    verifyToken,
+} from './crypto.ts'
 import { roomForms, parseSettings } from './forms.ts'
 import type { Env, RoomUser } from './types.ts'
 
@@ -12,6 +17,11 @@ type SonolusUser = {
     id: string
     name: string
     handle: string
+}
+
+type SessionPayload = {
+    user: SonolusUser
+    exp: number
 }
 
 type LevelItem = {
@@ -24,38 +34,45 @@ type LevelItem = {
     [key: string]: unknown
 }
 
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000
+
+const getSessionSecret = (env: Env): string =>
+    String((env as Record<string, unknown>).SESSION_SECRET ?? 'xx-championship-session-secret')
+
 const isStaffChatUser = (handle?: string | null): boolean =>
     Boolean(
         handle &&
             (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
 
-function parseUserFromRequest(request: Request, url: URL): SonolusUser | null {
-    const headerSession = request.headers.get('x-sonolus-session')
-    const queryHandle = url.searchParams.get('handle')
-    const queryUserId = url.searchParams.get('userId')
-    const queryName = url.searchParams.get('name')
+async function parseUserFromRequest(
+    request: Request,
+    url: URL,
+    env: Env,
+): Promise<SonolusUser | null> {
+    const secret = getSessionSecret(env)
 
-    if (headerSession) {
-        try {
-            const parsed = JSON.parse(decodeURIComponent(headerSession)) as {
-                user?: Partial<SonolusUser>
+    // 1. Official Sonolus-Session header (issued by POST /sonolus/authenticate)
+    const sonolusSession =
+        request.headers.get('Sonolus-Session') ??
+        request.headers.get('sonolus-session') ??
+        url.searchParams.get('session')
+
+    if (sonolusSession) {
+        const verified = await verifyToken<SessionPayload>(secret, sonolusSession.trim())
+        if (verified?.user?.handle) {
+            return {
+                id: String(verified.user.id || verified.user.handle).trim(),
+                name: String(verified.user.name || verified.user.handle).trim(),
+                handle: String(verified.user.handle).trim(),
             }
-            if (parsed?.user?.handle || parsed?.user?.id) {
-                return {
-                    id: String(parsed.user.id ?? parsed.user.handle ?? ''),
-                    name: String(parsed.user.name ?? parsed.user.handle ?? 'Player'),
-                    handle: String(parsed.user.handle ?? parsed.user.id ?? ''),
-                }
-            }
-        } catch {
-            // Fall through to query/header values.
         }
     }
 
-    const handleHeader = request.headers.get('x-user-handle') ?? queryHandle
-    const idHeader = request.headers.get('x-user-id') ?? queryUserId ?? handleHeader
-    const nameHeader = request.headers.get('x-user-name') ?? queryName ?? handleHeader
+    // 2. Fallback headers / query params (for direct browser / API testing)
+    const handleHeader = request.headers.get('x-user-handle') ?? url.searchParams.get('handle')
+    const idHeader = request.headers.get('x-user-id') ?? url.searchParams.get('userId') ?? handleHeader
+    const nameHeader = request.headers.get('x-user-name') ?? url.searchParams.get('name') ?? handleHeader
 
     if (handleHeader || idHeader) {
         const handle = String(handleHeader ?? idHeader ?? '').trim()
@@ -74,12 +91,16 @@ function buildRoomUser(user: SonolusUser, request: Request): RoomUser {
         id: user.id,
         name: user.name,
         handle: user.handle,
-        authentication: request.headers.get('x-sonolus-authentication') ?? '',
-        signature: request.headers.get('x-sonolus-signature') ?? '',
+        authentication: request.headers.get('Sonolus-Session') ?? '',
+        signature: request.headers.get('Sonolus-Signature') ?? '',
     }
 }
 
-function buildStaffChatPostItem(unread: number, origin: string) {
+function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: string) {
+    const chatUrl = sessionToken
+        ? `${origin}/chat?session=${encodeURIComponent(sessionToken)}`
+        : `${origin}/chat`
+
     return {
         name: 'staff-chat',
         version: 1,
@@ -87,7 +108,7 @@ function buildStaffChatPostItem(unread: number, origin: string) {
         time: Date.now(),
         author: SERVER_TITLE,
         tags: [{ title: 'Chat' }],
-        url: `${origin}/chat`,
+        url: chatUrl,
     }
 }
 
@@ -192,7 +213,7 @@ function filterCatalogLevels(levels: LevelItem[], searchParams: URLSearchParams)
     })
 }
 
-function renderStaffChatHtml(user: SonolusUser): string {
+function renderStaffChatHtml(user: SonolusUser, sessionToken: string): string {
     const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
         (tag) =>
             `<button type="button" class="chip" onclick="insertShortcut(${JSON.stringify(tag)})">${tag}</button>`,
@@ -239,8 +260,15 @@ function renderStaffChatHtml(user: SonolusUser): string {
   </div>
 <script>
   const myHandle = ${JSON.stringify(user.handle)};
+  const sessionToken = ${JSON.stringify(sessionToken)};
   const box = document.getElementById('messages');
   const input = document.getElementById('chatInput');
+
+  function authHeaders(extra = {}) {
+    const headers = { ...extra, 'x-user-handle': myHandle };
+    if (sessionToken) headers['Sonolus-Session'] = sessionToken;
+    return headers;
+  }
 
   function insertShortcut(tag) {
     const current = input.value;
@@ -271,7 +299,7 @@ function renderStaffChatHtml(user: SonolusUser): string {
   }
 
   async function loadMessages() {
-    const res = await fetch('/api/chat', { headers: { 'x-user-handle': myHandle } });
+    const res = await fetch('/api/chat', { headers: authHeaders() });
     if (res.ok) {
       const data = await res.json();
       render(data.messages || []);
@@ -285,10 +313,7 @@ function renderStaffChatHtml(user: SonolusUser): string {
     input.value = '';
     const res = await fetch('/api/chat', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-user-handle': myHandle,
-      },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ text }),
     });
     if (res.ok) {
@@ -307,7 +332,54 @@ function renderStaffChatHtml(user: SonolusUser): string {
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url)
-        const user = parseUserFromRequest(request, url)
+
+        // Official Sonolus Authentication endpoint (issues signed Sonolus-Session)
+        if (url.pathname === '/sonolus/authenticate' && request.method === 'POST') {
+            const rawBody = new Uint8Array(await request.arrayBuffer())
+            const signature =
+                request.headers.get('Sonolus-Signature') ??
+                request.headers.get('sonolus-signature') ??
+                ''
+
+            const validSig = await verifySonolusSignature(rawBody, signature)
+            if (!validSig) {
+                return new Response('Invalid Sonolus signature', { status: 401 })
+            }
+
+            let parsed: any = null
+            try {
+                parsed = JSON.parse(new TextDecoder().decode(rawBody))
+            } catch {
+                return new Response('Invalid JSON body', { status: 400 })
+            }
+
+            const profile = parsed?.userProfile ?? parsed?.profile ?? parsed
+            const handle = String(profile?.handle ?? '').trim()
+            const id = String(profile?.id ?? handle).trim()
+            const name = String(profile?.name ?? handle).trim()
+
+            if (!handle) {
+                return new Response('Missing user handle', { status: 400 })
+            }
+
+            const expiration = Date.now() + SESSION_TTL_MS
+            const session = await signToken(getSessionSecret(env), {
+                user: { id, name, handle },
+                exp: expiration,
+            })
+
+            return Response.json({
+                session,
+                expiration,
+            })
+        }
+
+        const user = await parseUserFromRequest(request, url, env)
+        const sessionToken =
+            request.headers.get('Sonolus-Session') ??
+            request.headers.get('sonolus-session') ??
+            url.searchParams.get('session') ??
+            ''
 
         if (url.pathname === '/api/chat') {
             if (!user || !isStaffChatUser(user.handle)) {
@@ -344,7 +416,7 @@ export default {
             const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
             await lobby.markChatRead(user.handle)
 
-            return new Response(renderStaffChatHtml(user), {
+            return new Response(renderStaffChatHtml(user, sessionToken), {
                 headers: { 'Content-Type': 'text/html; charset=utf-8' },
             })
         }
@@ -356,25 +428,17 @@ export default {
                 : 0
 
             const chatItem = canSeeChat
-                ? buildStaffChatPostItem(unread, url.origin)
+                ? buildStaffChatPostItem(unread, url.origin, sessionToken)
                 : null
 
             return Response.json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
+                hasAuthentication: true,
+                hasMultiplayer: true,
                 configuration: {
                     options: [],
                 },
-                sections: chatItem
-                    ? [
-                        {
-                            title: 'Chat',
-                            icon: 'comment',
-                            itemType: 'post',
-                            items: [chatItem],
-                        },
-                    ]
-                    : [],
                 levels: {
                     items: [],
                     searches: [
@@ -459,7 +523,7 @@ export default {
             const unread = await lobby.getChatUnreadCount(user.handle)
             return Response.json({
                 pageCount: 1,
-                items: [buildStaffChatPostItem(unread, url.origin)],
+                items: [buildStaffChatPostItem(unread, url.origin, sessionToken)],
                 searches: [],
             })
         }
@@ -473,14 +537,18 @@ export default {
             const messages = await lobby.listChatMessages()
             await lobby.markChatRead(user.handle)
 
+            const chatUrl = sessionToken
+                ? `${url.origin}/chat?session=${encodeURIComponent(sessionToken)}`
+                : `${url.origin}/chat`
+
             const recentLines = messages.slice(-15).map(
                 (m) => `[${m.author} (${m.handle})]: ${m.text}`,
             )
 
             return Response.json({
-                item: buildStaffChatPostItem(0, url.origin),
+                item: buildStaffChatPostItem(0, url.origin, sessionToken),
                 description: [
-                    `Open chat in browser: ${url.origin}/chat`,
+                    `Open chat: ${chatUrl}`,
                     'Shortcuts: @Bell, @Noct, @Ʌstra',
                     '',
                     ...(recentLines.length > 0 ? recentLines : ['No messages yet.']),
