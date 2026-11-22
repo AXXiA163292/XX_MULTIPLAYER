@@ -461,8 +461,34 @@ export class Room extends DurableObject<Env> {
                 this.st.settings.scoring = 'pp'
             }
 
+            // Remove duplicate member IDs from previously saved room state.
+            const uniqueMembers = new Map<string, Member>()
+
+            for (const member of this.st.members) {
+                uniqueMembers.set(member.id, member)
+            }
+
+            this.st.members = [...uniqueMembers.values()]
+
             for (const member of this.st.members) {
                 this.st.statuses[member.id] ??= 'waiting'
+            }
+
+            // Remove statuses and results that no longer belong to a member.
+            const memberIds = new Set(
+                this.st.members.map((member) => member.id),
+            )
+
+            for (const id of Object.keys(this.st.statuses)) {
+                if (!memberIds.has(id)) {
+                    delete this.st.statuses[id]
+                }
+            }
+
+            for (const id of Object.keys(this.st.results)) {
+                if (!memberIds.has(id)) {
+                    delete this.st.results[id]
+                }
             }
 
             if (this.st.status === 'playing' && !this.st.round) {
@@ -471,6 +497,15 @@ export class Room extends DurableObject<Env> {
 
                 for (const member of this.st.members) {
                     this.st.statuses[member.id] = 'waiting'
+                }
+            }
+
+            // A skipped player becomes waiting when the room enters playing.
+            if (this.st.status === 'playing') {
+                for (const member of this.st.members) {
+                    if (this.st.statuses[member.id] === 'skipped') {
+                        this.st.statuses[member.id] = 'waiting'
+                    }
                 }
             }
 
@@ -607,42 +642,49 @@ export class Room extends DurableObject<Env> {
         const { 0: client, 1: server } = new WebSocketPair()
         const user = join.user
 
+        /*
+         * Keep the previous sockets until the replacement socket has
+         * been accepted. Otherwise, the old socket's close callback can
+         * remove this user before the new socket is registered.
+         */
+        const oldSockets = this.socketsOf(user.id)
+
         const existingMember = this.st.members.find(
             (member) => member.id === user.id,
         )
 
-        if (existingMember) {
-            for (const oldSocket of this.socketsOf(user.id)) {
-                try {
-                    oldSocket.close(4000, 'replaced')
-                } catch {
-                    // The previous connection may already be closed.
-                }
-            }
-
-            existingMember.name = user.name
-            existingMember.handle = user.handle
-            existingMember.roomUser = join.roomUser
-        }
-
-        this.ctx.acceptWebSocket(server)
-        server.serializeAttachment({ userId: user.id })
-
-        await this.ctx.storage.deleteAlarm()
-
-        const member: Member = {
+        const member: Member = existingMember ?? {
             id: user.id,
             name: user.name,
             handle: user.handle,
             roomUser: join.roomUser,
         }
 
-        if (!existingMember) {
-            this.st.members.push(member)
-        }
+        member.name = user.name
+        member.handle = user.handle
+        member.roomUser = join.roomUser
+
+        // Guarantee exactly one entry for this user.
+        this.st.members = this.st.members.filter(
+            (entry) => entry.id !== user.id,
+        )
+        this.st.members.push(member)
 
         this.st.statuses[user.id] = 'waiting'
 
+        // Register the new socket before closing any previous connection.
+        this.ctx.acceptWebSocket(server)
+        server.serializeAttachment({ userId: user.id })
+
+        for (const oldSocket of oldSockets) {
+            try {
+                oldSocket.close(4000, 'replaced')
+            } catch {
+                // The previous connection may already be closed.
+            }
+        }
+
+        await this.ctx.storage.deleteAlarm()
         await this.save()
 
         this.send(server, this.view(user.id))
@@ -713,6 +755,7 @@ export class Room extends DurableObject<Env> {
 
         if (!attachment) return
 
+        // Ignore a replaced socket if the same user already has a new one.
         if (this.socketsOf(attachment.userId).some((socket) => socket !== ws)) {
             return
         }
@@ -1309,13 +1352,9 @@ export class Room extends DurableObject<Env> {
             )
 
             /*
-             * Sonolus requires updateLevel to arrive while the client
-             * is in selecting. Sending it during preparing or playing
-             * causes a fatal error.
-             *
-             * The level is not sent to non-hosts during normal selection
-             * or preparation. It is sent here, immediately before the
-             * round starts.
+             * updateLevel must arrive while clients are in selecting.
+             * Non-hosts do not receive the selected level during normal
+             * selection or preparation.
              */
 
             state.status = 'selecting'
@@ -1359,6 +1398,17 @@ export class Room extends DurableObject<Env> {
                         },
                     })
                 } else {
+                    state.statuses[member.id] = 'waiting'
+                }
+            }
+
+            /*
+             * Sonolus resets skipped users to waiting when it receives
+             * updateStatus: playing. Mirror that change on the server
+             * before sending the event, so future room updates stay valid.
+             */
+            for (const member of state.members) {
+                if (state.statuses[member.id] === 'skipped') {
                     state.statuses[member.id] = 'waiting'
                 }
             }
