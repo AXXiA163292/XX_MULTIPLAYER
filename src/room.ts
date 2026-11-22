@@ -675,6 +675,7 @@ export class Room extends DurableObject<Env> {
             webSocket: client,
         })
     }
+
     async webSocketMessage(
         ws: WebSocket,
         raw: string | ArrayBuffer,
@@ -784,7 +785,7 @@ export class Room extends DurableObject<Env> {
                 }
                 state.levelInfo = null
 
-                this.sendHost({
+                this.sendAll({
                     type: 'updateLevel',
                     level: state.level,
                 })
@@ -884,13 +885,8 @@ export class Room extends DurableObject<Env> {
                         isSuggestionsLocked: next.type !== 'casualRoom',
                     })
 
-                    if (next.type !== 'casualRoom' && state.level) {
-                        this.sendExcept(uid, {
-                            type: 'updateLevel',
-                            level: null,
-                        })
-                    } else if (state.level) {
-                        this.sendExcept(uid, {
+                    if (state.level) {
+                        this.sendAll({
                             type: 'updateLevel',
                             level: state.level,
                         })
@@ -1097,6 +1093,7 @@ export class Room extends DurableObject<Env> {
 
                 return
             }
+
             case 'startGameplay': {
                 if (
                     state.status !== 'playing' ||
@@ -1251,13 +1248,6 @@ export class Room extends DurableObject<Env> {
             status: 'selecting',
         })
 
-        if (state.settings.type !== 'casualRoom') {
-            this.sendExcept(state.hostId, {
-                type: 'updateLevel',
-                level: null,
-            })
-        }
-
         this.pushScoreboard()
         return true
     }
@@ -1287,13 +1277,6 @@ export class Room extends DurableObject<Env> {
                 state.levelInfo = await fetchLevelInfo(state.level)
             }
 
-            if (state.settings.type !== 'casualRoom') {
-                this.sendAll({
-                    type: 'updateLevel',
-                    level: null,
-                })
-            }
-
             this.sendAll({
                 type: 'updateStatus',
                 status: 'preparing',
@@ -1309,19 +1292,6 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'selecting',
             })
-
-            if (state.settings.type !== 'casualRoom') {
-                this.sendExcept(uid, {
-                    type: 'updateLevel',
-                    level: null,
-                })
-                if (state.level) {
-                    this.sendHost({
-                        type: 'updateLevel',
-                        level: state.level,
-                    })
-                }
-            }
         } else if (
             current === 'preparing' &&
             next === 'playing'
@@ -1349,12 +1319,10 @@ export class Room extends DurableObject<Env> {
                 }
             }
 
-            if (state.settings.type !== 'casualRoom') {
-                this.sendAll({
-                    type: 'updateLevel',
-                    level: state.level,
-                })
-            }
+            this.sendAll({
+                type: 'updateLevel',
+                level: state.level,
+            })
 
             this.sendAll({
                 type: 'updateStatus',
@@ -1391,13 +1359,6 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'selecting',
             })
-
-            if (state.settings.type !== 'casualRoom') {
-                this.sendExcept(uid, {
-                    type: 'updateLevel',
-                    level: null,
-                })
-            }
         } else {
             return this.resync(uid)
         }
@@ -1432,11 +1393,6 @@ export class Room extends DurableObject<Env> {
             state.members.map((member) => member.id),
         )
 
-        const canSeeLevel =
-            state.settings.type === 'casualRoom' ||
-            state.status === 'playing' ||
-            (isHost && state.status === 'selecting')
-
         return {
             type: 'update',
             allowOtherServers: true,
@@ -1452,7 +1408,7 @@ export class Room extends DurableObject<Env> {
                 ...(isHost ? [closeRoomForm] : []),
             ],
             optionValues: serializeSettings(state.settings),
-            level: canSeeLevel ? state.level : null,
+            level: state.level,
             levelOptions: [],
             autoExit: 'off',
             isSuggestionsLocked: state.settings.type !== 'casualRoom' && !isHost,
@@ -1574,6 +1530,7 @@ export class Room extends DurableObject<Env> {
 
         return output
     }
+
     private getDivisions(members: Member[]) {
         const type = this.st.settings.type
 
