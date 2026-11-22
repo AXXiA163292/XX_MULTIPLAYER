@@ -144,21 +144,23 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
             return null
         }
 
-        const match = url.pathname.match(/\/levels\/([^/]+)\/?$/i)
+        // Keep a path prefix of the server (https://host/prefix/levels/x -> https://host/prefix).
+        const match = url.pathname.match(/^(.*)\/levels\/([^/]+)\/?$/i)
 
         if (!match) {
             console.warn('[Sheets] Level URL has no /levels/{name} path:', id, raw)
             return null
         }
 
-        const name = decodeURIComponent(match[1]!)
+        const name = decodeURIComponent(match[2]!)
+        const prefix = match[1]!.replace(/\/sonolus$/i, '')
 
         if (!name) return null
 
         return {
             id,
             url: raw,
-            address: url.origin,
+            address: url.origin + prefix,
             name,
         }
     } catch (error) {
@@ -474,6 +476,11 @@ export function clearSheetCache(): void {
 
 
 // ───────────────────────── Ranked Match song pool ─────────────────────────
+//
+// Song lists live in the R2 bucket "ranked-match" (binding RANKED_BUCKET):
+//   <TIER>/official.json   official songs of the tier   e.g. MASTER/official.json
+//   CUSTOM/<TIER>.json     ranked custom songs of the tier   e.g. CUSTOM/MASTER.json
+// Rooms only read the bucket (fast). The bucket is refreshed from the sheets when a room opens.
 
 const METADATA_TAB = 'METADATA_RAW'
 
@@ -490,13 +497,21 @@ export const RANKED_TIERS = {
 
 export type RankedTier = keyof typeof RANKED_TIERS
 
+/** off = official only, on = official + custom, only = custom only. */
+export type RankedCustomMode = 'off' | 'on' | 'only'
+
+type StoredSong = { id: string; url: string }
+
 const OFFICIAL_DIFFS = ['ez', 'nm', 'hr', 'ex', 'ms', 'ap'] as const
+
+const officialKey = (tier: RankedTier) => `${tier.toUpperCase()}/official.json`
+const customKey = (tier: RankedTier) => `CUSTOM/${tier.toUpperCase()}.json`
 
 function inRange(level: number, range: readonly [number, number] | null): boolean {
     return !!range && level >= range[0] && level <= range[1]
 }
 
-// Short cache so clicking "select" several times does not re-download the whole metadata sheet.
+// Short cache so several builds in a row do not re-download the whole metadata sheet.
 const METADATA_CACHE_MS = 2 * 60_000
 let metadataCache: { at: number; values: string[][] } | null = null
 
@@ -512,7 +527,7 @@ async function metadataRows(): Promise<string[][]> {
 }
 
 /** Official songs: every difficulty whose play level fits the tier (links from <diff>LevelLinkSbuga). */
-async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
+async function officialRankedSongs(tier: RankedTier): Promise<StoredSong[]> {
     const values = await metadataRows()
 
     const headerIndex = values.findIndex((row) =>
@@ -524,7 +539,7 @@ async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
     const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const idCol = headers.indexOf('id')
     const rules = RANKED_TIERS[tier]
-    const pool: SheetChart[] = []
+    const songs: StoredSong[] = []
 
     const usable = OFFICIAL_DIFFS.filter(
         (diff) =>
@@ -534,11 +549,8 @@ async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
 
     for (const cells of values.slice(headerIndex + 1)) {
         for (const diff of usable) {
-            const levelCol = headers.indexOf(`${diff}playlevel`)
-            const linkCol = headers.indexOf(`${diff}levellinksbuga`)
-
-            const rawLevel = normalizeId(cells[levelCol])
-            const link = normalizeId(cells[linkCol])
+            const rawLevel = normalizeId(cells[headers.indexOf(`${diff}playlevel`)])
+            const link = normalizeId(cells[headers.indexOf(`${diff}levellinksbuga`)])
 
             if (!rawLevel || !link || link === '-') continue
 
@@ -552,20 +564,17 @@ async function officialRankedPool(tier: RankedTier): Promise<SheetChart[]> {
 
             if (!fits) continue
 
-            const chart = chartFromUrl(`${normalizeId(cells[idCol])}-${diff}`, link)
-            if (chart) pool.push(chart)
+            songs.push({ id: `${normalizeId(cells[idCol])}-${diff}`, url: link })
         }
     }
 
-    console.log(
-        `[Ranked] Official pool for ${tier}: ${pool.length} charts (difficulty columns found: ${usable.join(', ') || 'none'}).`,
-    )
+    console.log(`[Ranked] Built official list for ${tier}: ${songs.length} songs.`)
 
-    return pool
+    return songs
 }
 
 /** Custom songs: rows of the custom tab with Ranked = true (playLevel + difficulty columns). */
-async function customRankedPool(tier: RankedTier): Promise<SheetChart[]> {
+async function customRankedSongs(tier: RankedTier): Promise<StoredSong[]> {
     const values = await fetchSheet(CUSTOM_SHEET_ID, 'custom')
 
     const headerIndex = values.findIndex((row) =>
@@ -577,7 +586,7 @@ async function customRankedPool(tier: RankedTier): Promise<SheetChart[]> {
     const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const col = (name: string) => headers.indexOf(name)
     const rules = RANKED_TIERS[tier]
-    const pool: SheetChart[] = []
+    const songs: StoredSong[] = []
 
     for (const cells of values.slice(headerIndex + 1)) {
         const id = normalizeId(cells[col('id')])
@@ -600,44 +609,125 @@ async function customRankedPool(tier: RankedTier): Promise<SheetChart[]> {
         if (!Number.isFinite(level)) continue
         if (!inRange(level, isAppend ? rules.append : rules.main)) continue
 
-        const chart = chartFromUrl(id, row.input)
-        if (chart) pool.push(chart)
+        songs.push({ id, url: row.input })
     }
 
-    console.log(`[Ranked] Custom pool for ${tier}: ${pool.length} charts.`)
+    console.log(`[Ranked] Built custom list for ${tier}: ${songs.length} songs.`)
 
-    return pool
+    return songs
 }
 
-/** Random level of the ranked list for this tier. `exclude` (the current level) is avoided when possible. */
-export async function pickRankedLevel(
-    tier: RankedTier,
-    includeCustom: boolean,
-    exclude?: { address: string; name: string } | null,
-): Promise<SheetChart | null> {
-    const official = await officialRankedPool(tier)
+async function readList(bucket: R2Bucket, key: string): Promise<StoredSong[] | null> {
+    try {
+        const object = await bucket.get(key)
 
-    let custom: SheetChart[] = []
+        if (!object) return null
 
-    if (includeCustom) {
-        try {
-            custom = await customRankedPool(tier)
-        } catch (error) {
-            console.error('[Ranked] Could not read the custom ranked pool:', error)
-        }
+        const data: unknown = JSON.parse(await object.text())
+
+        return Array.isArray(data)
+            ? data.filter(
+                (entry): entry is StoredSong =>
+                    !!entry &&
+                    typeof entry.id === 'string' &&
+                    typeof entry.url === 'string',
+            )
+            : null
+    } catch (error) {
+        console.error('[Ranked] Could not read bucket list', key, error)
+        return null
+    }
+}
+
+async function writeList(bucket: R2Bucket, key: string, songs: StoredSong[]): Promise<void> {
+    try {
+        await bucket.put(key, JSON.stringify(songs), {
+            httpMetadata: { contentType: 'application/json' },
+        })
+    } catch (error) {
+        console.error('[Ranked] Could not write bucket list', key, error)
+    }
+}
+
+/** Bucket first (fast). If the file does not exist yet, build it from the sheet and store it. */
+async function listFor(
+    bucket: R2Bucket | undefined,
+    key: string,
+    build: () => Promise<StoredSong[]>,
+): Promise<StoredSong[]> {
+    const stored = bucket ? await readList(bucket, key) : null
+
+    if (stored) return stored
+
+    const built = await build()
+
+    if (bucket) await writeList(bucket, key, built)
+
+    return built
+}
+
+function toCharts(songs: StoredSong[]): SheetChart[] {
+    const charts: SheetChart[] = []
+
+    for (const song of songs) {
+        const chart = chartFromUrl(song.id, song.url)
+        if (chart) charts.push(chart)
     }
 
-    const all = [...official, ...custom]
+    return charts
+}
 
-    if (all.length === 0) return null
+/** Song list of a Ranked Match room. Called when the room opens, never between rounds. */
+export async function loadRankedPool(
+    bucket: R2Bucket | undefined,
+    tier: RankedTier,
+    custom: RankedCustomMode,
+): Promise<SheetChart[]> {
+    const [official, extra] = await Promise.all([
+        custom === 'only'
+            ? Promise.resolve([] as StoredSong[])
+            : listFor(bucket, officialKey(tier), () => officialRankedSongs(tier)),
+        custom === 'off'
+            ? Promise.resolve([] as StoredSong[])
+            : listFor(bucket, customKey(tier), () => customRankedSongs(tier)).catch((error) => {
+                console.error('[Ranked] Could not load custom songs:', error)
+                return [] as StoredSong[]
+            }),
+    ])
+
+    const charts = toCharts([...official, ...extra])
+
+    console.log(`[Ranked] Pool for ${tier} (custom ${custom}): ${charts.length} songs.`)
+
+    return charts
+}
+
+/** Rebuilds the bucket lists of a tier from the sheets (run in the background when a room opens). */
+export async function refreshRankedBucket(bucket: R2Bucket, tier: RankedTier): Promise<void> {
+    const [official, custom] = await Promise.allSettled([
+        officialRankedSongs(tier),
+        customRankedSongs(tier),
+    ])
+
+    if (official.status === 'fulfilled') await writeList(bucket, officialKey(tier), official.value)
+    else console.error('[Ranked] Official refresh failed:', official.reason)
+
+    if (custom.status === 'fulfilled') await writeList(bucket, customKey(tier), custom.value)
+    else console.error('[Ranked] Custom refresh failed:', custom.reason)
+}
+
+/** Random song of the pool, avoiding `exclude` (the song just played) when possible. */
+export function pickFromPool<T extends { address: string; name: string }>(
+    pool: T[],
+    exclude?: { address: string; name: string } | null,
+): T | null {
+    if (pool.length === 0) return null
 
     const others = exclude
-        ? all.filter(
-            (chart) => !(chart.address === exclude.address && chart.name === exclude.name),
-        )
-        : all
+        ? pool.filter((entry) => !(entry.address === exclude.address && entry.name === exclude.name))
+        : pool
 
-    const pool = others.length > 0 ? others : all
+    const list = others.length > 0 ? others : pool
 
-    return pool[Math.floor(Math.random() * pool.length)]!
+    return list[Math.floor(Math.random() * list.length)]!
 }
