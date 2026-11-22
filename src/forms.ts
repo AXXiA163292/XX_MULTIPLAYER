@@ -135,7 +135,6 @@ export const roomForms = (isTournamentHost = false) =>
                 : type === 'casualRoom'
                     ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
                     : type === 'rankedRoom'
-                        // Ranked Match: always public, always Ranked scoring, never random.
                         ? [tierOption, customSongsOption]
                         : [tournamentScoringOption, tournamentVisibilityOption],
         }))
@@ -190,7 +189,6 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
 
     const type = p.get('type') || DEFAULT_TYPE
-
     if (!(type in ROOM_TYPES)) return null
 
     const open = isOpenType(type as RoomType)
@@ -204,7 +202,6 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
         ? rawTier
         : 'master'
 
-    // Ranked Match rooms are always public.
     const visibility = type === 'rankedRoom'
         ? 'public'
         : type === 'casualRoom'
@@ -222,7 +219,6 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
 
     return {
         type: type as RoomType,
-        // Ranked Match rooms always use Ranked scoring.
         scoring: type === 'rankedRoom' ? 'rankedMatch' : (scoring as ScoringMode),
         group,
         title,
