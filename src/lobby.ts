@@ -1,18 +1,18 @@
-
 import { DurableObject } from 'cloudflare:workers'
 import type { Env } from './types.ts'
 
-export type PostCategory = 'announcements' | 'news'
+export type PostCategory = 'announcements' | 'posts' | 'results'
 
 export type LobbyRoom = {
     name: string
     title: string
     subtitle: string
     master: string
+    visibility?: 'public' | 'private' | 'locked'
 }
 
 export type LobbyPost = {
-    category?: PostCategory
+    category?: PostCategory | 'news'
     item: {
         name: string
         version: 1
@@ -49,9 +49,7 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async getPost(name: string): Promise<LobbyPost | null> {
-        return (
-            (await this.ctx.storage.get<LobbyPost>(`post:${name}`)) ?? null
-        )
+        return (await this.ctx.storage.get<LobbyPost>(`post:${name}`)) ?? null
     }
 
     async listPosts(category?: PostCategory): Promise<LobbyPost[]> {
@@ -61,15 +59,15 @@ export class Lobby extends DurableObject<Env> {
 
         return [...map.values()]
             .filter((post) => {
-                const postCategory = post.category ?? 'news'
-                return !category || postCategory === category
+                const stored = post.category ?? 'posts'
+                const normalized = stored === 'news' ? 'posts' : stored
+                return !category || normalized === category
             })
             .sort((a, b) => b.item.time - a.item.time)
     }
 
     async findPostByUploadKey(key: string): Promise<LobbyPost | null> {
         const posts = await this.listPosts()
-
         return posts.find((post) => post.uploadKey === key) ?? null
     }
 
@@ -79,7 +77,6 @@ export class Lobby extends DurableObject<Env> {
         url: string,
     ): Promise<void> {
         const post = await this.getPost(name)
-
         if (!post) return
 
         post.item.thumbnail = { hash, url }
