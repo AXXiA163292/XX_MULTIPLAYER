@@ -1,4 +1,3 @@
-
 import { RANKED_POINTS, type ScoringMode } from './config.ts'
 import { calculatePP, formatPP, roundPP, PP_SETTINGS } from './pp.ts'
 import type { GameplayResult } from './types.ts'
@@ -23,8 +22,11 @@ export type Total = {
     bestCombo: number
 }
 
+const isDisqualified = (r: GameplayResult) =>
+    r.disqualified === true || r.grade === 'X'
+
 export const rankedScore = (r: GameplayResult): number =>
-    r.grade === 'X'
+    isDisqualified(r)
         ? 0
         : r.perfect * RANKED_POINTS.perfect +
           r.great * RANKED_POINTS.great +
@@ -34,7 +36,7 @@ export function ppScore(
     r: GameplayResult,
     round?: RoundRecord,
 ): number {
-    if (!round || r.grade === 'X') return 0
+    if (!round || isDisqualified(r)) return 0
 
     const rating = round.levelConstant ?? round.levelRating
     const noteCount = round.noteCount ?? r.totalCount
@@ -78,6 +80,7 @@ export function compareResults(
     return (
         roundScore(b, mode, round) -
         roundScore(a, mode, round) ||
+        Number(isDisqualified(a)) - Number(isDisqualified(b)) ||
         b.perfect - a.perfect ||
         b.combo - a.combo
     )
@@ -91,7 +94,7 @@ export function totals(
 
     for (const round of history) {
         for (const [userId, result] of Object.entries(round.results)) {
-            if (result.grade === 'X') continue
+            if (isDisqualified(result)) continue
 
             const total = map.get(userId) ?? {
                 userId,
@@ -129,7 +132,7 @@ export function fmtDetail(
     mode: ScoringMode,
     round?: RoundRecord,
 ): string {
-    if (result.grade === 'X') return 'X'
+    if (isDisqualified(result)) return 'X'
 
     const score = roundScore(result, mode, round)
 
