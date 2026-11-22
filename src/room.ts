@@ -143,9 +143,15 @@ function sanitizeWireResult(result: GameplayResult): GameplayResult {
             : 'fail'
 
     return {
-        ...result,
         grade: wireGrade,
-        disqualified: result.disqualified === true || result.grade === 'X',
+        arcadeScore: Number(result.arcadeScore) || 0,
+        accuracyScore: Number(result.accuracyScore) || 0,
+        combo: Number(result.combo) || 0,
+        perfect: Number(result.perfect) || 0,
+        great: Number(result.great) || 0,
+        good: Number(result.good) || 0,
+        miss: Number(result.miss) || 0,
+        totalCount: Number(result.totalCount) || 0,
     }
 }
 
@@ -1272,17 +1278,14 @@ export class Room extends DurableObject<Env> {
                 const incomplete =
                     expectedCount !== null && judgedCount < expectedCount
 
-                const result: GameplayResult = incomplete
-                    ? {
-                        ...cmd.result,
-                        grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
-                        disqualified: true,
-                    }
-                    : {
-                        ...cmd.result,
-                        grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
-                        disqualified: cmd.result.disqualified === true || cmd.result.grade === 'X',
-                    }
+                const result: GameplayResult = {
+                    ...cmd.result,
+                    grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
+                    disqualified:
+                        incomplete ||
+                        cmd.result.disqualified === true ||
+                        cmd.result.grade === 'X',
+                }
 
                 state.results[uid] = result
                 state.statuses[uid] = 'waiting'
