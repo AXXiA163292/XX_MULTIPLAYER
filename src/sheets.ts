@@ -8,6 +8,7 @@ const METADATA_TAB = 'METADATA_RAW'
 
 const R2_LEVEL_LIST_KEY = 'server/level-list/index.json'
 const R2_PLAYLISTS_KEY = 'server/playlists/index.json'
+const R2_CONSTANTS_KEY = 'server/constants/index.json'
 const rankedTierKey = (tier: RankedTier) => `ranked-match/${tier.toUpperCase()}/pool.json`
 const R2_RANKED_CUSTOM_KEY = 'ranked-match/CUSTOM/pool.json'
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -20,6 +21,7 @@ type Row = {
     ranked: string
     playLevel: string
     difficulty: string
+    constant: string
 }
 
 export type RankedCustomChart = SheetChart & {
@@ -50,6 +52,9 @@ type StoredSnapshot<T> = {
     updatedAt: number
     data: T
 }
+
+export const stripTrailingSlash = (value: string) =>
+    value.trim().replace(/\/+$/, '')
 
 function parseCSV(input: string): string[][] {
     const rows: string[][] = []
@@ -144,7 +149,7 @@ function normalizeId(value: unknown): string {
 }
 
 function chartFromUrl(id: string, rawInput: string): SheetChart | null {
-    const raw = rawInput.trim()
+    const raw = stripTrailingSlash(rawInput)
     if (!raw) return null
 
     try {
@@ -168,7 +173,7 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
         return {
             id,
             url: raw,
-            address: url.origin,
+            address: stripTrailingSlash(url.origin),
             name,
         }
     } catch (error) {
@@ -209,17 +214,19 @@ function parseCustomRows(values: string[][]): Row[] {
     const rankedIndex = col('ranked')
     const playLevelIndex = col('playlevel')
     const difficultyIndex = col('difficulty')
+    const constantIndex = col('constant')
 
     return values
         .slice(headerIndex + 1)
         .map((cells) => ({
             id: normalizeId(cells[idIndex]),
-            input: normalizeId(cells[inputIndex]),
+            input: stripTrailingSlash(normalizeId(cells[inputIndex])),
             serverId: normalizeId(cells[serverIdIndex]),
             privacy: normalizeId(cells[privacyIndex]),
             ranked: rankedIndex >= 0 ? normalizeId(cells[rankedIndex]) : '',
             playLevel: playLevelIndex >= 0 ? normalizeId(cells[playLevelIndex]) : '',
             difficulty: difficultyIndex >= 0 ? normalizeId(cells[difficultyIndex]) : '',
+            constant: constantIndex >= 0 ? normalizeId(cells[constantIndex]) : '',
         }))
         .filter((row) => row.id && row.input)
 }
@@ -293,6 +300,36 @@ function buildCustomLevels(rows: Row[]): SheetChart[] {
         .map((row) => chartFromUrl(row.id, row.input))
         .filter((chart): chart is SheetChart => chart !== null)
         .sort(compareIdDescending)
+}
+
+function buildConstantsMap(rows: Row[]): Record<string, number> {
+    const map: Record<string, number> = {}
+    for (const row of rows) {
+        const cleanInput = stripTrailingSlash(row.input)
+        const val = Number(row.constant)
+        if (cleanInput && Number.isFinite(val) && val > 0) {
+            map[cleanInput] = Math.round(val * 10) / 10
+        }
+    }
+    return map
+}
+
+export async function getConstantForAddress(
+    address: string,
+    env?: Env,
+): Promise<number | null> {
+    const cleanAddr = stripTrailingSlash(address)
+    if (!cleanAddr) return null
+
+    const cached = await readBucketJson<Record<string, number>>(env, R2_CONSTANTS_KEY)
+    if (cached && typeof cached[cleanAddr] === 'number') {
+        return cached[cleanAddr]!
+    }
+
+    const rows = await customRows()
+    const map = buildConstantsMap(rows)
+    await writeBucketJson(env, R2_CONSTANTS_KEY, map).catch(() => {})
+    return map[cleanAddr] ?? null
 }
 
 export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
@@ -524,7 +561,7 @@ function officialRankedPoolFromSheet(
             if (levelCol < 0 || linkCol < 0) continue
 
             const level = Number(normalizeId(cells[levelCol]))
-            const link = normalizeId(cells[linkCol])
+            const link = stripTrailingSlash(normalizeId(cells[linkCol]))
             if (!Number.isFinite(level) || !link || link === '-') continue
 
             const fits = diff === 'ap'
@@ -597,19 +634,39 @@ async function getRankedCustomPool(tier: RankedTier, env?: Env): Promise<SheetCh
     return filterCustomRankedForTier(allCustom, tier)
 }
 
+export async function pickRankedLevel(
+    tier: RankedTier,
+    customSongs: CustomSongsMode,
+    env?: Env,
+): Promise<SheetChart | null> {
+    const official = customSongs === 'customOnly'
+        ? []
+        : await getRankedTierOfficialPool(tier, env)
+    const custom = customSongs === 'off'
+        ? []
+        : await getRankedCustomPool(tier, env)
+
+    const pool = [...official, ...custom]
+    if (pool.length === 0) return null
+
+    return pool[Math.floor(Math.random() * pool.length)]!
+}
+
 export type RefreshSummary = {
     levels: number | null
     playlists: number | null
+    constants: number | null
     rankedCustom: number | null
     rankedTiers: Partial<Record<RankedTier, number>>
     errors: string[]
 }
 
 export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
-    console.log('[Refresh] Starting R2 refresh...')
+    console.log('[Refresh] Starting R2 refresh on POSTS_BUCKET...')
     const summary: RefreshSummary = {
         levels: null,
         playlists: null,
+        constants: null,
         rankedCustom: null,
         rankedTiers: {},
         errors: [],
@@ -626,6 +683,10 @@ export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
         await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists)
         summary.playlists = playlists.length
 
+        const constantsMap = buildConstantsMap(rows)
+        await writeBucketJson(env, R2_CONSTANTS_KEY, constantsMap)
+        summary.constants = Object.keys(constantsMap).length
+
         const allCustomRanked = buildAllCustomRanked(rows)
         await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustomRanked)
         summary.rankedCustom = allCustomRanked.length
@@ -637,42 +698,16 @@ export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
 
     try {
         const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
-        const tiers = Object.keys(RANKED_TIERS) as RankedTier[]
-
-        for (const tier of tiers) {
-            const officialPool = officialRankedPoolFromSheet(metaRows, tier)
-            await writeBucketJson(env, rankedTierKey(tier), officialPool)
-            summary.rankedTiers[tier] = officialPool.length
+        for (const tier of Object.keys(RANKED_TIERS) as RankedTier[]) {
+            const charts = officialRankedPoolFromSheet(metaRows, tier)
+            await writeBucketJson(env, rankedTierKey(tier), charts)
+            summary.rankedTiers[tier] = charts.length
         }
     } catch (error) {
         const msg = error instanceof Error ? error.message : String(error)
         console.error('[Refresh] Failed METADATA_RAW step:', msg)
-        summary.errors.push(`METADATA_RAW: ${msg}`)
+        summary.errors.push(`metadata: ${msg}`)
     }
 
-    console.log('[Refresh] Finished R2 refresh:', summary)
     return summary
-}
-
-export async function pickRankedLevel(
-    tier: RankedTier,
-    customSongs: CustomSongsMode | boolean,
-    env?: Env,
-): Promise<SheetChart | null> {
-    const mode: CustomSongsMode =
-        typeof customSongs === 'boolean'
-            ? (customSongs ? 'on' : 'off')
-            : customSongs
-
-    const officialPool = mode === 'customOnly'
-        ? []
-        : await getRankedTierOfficialPool(tier, env)
-
-    const customPool = mode === 'off'
-        ? []
-        : await getRankedCustomPool(tier, env)
-
-    const pool = [...officialPool, ...customPool]
-    if (pool.length === 0) return null
-    return pool[Math.floor(Math.random() * pool.length)]!
 }
