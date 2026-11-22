@@ -1,3 +1,4 @@
+
 {
   "name": "xx-multiplayer",
   "main": "src/index.ts",
@@ -24,6 +25,9 @@
     "HOST_HANDLE": "163292"
   },
   "observability": {
+    "enabled": false,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
     "logs": {
       "enabled": true,
       "head_sampling_rate": 1,
@@ -31,12 +35,12 @@
       "persist": true
     },
     "traces": {
-      "enabled": false,
+      "enabled": true,
       "head_sampling_rate": 1,
       "persist": true
     },
-    "issue_detection": {
-      "enabled": false
+    "issues": {
+      "enabled": true
     }
   }
 }
