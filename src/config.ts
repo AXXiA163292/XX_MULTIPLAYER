@@ -80,7 +80,8 @@ export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 export const SERVER_TITLE = 'XX! Championship'
 export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\nAXX!A's server!"
 
-export const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000
+/** An empty room (nobody connected) is deleted after this delay, whatever its type. */
+export const EMPTY_ROOM_TTL_MS = 6 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 5 * 60 * 1000
 
 let sheetDivisions: Record<string, string> = {}
