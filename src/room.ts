@@ -133,6 +133,22 @@ const getRoomTitle = (settings: RoomSettings, edition = '') => {
     return `${edition || 'Final'} Final`
 }
 
+function sanitizeWireResult(result: GameplayResult): GameplayResult {
+    const wireGrade: GameplayResult['grade'] =
+        result.grade === 'allPerfect' ||
+        result.grade === 'fullCombo' ||
+        result.grade === 'pass' ||
+        result.grade === 'fail'
+            ? result.grade
+            : 'fail'
+
+    return {
+        ...result,
+        grade: wireGrade,
+        disqualified: result.disqualified === true || result.grade === 'X',
+    }
+}
+
 function chartsForType(
     edition: EditionData,
     type: RoomSettings['type'],
@@ -1248,15 +1264,25 @@ export class Room extends DurableObject<Env> {
 
                 const expectedCount = state.levelInfo?.noteCount ?? null
                 const judgedCount =
-                    cmd.result.perfect +
-                    cmd.result.great +
-                    cmd.result.good +
-                    cmd.result.miss
+                    (Number(cmd.result.perfect) || 0) +
+                    (Number(cmd.result.great) || 0) +
+                    (Number(cmd.result.good) || 0) +
+                    (Number(cmd.result.miss) || 0)
 
-                const result: GameplayResult =
+                const incomplete =
                     expectedCount !== null && judgedCount < expectedCount
-                        ? { ...cmd.result, grade: 'X' }
-                        : cmd.result
+
+                const result: GameplayResult = incomplete
+                    ? {
+                        ...cmd.result,
+                        grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
+                        disqualified: true,
+                    }
+                    : {
+                        ...cmd.result,
+                        grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
+                        disqualified: cmd.result.disqualified === true || cmd.result.grade === 'X',
+                    }
 
                 state.results[uid] = result
                 state.statuses[uid] = 'waiting'
@@ -1271,7 +1297,11 @@ export class Room extends DurableObject<Env> {
 
                 this.sendResult(uid, result)
                 this.pushScoreboard()
-                this.diag('finishGameplay-accepted', { userId: uid, grade: result.grade })
+                this.diag('finishGameplay-accepted', {
+                    userId: uid,
+                    grade: result.grade,
+                    disqualified: result.disqualified === true,
+                })
 
                 await this.maybeFinishRound(true)
                 return
@@ -1521,11 +1551,13 @@ export class Room extends DurableObject<Env> {
         )
         if (!activeIds.has(uid)) return
 
+        const wireResult = sanitizeWireResult(result)
+
         for (const member of this.st.members) {
             if (activeIds.has(member.id) && this.canSee(member.id)) {
                 this.sendTo(member.id, {
                     type: 'addResult',
-                    result: { userId: uid, result },
+                    result: { userId: uid, result: wireResult },
                 })
             }
         }
@@ -1647,7 +1679,7 @@ export class Room extends DurableObject<Env> {
                 .filter(([id]) => activeIds.has(id) && (this.canSee(uid) || id === uid))
                 .map(([userId, result]) => ({
                     userId,
-                    result,
+                    result: sanitizeWireResult(result),
                 })),
             users: activeMembers.map((member) => member.roomUser),
             userStatuses: activeMembers.map((member) => ({
@@ -1856,7 +1888,8 @@ export class Room extends DurableObject<Env> {
                 !state.results[uid]
             ) {
                 const result: GameplayResult = {
-                    grade: 'X',
+                    grade: 'fail',
+                    disqualified: true,
                     arcadeScore: 0,
                     accuracyScore: 0,
                     combo: 0,
