@@ -22,11 +22,11 @@ export type Total = {
     bestCombo: number
 }
 
-const isDisqualified = (r: GameplayResult) =>
+const isXResult = (r: GameplayResult) =>
     r.disqualified === true || r.grade === 'X'
 
 export const rankedScore = (r: GameplayResult): number =>
-    isDisqualified(r)
+    isXResult(r)
         ? 0
         : (Number(r.perfect) || 0) * RANKED_POINTS.perfect +
           (Number(r.great) || 0) * RANKED_POINTS.great +
@@ -36,7 +36,7 @@ export function ppScore(
     r: GameplayResult,
     round?: RoundRecord,
 ): number {
-    if (!round || isDisqualified(r)) return 0
+    if (!round || isXResult(r)) return 0
 
     const rating = round.levelConstant ?? round.levelRating
     const noteCount = round.noteCount ?? r.totalCount
@@ -87,7 +87,7 @@ export function compareResults(
     return (
         roundScore(b, mode, round) -
         roundScore(a, mode, round) ||
-        Number(isDisqualified(a)) - Number(isDisqualified(b)) ||
+        Number(isXResult(a)) - Number(isXResult(b)) ||
         (Number(b.perfect) || 0) - (Number(a.perfect) || 0) ||
         (Number(b.combo) || 0) - (Number(a.combo) || 0)
     )
@@ -101,7 +101,7 @@ export function totals(
 
     for (const round of history) {
         for (const [userId, result] of Object.entries(round.results)) {
-            if (isDisqualified(result)) continue
+            if (isXResult(result)) continue
 
             const total = map.get(userId) ?? {
                 userId,
@@ -132,7 +132,7 @@ export function totals(
 
 export const fmtScore = (
     n: number,
-    mode: ScoringMode,
+    _mode: ScoringMode,
 ) => `${Math.round(Number.isFinite(n) ? n : 0)}`
 
 export function fmtDetail(
@@ -145,8 +145,9 @@ export function fmtDetail(
     const miss = Number(result.miss) || 0
     const combo = Number(result.combo) || 0
 
-    if (isDisqualified(result)) {
-        return `0 | F • ${combo}x (${great}/${good}/${miss})`
+    if (isXResult(result)) {
+        const zeroLabel = mode === 'pp' ? formatPP(0) : '0'
+        return `${zeroLabel} | X • ${combo}x (${great}/${good}/${miss})`
     }
 
     const score = roundScore(result, mode, round)
