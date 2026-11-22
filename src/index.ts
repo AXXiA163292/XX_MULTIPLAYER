@@ -1,3 +1,5 @@
+export { Room } from './room.ts'
+export { Lobby } from './lobby.ts'
 import {
     RANKED_ALLOWED_DIFFICULTIES,
     RANKED_MAX_RATING,
