@@ -98,10 +98,8 @@ async function roomItems(env: Env, session: AuthSession | null) {
                 return null
             }
 
-            // Private rooms are only listed for their host. Others join through the room link.
-            if (current.visibility === 'private' && current.hostId !== session?.user.id) {
-                return null
-            }
+            // Private rooms are never listed: players join them through the room link only.
+            if (current.visibility === 'private') return null
 
             return {
                 name: current.name,
@@ -203,16 +201,27 @@ const deletePostForm = {
 
 /** `?type=` of the post requests. Old "news" posts and links are treated as "posts". */
 function postCategory(url: URL): PostKind {
-    const type = url.searchParams.get('type')
+    const type =
+        url.searchParams.get('type') ??
+        url.searchParams.get('infoType') ??
+        url.searchParams.get('category')
+
     return type === 'announcements' || type === 'results' ? type : 'posts'
 }
 
+/** True when the request names a post category at all (the info request of some clients does not). */
+const hasPostCategory = (url: URL) =>
+    ['type', 'infoType', 'category'].some((key) => url.searchParams.has(key))
+
+/** Keeps the original case (SUDU-001) so the top-left tag is uppercase. */
 function playlistSlug(name: string): string {
     return name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/[^A-Za-z0-9]+/g, '-')
         .replace(/^-|-$/g, '')
 }
+
+const samePlaylist = (a: string, b: string) =>
+    a.toLowerCase() === b.toLowerCase()
 
 type RemoteLevelItem = Record<string, any>
 type RemoteLevelDetails = Record<string, any> & {
@@ -329,6 +338,228 @@ async function loadLevelItems(charts: SheetChart[]) {
     }
 
     return loaded
+}
+
+const UNCH_HOST = 'untitledcharts.com'
+
+const isUnch = (chart: SheetChart) => {
+    try {
+        const host = new URL(chart.address).hostname
+        return host === UNCH_HOST || host.endsWith(`.${UNCH_HOST}`)
+    } catch {
+        return false
+    }
+}
+
+async function findChart(name: string): Promise<SheetChart | null> {
+    const [customCharts, playlists] = await Promise.all([
+        getCustomLevels(),
+        getPlaylists(),
+    ])
+
+    return [
+        ...customCharts,
+        ...playlists.flatMap((playlist) => playlist.charts),
+    ].find((entry) => entry.name === name || entry.id === name) ?? null
+}
+
+/** Forwards community / leaderboard requests to the server that owns the level (Untitled Charts only). */
+async function proxyToUnch(
+    req: Request,
+    url: URL,
+    chart: SheetChart,
+    rest: string,
+): Promise<Response> {
+    const target = `${chart.address.replace(/\/+$/, '')}/sonolus/levels/${encodeURIComponent(chart.name)}/${rest}${url.search}`
+
+    const headers = new Headers()
+    headers.set('Accept', req.headers.get('Accept') ?? 'application/json')
+
+    const contentType = req.headers.get('Content-Type')
+    if (contentType) headers.set('Content-Type', contentType)
+
+    const upload = req.headers.get('Sonolus-Upload-Key')
+    if (upload) headers.set('Sonolus-Upload-Key', upload)
+
+    try {
+        const response = await fetch(target, {
+            method: req.method,
+            headers,
+            body: req.method === 'GET' || req.method === 'HEAD'
+                ? undefined
+                : await req.arrayBuffer(),
+            signal: AbortSignal.timeout(15000),
+        })
+
+        const type = response.headers.get('Content-Type') ?? 'application/json'
+
+        if (type.includes('json')) {
+            // Relative repository urls would resolve against this server: make them absolute.
+            const text = (await response.text()).replace(
+                /"url":"\/(?!\/)/g,
+                `"url":"${chart.address.replace(/\/+$/, '')}/`,
+            )
+
+            return new Response(text, {
+                status: response.status,
+                headers: {
+                    'Content-Type': type,
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'no-store',
+                },
+            })
+        }
+
+        return new Response(response.body, {
+            status: response.status,
+            headers: {
+                'Content-Type': type,
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'no-store',
+            },
+        })
+    } catch (error) {
+        console.error('Could not proxy community request:', target, error)
+        return message(502, 'Could not reach the level server.')
+    }
+}
+
+// Level search (title, artist, author + rating filter), like Untitled Charts.
+
+const LEVEL_SEARCHES = [
+    {
+        type: 'quick',
+        title: '#QUICK',
+        icon: 'search',
+        requireConfirmation: false,
+        options: [
+            {
+                query: 'keywords',
+                name: '#KEYWORDS',
+                required: false,
+                type: 'text',
+                def: '',
+                placeholder: '#KEYWORDS',
+                limit: 0,
+                shortcuts: [],
+            },
+        ],
+    },
+    {
+        type: 'advanced',
+        title: '#ADVANCED',
+        icon: 'advanced',
+        requireConfirmation: false,
+        options: [
+            {
+                query: 'keywords',
+                name: '#KEYWORDS',
+                required: false,
+                type: 'text',
+                def: '',
+                placeholder: '#KEYWORDS',
+                limit: 0,
+                shortcuts: [],
+            },
+            {
+                query: 'minRating',
+                name: 'Min level',
+                required: false,
+                type: 'slider',
+                def: 0,
+                min: 0,
+                max: 40,
+                step: 1,
+            },
+            {
+                query: 'maxRating',
+                name: 'Max level',
+                required: false,
+                type: 'slider',
+                def: 40,
+                min: 0,
+                max: 40,
+                step: 1,
+            },
+            {
+                query: 'sort',
+                name: 'Sort by',
+                required: false,
+                type: 'select',
+                def: 'newest',
+                values: [
+                    { name: 'newest', title: 'Newest' },
+                    { name: 'ratingDesc', title: 'Level (high to low)' },
+                    { name: 'ratingAsc', title: 'Level (low to high)' },
+                    { name: 'title', title: 'Title' },
+                ],
+            },
+        ],
+    },
+]
+
+let levelIndex: { at: number; entries: { chart: SheetChart; item: RemoteLevelItem }[] } | null = null
+
+async function allLevelEntries() {
+    if (levelIndex && Date.now() - levelIndex.at < 5 * 60_000) return levelIndex.entries
+
+    const entries = await loadLevelItems(await getCustomLevels())
+    levelIndex = { at: Date.now(), entries }
+
+    return entries
+}
+
+function hasLevelFilters(url: URL) {
+    const keywords = (url.searchParams.get('keywords') ?? '').trim()
+    const min = Number(url.searchParams.get('minRating') ?? '0')
+    const max = Number(url.searchParams.get('maxRating') ?? '40')
+    const sort = url.searchParams.get('sort') ?? 'newest'
+
+    return !!keywords || min > 0 || (Number.isFinite(max) && max < 40) || sort !== 'newest'
+}
+
+async function searchLevels(url: URL, page: number) {
+    const keywords = (url.searchParams.get('keywords') ?? '').trim().toLowerCase()
+    const min = Number(url.searchParams.get('minRating') ?? '0')
+    const max = Number(url.searchParams.get('maxRating') ?? '40')
+    const sort = url.searchParams.get('sort') ?? 'newest'
+
+    const haystack = (item: RemoteLevelItem) =>
+        [
+            localizedTitle(item.title),
+            localizedTitle(item.artists),
+            localizedTitle(item.author),
+            String(item.name ?? ''),
+        ].join(' ').toLowerCase()
+
+    let entries = (await allLevelEntries()).filter(({ item }) => {
+        const rating = Number(item.rating)
+
+        if (Number.isFinite(rating)) {
+            if (Number.isFinite(min) && rating < min) return false
+            if (Number.isFinite(max) && rating > max) return false
+        }
+
+        return keywords
+            .split(/\s+/)
+            .filter(Boolean)
+            .every((word) => haystack(item).includes(word))
+    })
+
+    if (sort === 'ratingDesc') entries = [...entries].sort((a, b) => Number(b.item.rating) - Number(a.item.rating))
+    else if (sort === 'ratingAsc') entries = [...entries].sort((a, b) => Number(a.item.rating) - Number(b.item.rating))
+    else if (sort === 'title') {
+        entries = [...entries].sort((a, b) =>
+            localizedTitle(a.item.title).localeCompare(localizedTitle(b.item.title)))
+    }
+
+    const pageCount = Math.max(1, Math.ceil(entries.length / 10))
+    const start = page * 10
+
+    return {
+        pageCount,
+        items: entries.slice(start, start + 10).map((entry) => entry.item),
+    }
 }
 
 export default {
@@ -464,22 +695,27 @@ export default {
         // Posts: Announcements, Posts and Results (only the tournament host can create / delete)
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
-            const category = postCategory(url)
+            console.log('[Posts] info request query:', url.search)
+
             const session = await sessionOf(req, env)
-            const posts = await lobby(env).listPosts(category)
+            const kinds: PostKind[] = hasPostCategory(url)
+                ? [postCategory(url)]
+                : ['announcements', 'posts', 'results']
+
+            const sections = await Promise.all(
+                kinds.map(async (kind) => ({
+                    title: POST_LABELS[kind].section,
+                    itemType: 'post',
+                    items: (await lobby(env).listPosts(kind)).map((post) => post.item),
+                })),
+            )
 
             return json({
                 creates: canManagePosts(session)
-                    ? [postForm(category)]
+                    ? [postForm(kinds.length === 1 ? kinds[0]! : 'posts')]
                     : [],
                 searches: [],
-                sections: [
-                    {
-                        title: POST_LABELS[category].section,
-                        itemType: 'post',
-                        items: posts.map((post) => post.item),
-                    },
-                ],
+                sections,
             })
         }
 
@@ -742,7 +978,7 @@ export default {
 
                 return json({
                     creates: [],
-                    searches: [],
+                    searches: LEVEL_SEARCHES,
                     sections: [
                         {
                             title: 'Custom Levels',
@@ -764,13 +1000,23 @@ export default {
                     ? requestedPage
                     : 0
 
+                if (hasLevelFilters(url)) {
+                    const found = await searchLevels(url, page)
+
+                    return json({
+                        pageCount: found.pageCount,
+                        items: page >= found.pageCount ? [] : found.items,
+                        searches: LEVEL_SEARCHES,
+                    })
+                }
+
                 const { charts, pageCount } = await getCustomLevelPage(page)
 
                 if (page >= pageCount) {
                     return json({
                         pageCount,
                         items: [],
-                        searches: [],
+                        searches: LEVEL_SEARCHES,
                     })
                 }
 
@@ -783,12 +1029,25 @@ export default {
                 return json({
                     pageCount,
                     items: loaded.map((entry) => entry.item),
-                    searches: [],
+                    searches: LEVEL_SEARCHES,
                 })
             } catch (error) {
                 console.error('Could not read custom levels sheet:', error)
                 return message(502, 'Could not read custom levels sheet.')
             }
+        }
+
+        const levelSub = path.match(
+            /^\/sonolus\/levels\/([^/]+)\/((?:community|leaderboards|submit|upload)(?:\/.*)?)$/,
+        )
+
+        if (levelSub) {
+            const chart = await findChart(decodeURIComponent(levelSub[1]!)).catch(() => null)
+
+            // Only Untitled Charts levels have a community / leaderboards.
+            if (!chart || !isUnch(chart)) return new Response(null, { status: 404 })
+
+            return proxyToUnch(req, url, chart, levelSub[2]!)
         }
 
         const levelPath = path.match(/^\/sonolus\/levels\/([^/]+)$/)
@@ -823,13 +1082,12 @@ export default {
                     ...details,
                     item: details.item,
                     description: details.description ?? details.item.description ?? '',
-                    actions: Array.isArray(details.actions) ? details.actions : [],
-                    hasCommunity: details.hasCommunity ?? false,
-                    leaderboards: Array.isArray(details.leaderboards)
+                    actions: isUnch(chart) && Array.isArray(details.actions) ? details.actions : [],
+                    // Community / leaderboard only exist on Untitled Charts levels. They are proxied below.
+                    hasCommunity: isUnch(chart) ? details.hasCommunity ?? false : false,
+                    leaderboards: isUnch(chart) && Array.isArray(details.leaderboards)
                         ? details.leaderboards
-                        : Array.isArray(details.item.leaderboards)
-                            ? details.item.leaderboards
-                            : [],
+                        : [],
                     sections: Array.isArray(details.sections) ? details.sections : [],
                 })
             } catch (error) {
@@ -852,7 +1110,7 @@ export default {
                         version: 1 as const,
                         title: playlist.name,
                         subtitle: `${loaded.length} levels`,
-                        author: "AXX!A's server",
+                        author: 'XX!',
                         tags: [],
                         levels: loaded.map((entry) => entry.item),
                     }
@@ -905,43 +1163,26 @@ export default {
             try {
                 const playlists = await getPlaylists()
                 const playlist = playlists.find(
-                    (entry) => playlistSlug(entry.name) === requestedName,
+                    (entry) => samePlaylist(playlistSlug(entry.name), requestedName),
                 )
 
                 if (!playlist) return new Response(null, { status: 404 })
 
-                const details = await Promise.all(
-                    playlist.charts.map((chart) => remoteLevelDetails(chart)),
-                )
-
-                const loaded = details.filter(
-                    (detail): detail is RemoteLevelDetails => detail !== null,
-                )
+                const loaded = await loadLevelItems(playlist.charts)
 
                 const item = {
-                    name: requestedName,
+                    name: playlistSlug(playlist.name),
                     version: 1 as const,
                     title: playlist.name,
                     subtitle: `${loaded.length} levels`,
-                    author: "AXX!A's server",
+                    author: 'XX!',
                     tags: [],
-                    levels: loaded.map((detail) => detail.item),
+                    levels: loaded.map((entry) => entry.item),
                 }
-
-                const description = loaded
-                    .map((detail) => {
-                        const title = localizedTitle(detail.item?.title)
-                        const text = descriptionText(
-                            detail.description ?? detail.item?.description,
-                        )
-                        return text ? [title, text].filter(Boolean).join('\n') : ''
-                    })
-                    .filter(Boolean)
-                    .join('\n\n')
 
                 return json({
                     item,
-                    description,
+                    description: '',
                     actions: [],
                     hasCommunity: false,
                     leaderboards: [],
@@ -1051,11 +1292,12 @@ export default {
                 if (
                     (
                         user.handle !== TOURNAMENT_HOST_HANDLE &&
-                        settings.type !== 'casualRoom'
+                        settings.type !== 'casualRoom' &&
+                        settings.type !== 'rankedRoom'
                     ) ||
                     !(await stub.configure(key, settings, user))
                 ) {
-                    return message(403, 'You can only create Custom Rooms.')
+                    return message(403, 'You can only create Custom or Ranked Match rooms.')
                 }
             } else {
                 if (!(await stub.isOpen())) {
