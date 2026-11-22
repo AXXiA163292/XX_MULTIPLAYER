@@ -6,7 +6,7 @@ import {
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import { roomForms, parseSettings } from './forms.ts'
-import type { Env, RoomUser, Sil } from './types.ts'
+import type { Env, RoomUser } from './types.ts'
 
 type SonolusUser = {
     id: string
@@ -76,6 +76,18 @@ function buildRoomUser(user: SonolusUser, request: Request): RoomUser {
         handle: user.handle,
         authentication: request.headers.get('x-sonolus-authentication') ?? '',
         signature: request.headers.get('x-sonolus-signature') ?? '',
+    }
+}
+
+function buildStaffChatPostItem(unread: number, origin: string) {
+    return {
+        name: 'staff-chat',
+        version: 1,
+        title: unread > 0 ? `🔴 Chat (${unread})` : 'Chat',
+        time: Date.now(),
+        author: SERVER_TITLE,
+        tags: [{ title: 'Chat' }],
+        url: `${origin}/chat`,
     }
 }
 
@@ -338,30 +350,31 @@ export default {
         }
 
         if (url.pathname === '/sonolus/info') {
-            const options: Record<string, unknown>[] = []
+            const canSeeChat = Boolean(user && isStaffChatUser(user.handle))
+            const unread = canSeeChat
+                ? await env.LOBBY.get(env.LOBBY.idFromName('main')).getChatUnreadCount(user!.handle)
+                : 0
 
-            if (user && isStaffChatUser(user.handle)) {
-                const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
-                const unread = await lobby.getChatUnreadCount(user.handle)
-                options.push({
-                    query: 'chat',
-                    name: unread > 0 ? `🔴 Chat (${unread})` : 'Chat',
-                    description: 'Staff chat (163292, 283420, 3227470)',
-                    required: false,
-                    type: 'select',
-                    def: 'open',
-                    values: [
-                        { name: 'open', title: 'Open Chat (/chat)' },
-                    ],
-                })
-            }
+            const chatItem = canSeeChat
+                ? buildStaffChatPostItem(unread, url.origin)
+                : null
 
             return Response.json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
                 configuration: {
-                    options,
+                    options: [],
                 },
+                sections: chatItem
+                    ? [
+                        {
+                            title: 'Chat',
+                            icon: 'comment',
+                            itemType: 'post',
+                            items: [chatItem],
+                        },
+                    ]
+                    : [],
                 levels: {
                     items: [],
                     searches: [
@@ -427,9 +440,52 @@ export default {
                     searches: [],
                 },
                 posts: {
-                    items: [],
+                    items: chatItem ? [chatItem] : [],
                     searches: [],
                 },
+            })
+        }
+
+        if (url.pathname === '/sonolus/posts/list') {
+            if (!user || !isStaffChatUser(user.handle)) {
+                return Response.json({
+                    pageCount: 1,
+                    items: [],
+                    searches: [],
+                })
+            }
+
+            const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
+            const unread = await lobby.getChatUnreadCount(user.handle)
+            return Response.json({
+                pageCount: 1,
+                items: [buildStaffChatPostItem(unread, url.origin)],
+                searches: [],
+            })
+        }
+
+        if (url.pathname === '/sonolus/posts/staff-chat') {
+            if (!user || !isStaffChatUser(user.handle)) {
+                return new Response('Not Found', { status: 404 })
+            }
+
+            const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
+            const messages = await lobby.listChatMessages()
+            await lobby.markChatRead(user.handle)
+
+            const recentLines = messages.slice(-15).map(
+                (m) => `[${m.author} (${m.handle})]: ${m.text}`,
+            )
+
+            return Response.json({
+                item: buildStaffChatPostItem(0, url.origin),
+                description: [
+                    `Open chat in browser: ${url.origin}/chat`,
+                    'Shortcuts: @Bell, @Noct, @Ʌstra',
+                    '',
+                    ...(recentLines.length > 0 ? recentLines : ['No messages yet.']),
+                ].join('\n'),
+                recommended: [],
             })
         }
 
