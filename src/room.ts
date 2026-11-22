@@ -1298,24 +1298,76 @@ export class Room extends DurableObject<Env> {
                 return this.resync(uid)
             }
 
+            const readyIds = new Set(
+                readyMembers.map((member) => member.id),
+            )
+
+            const skippedIds = new Set(
+                state.members
+                    .filter((member) => state.statuses[member.id] === 'skipped')
+                    .map((member) => member.id),
+            )
+
+            /*
+             * Sonolus requires updateLevel to arrive while the client
+             * is in selecting. Sending it during preparing or playing
+             * causes a fatal error.
+             *
+             * The level is not sent to non-hosts during normal selection
+             * or preparation. It is sent here, immediately before the
+             * round starts.
+             */
+
+            state.status = 'selecting'
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'selecting',
+            })
+
+            this.sendAll({
+                type: 'updateLevel',
+                level: state.level,
+            })
+
+            state.status = 'preparing'
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'preparing',
+            })
+
+            for (const member of state.members) {
+                if (readyIds.has(member.id)) {
+                    state.statuses[member.id] = 'ready'
+
+                    this.sendAll({
+                        type: 'updateUserStatus',
+                        userStatus: {
+                            userId: member.id,
+                            status: 'ready',
+                        },
+                    })
+                } else if (skippedIds.has(member.id)) {
+                    state.statuses[member.id] = 'skipped'
+
+                    this.sendAll({
+                        type: 'updateUserStatus',
+                        userStatus: {
+                            userId: member.id,
+                            status: 'skipped',
+                        },
+                    })
+                } else {
+                    state.statuses[member.id] = 'waiting'
+                }
+            }
+
             state.status = 'playing'
             state.results = {}
             state.round = {
                 state: crypto.randomUUID(),
                 seed: Math.random(),
-            }
-
-            for (const member of state.members) {
-                if (state.statuses[member.id] === 'skipped') {
-                    state.statuses[member.id] = 'waiting'
-                }
-            }
-
-            for (const member of readyMembers) {
-                this.sendTo(member.id, {
-                    type: 'updateLevel',
-                    level: state.level,
-                })
             }
 
             this.sendAll({
@@ -1401,11 +1453,8 @@ export class Room extends DurableObject<Env> {
             ],
             optionValues: serializeSettings(state.settings),
 
-            // Keep the level field present to avoid invalid room updates.
-            // Non-hosts receive null until the round is underway.
-            level: isHost || state.status === 'playing'
-                ? state.level
-                : null,
+            // Non-hosts do not receive the selected level before game start.
+            level: isHost ? state.level : null,
 
             levelOptions: [],
             autoExit: 'off',
