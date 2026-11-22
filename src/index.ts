@@ -149,7 +149,8 @@ function postForm(category: PostKind) {
     const label = POST_LABELS[category]
 
     return {
-        type: 'post',
+        // The form type is the category, so the create request says where the post goes.
+        type: category,
         title: label.create,
         requireConfirmation: false,
         options: [
@@ -199,19 +200,24 @@ const deletePostForm = {
     options: [],
 }
 
-/** `?type=` of the post requests. Old "news" posts and links are treated as "posts". */
-function postCategory(url: URL): PostKind {
-    const type =
-        url.searchParams.get('type') ??
-        url.searchParams.get('infoType') ??
-        url.searchParams.get('category')
+const POST_KINDS: PostKind[] = ['announcements', 'posts', 'results']
 
-    return type === 'announcements' || type === 'results' ? type : 'posts'
+const asKind = (value: string | null | undefined): PostKind | null =>
+    POST_KINDS.includes(value as PostKind) ? (value as PostKind) : null
+
+/** Category of a post request: `?type=` / `?infoType=` / `?category=` or the same keys in the submitted values. */
+function postCategory(url: URL, values?: URLSearchParams): PostKind {
+    for (const key of ['type', 'infoType', 'category']) {
+        const kind = asKind(url.searchParams.get(key)) ?? asKind(values?.get(key))
+        if (kind) return kind
+    }
+
+    return 'posts'
 }
 
 /** True when the request names a post category at all (the info request of some clients does not). */
 const hasPostCategory = (url: URL) =>
-    ['type', 'infoType', 'category'].some((key) => url.searchParams.has(key))
+    ['type', 'infoType', 'category'].some((key) => asKind(url.searchParams.get(key)) !== null)
 
 /** Keeps the original case (SUDU-001) so the top-left tag is uppercase. */
 function playlistSlug(name: string): string {
@@ -711,16 +717,17 @@ export default {
             )
 
             return json({
-                creates: canManagePosts(session)
-                    ? [postForm(kinds.length === 1 ? kinds[0]! : 'posts')]
-                    : [],
+                // One create form per category shown (all three on the combined page).
+                creates: canManagePosts(session) ? kinds.map(postForm) : [],
                 searches: [],
                 sections,
             })
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const posts = await lobby(env).listPosts(postCategory(url))
+            const posts = await lobby(env).listPosts(
+                hasPostCategory(url) ? postCategory(url) : undefined,
+            )
 
             return json({
                 pageCount: 1,
@@ -746,7 +753,7 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            const category = postCategory(url)
+            const category = postCategory(url, values)
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
             const thumbnailHash = (values.get('thumbnail') ?? '').trim()
