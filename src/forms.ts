@@ -46,11 +46,11 @@ const groupOption = {
 const titleOption = {
     query: 'title',
     name: 'Room title',
-    description: 'Choose a name for your Custom Room.',
+    description: "Defaults to <username>'s room.",
     required: false,
     type: 'text' as const,
-    def: 'Custom Room',
-    placeholder: 'Custom Room',
+    def: '',
+    placeholder: "<username>'s room",
     limit: 48,
     shortcuts: [],
 }
@@ -166,7 +166,10 @@ export type RoomSettings = {
     customSongs: CustomSongsMode
 }
 
-export const serializeSettings = (s: RoomSettings) => {
+export const defaultCustomRoomTitle = (username?: string) =>
+    `${(username || 'Player').trim() || 'Player'}'s room`
+
+export const serializeSettings = (s: RoomSettings, hostName?: string) => {
     const values = [
         `type=${s.type}`,
         `scoring=${s.scoring}`,
@@ -175,7 +178,7 @@ export const serializeSettings = (s: RoomSettings) => {
 
     if (s.type === 'groupStage') values.push(`group=${encodeURIComponent(s.group || 'A')}`)
     if (s.type === 'casualRoom') {
-        values.push(`title=${encodeURIComponent(s.title || '')}`)
+        values.push(`title=${encodeURIComponent(s.title || defaultCustomRoomTitle(hostName))}`)
         values.push(`random=${s.random ? '1' : '0'}`)
     }
     if (s.type === 'rankedRoom') {
@@ -204,6 +207,7 @@ export function normalizeCustomSongsMode(value: unknown): CustomSongsMode {
 export function parseSettings(
     input: string | URLSearchParams,
     fallback?: RoomSettings,
+    hostName?: string,
 ): RoomSettings | null {
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
 
@@ -214,7 +218,10 @@ export function parseSettings(
     const open = isOpenType(type)
     const scoring = p.get('scoring') || fallback?.scoring || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
     const group = (p.get('group') ?? fallback?.group ?? 'A').trim() || 'A'
-    const title = (p.get('title') ?? fallback?.title ?? '').trim()
+    const rawTitle = (p.get('title') ?? fallback?.title ?? '').trim()
+    const title = type === 'casualRoom'
+        ? (rawTitle || defaultCustomRoomTitle(hostName))
+        : rawTitle
     const rawVisibility = p.get('visibility') ?? fallback?.visibility ?? (type === 'casualRoom' ? 'public' : 'locked')
     const rawTier = (p.get('tier') ?? fallback?.tier ?? 'master').trim().toLowerCase()
 
