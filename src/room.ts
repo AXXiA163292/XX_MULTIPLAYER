@@ -3,14 +3,15 @@ import {
     EMPTY_ROOM_TTL_MS,
     RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
-    SERVER_TITLE,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import {
     closeRoomForm,
+    normalizeCustomSongsMode,
     parseSettings,
     roomForms,
     serializeSettings,
+    type CustomSongsMode,
     type RoomSettings,
 } from './forms.ts'
 import {
@@ -21,16 +22,7 @@ import {
     totals,
     type RoundRecord,
 } from './scoring.ts'
-import {
-    getEditionData,
-    loadRankedPool,
-    pickFromPool,
-    refreshRankedBucket,
-    type EditionData,
-    type RankedCustomMode,
-    type RankedTier,
-    type SheetChart,
-} from './sheets.ts'
+import { getEditionData, pickRankedLevel, type EditionData, type RankedTier, type SheetChart } from './sheets.ts'
 import type {
     Env,
     GameplayResult,
@@ -83,8 +75,6 @@ type RoomState = {
     round: { state: string; seed: number } | null
     results: Record<string, GameplayResult>
     history: RoundRecord[]
-    /** Ranked Match: a new song must be picked before the next match can start. */
-    rankedNeedsRoll: boolean
 }
 
 const fresh = (): RoomState => ({
@@ -103,8 +93,7 @@ const fresh = (): RoomState => ({
         visibility: 'locked',
         random: false,
         tier: 'master',
-        customSongs: false,
-        customOnly: false,
+        customSongs: 'off',
     },
     status: 'selecting',
     level: null,
@@ -116,12 +105,12 @@ const fresh = (): RoomState => ({
     round: null,
     results: {},
     history: [],
-    rankedNeedsRoll: false,
 })
 
-/** Room types anyone can create (no tournament host needed). */
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
+
+const KEEP_LEFT_RESULTS_MS = 6 * 60 * 60 * 1000
 
 const getRoomTitle = (settings: RoomSettings, edition = '') => {
     if (settings.type === 'rankedRoom') {
@@ -136,9 +125,7 @@ const getRoomTitle = (settings: RoomSettings, edition = '') => {
         return settings.title || 'Custom Room'
     }
 
-    return edition
-        ? `${SERVER_TITLE} • ${edition} Final`
-        : `${SERVER_TITLE} • Final`
+    return `${edition || 'Final'} Final`
 }
 
 function chartsForType(
@@ -183,10 +170,7 @@ const localize = (value: any): string => {
     if (value && typeof value === 'object') {
         if (typeof value.en === 'string') return value.en
 
-        const first = Object.values(value).find(
-            (v) => typeof v === 'string',
-        )
-
+        const first = Object.values(value).find((v) => typeof v === 'string')
         return typeof first === 'string' ? first : ''
     }
 
@@ -221,7 +205,6 @@ function extractDescriptionNumber(
     )
 
     if (!match) return null
-
     const value = Number(match[1])
     return Number.isFinite(value) ? value : null
 }
@@ -283,12 +266,9 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
 
                 const data: any = await response.json()
                 const item = data.item ?? data
-
                 if (!item || typeof item !== 'object') continue
 
-                const description = descriptionText(
-                    data.description ?? item.description,
-                )
+                const description = descriptionText(data.description ?? item.description)
 
                 const difficultyTags = Array.isArray(item.tags)
                     ? item.tags
@@ -320,11 +300,7 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     ? Math.round(parsedRating * 10) / 10
                     : null
 
-                const descriptionConstant = extractDescriptionNumber(
-                    description,
-                    'Constant',
-                )
-
+                const descriptionConstant = extractDescriptionNumber(description, 'Constant')
                 const constant = descriptionConstant ?? rating
 
                 return {
@@ -344,11 +320,6 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
     }
 
     return null
-}
-
-type ScoreboardSection = {
-    title: string
-    scores: { userId: string; value: string }[]
 }
 
 type Ev = Record<string, unknown>
@@ -409,9 +380,6 @@ function cleanDivisions(value: unknown): Record<string, string> {
 export class Room extends DurableObject<Env> {
     st: RoomState = fresh()
 
-    /** Ranked Match song list, loaded when the room opens (kept in storage under 'rankedPool'). */
-    private rankedPool: Sil[] | null = null
-
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
 
@@ -426,24 +394,14 @@ export class Room extends DurableObject<Env> {
                     ...base.settings,
                     ...(saved?.settings ?? {}),
                 },
-                edition: typeof saved?.edition === 'string'
-                    ? saved.edition
-                    : '',
+                edition: typeof saved?.edition === 'string' ? saved.edition : '',
                 divisions: cleanDivisions(saved?.divisions),
                 reserved: saved?.reserved ?? null,
                 configured: saved?.configured === true,
-                hostId: typeof saved?.hostId === 'string'
-                    ? saved.hostId
-                    : '',
-                hostName: typeof saved?.hostName === 'string'
-                    ? saved.hostName
-                    : '',
-                status: isRoomStatus(saved?.status)
-                    ? saved.status
-                    : 'selecting',
-                level: saved?.level && isSil(saved.level)
-                    ? saved.level
-                    : null,
+                hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
+                hostName: typeof saved?.hostName === 'string' ? saved.hostName : '',
+                status: isRoomStatus(saved?.status) ? saved.status : 'selecting',
+                level: saved?.level && isSil(saved.level) ? saved.level : null,
                 levelInfo: saved?.levelInfo ?? null,
                 levelOptions: Array.isArray(saved?.levelOptions)
                     ? saved.levelOptions.filter(
@@ -487,9 +445,7 @@ export class Room extends DurableObject<Env> {
                         ),
                     )
                     : {},
-                history: Array.isArray(saved?.history)
-                    ? saved.history
-                    : [],
+                history: Array.isArray(saved?.history) ? saved.history : [],
                 round: saved?.round &&
                     typeof saved.round.state === 'string' &&
                     typeof saved.round.seed === 'number'
@@ -514,8 +470,7 @@ export class Room extends DurableObject<Env> {
                 this.st.settings.tier = 'master'
             }
 
-            this.st.settings.customSongs = this.st.settings.customSongs === true
-            this.st.settings.customOnly = this.st.settings.customOnly === true
+            this.st.settings.customSongs = normalizeCustomSongsMode(this.st.settings.customSongs)
 
             if (this.st.settings.type === 'rankedRoom') {
                 this.st.settings.scoring = 'rankedMatch'
@@ -528,37 +483,26 @@ export class Room extends DurableObject<Env> {
             }
 
             const uniqueMembers = new Map<string, Member>()
-
             for (const member of this.st.members) {
                 uniqueMembers.set(member.id, member)
             }
-
             this.st.members = [...uniqueMembers.values()]
 
             for (const member of this.st.members) {
                 this.st.statuses[member.id] ??= 'waiting'
             }
 
-            const memberIds = new Set(
-                this.st.members.map((member) => member.id),
-            )
-
+            const memberIds = new Set(this.st.members.map((member) => member.id))
             for (const id of Object.keys(this.st.statuses)) {
-                if (!memberIds.has(id)) {
-                    delete this.st.statuses[id]
-                }
+                if (!memberIds.has(id)) delete this.st.statuses[id]
             }
-
             for (const id of Object.keys(this.st.results)) {
-                if (!memberIds.has(id)) {
-                    delete this.st.results[id]
-                }
+                if (!memberIds.has(id)) delete this.st.results[id]
             }
 
             if (this.st.status === 'playing' && !this.st.round) {
                 this.st.status = 'selecting'
                 this.st.results = {}
-
                 for (const member of this.st.members) {
                     this.st.statuses[member.id] = 'waiting'
                 }
@@ -576,6 +520,23 @@ export class Room extends DurableObject<Env> {
         })
     }
 
+    private diag(event: string, extra?: Record<string, unknown>) {
+        const connectedIds = this.st.members
+            .filter((m) => this.socketsOf(m.id).length > 0)
+            .map((m) => m.id)
+
+        console.log(`[Room:${this.st.name || 'init'}] ${event}`, {
+            type: this.st.settings.type,
+            status: this.st.status,
+            round: this.st.round?.state ?? null,
+            historyLen: this.st.history.length,
+            resultsKeys: Object.keys(this.st.results),
+            connectedIds,
+            statuses: this.st.statuses,
+            ...extra,
+        })
+    }
+
     async reserve(name: string, reservation: Reservation): Promise<void> {
         this.st = {
             ...fresh(),
@@ -584,9 +545,7 @@ export class Room extends DurableObject<Env> {
         }
 
         await this.save()
-        await this.ctx.storage.setAlarm(
-            Date.now() + RESERVED_ROOM_TTL_MS,
-        )
+        await this.ctx.storage.setAlarm(Date.now() + RESERVED_ROOM_TTL_MS)
     }
 
     async configure(
@@ -634,10 +593,7 @@ export class Room extends DurableObject<Env> {
         } else {
             this.st.edition ||= 'Final'
             this.st.divisions = {}
-            this.st.suggestions = await songPoolSuggestions(
-                settings.type,
-                host.id,
-            )
+            this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
         }
 
         this.st.configured = true
@@ -653,29 +609,10 @@ export class Room extends DurableObject<Env> {
         this.st.results = {}
         this.st.history = []
 
-        // Ranked Match: load the song list from the bucket once (room open) and put a first song.
-        if (settings.type === 'rankedRoom') {
-            this.rankedPool = null
-            this.st.rankedNeedsRoll = false
-
-            await this.loadRankedSongs()
-            await this.rollRankedLevel(false)
-
-            // Refresh the bucket from the sheets in the background; the next rooms use it.
-            const bucket = this.rankedBucket()
-
-            if (bucket) {
-                this.ctx.waitUntil(
-                    refreshRankedBucket(bucket, settings.tier as RankedTier).catch((error) =>
-                        console.error('Could not refresh the ranked bucket:', error),
-                    ),
-                )
-            }
-        }
-
         await this.ctx.storage.deleteAlarm()
         await this.save()
         await this.syncLobby()
+        this.diag('configured')
 
         return true
     }
@@ -697,15 +634,11 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    /** Returns null when the user may join, otherwise the message to show. */
     async canJoin(user: { id: string; handle: string }): Promise<string | null> {
         if (!this.st.configured) return 'This room does not exist.'
 
         const s = this.st.settings
-
         if (user.id === this.st.hostId || user.handle === TOURNAMENT_HOST_HANDLE) return null
-
-        // Locked rooms are closed for everybody (even registered players) until they are made public.
         if (s.visibility === 'locked') return 'This room is locked.'
 
         return null
@@ -723,12 +656,9 @@ export class Room extends DurableObject<Env> {
         }
 
         let join: JoinSession | null
-
         try {
             join = JSON.parse(
-                decodeURIComponent(
-                    request.headers.get('x-join') ?? 'null',
-                ),
+                decodeURIComponent(request.headers.get('x-join') ?? 'null'),
             ) as JoinSession | null
         } catch {
             return new Response('Invalid join session', { status: 400 })
@@ -753,10 +683,7 @@ export class Room extends DurableObject<Env> {
         const oldSockets = this.socketsOf(user.id)
         const wasConnected = oldSockets.length > 0
 
-        const existingMember = this.st.members.find(
-            (member) => member.id === user.id,
-        )
-
+        const existingMember = this.st.members.find((member) => member.id === user.id)
         const member: Member = existingMember ?? {
             id: user.id,
             name: user.name,
@@ -768,11 +695,8 @@ export class Room extends DurableObject<Env> {
         member.handle = user.handle
         member.roomUser = join.roomUser
 
-        this.st.members = this.st.members.filter(
-            (entry) => entry.id !== user.id,
-        )
+        this.st.members = this.st.members.filter((entry) => entry.id !== user.id)
         this.st.members.push(member)
-
         this.st.statuses[user.id] = 'waiting'
 
         this.ctx.acceptWebSocket(server)
@@ -780,7 +704,6 @@ export class Room extends DurableObject<Env> {
 
         for (const oldSocket of oldSockets) {
             this.closing.add(oldSocket)
-
             try {
                 oldSocket.close(4000, 'replaced')
             } catch {
@@ -814,13 +737,12 @@ export class Room extends DurableObject<Env> {
 
         this.pushScoreboard()
 
-        // Some clients keep showing the room id until a title event arrives.
         this.send(server, {
             type: 'updateTitle',
             title: getRoomTitle(this.st.settings, this.st.edition),
         })
 
-        // A round that nobody is playing any more must not keep the room stuck in "playing".
+        this.diag('ws-join', { userId: user.id, wasConnected })
         await this.maybeFinishRound(true)
 
         return new Response(null, {
@@ -833,14 +755,10 @@ export class Room extends DurableObject<Env> {
         ws: WebSocket,
         raw: string | ArrayBuffer,
     ): Promise<void> {
-        const attachment = ws.deserializeAttachment() as {
-            userId: string
-        } | null
-
+        const attachment = ws.deserializeAttachment() as { userId: string } | null
         if (!attachment || typeof raw !== 'string') return
 
         let command: Cmd
-
         try {
             command = JSON.parse(raw)
         } catch {
@@ -855,6 +773,7 @@ export class Room extends DurableObject<Env> {
             await this.handle(attachment.userId, command)
         } catch (error) {
             console.error('Room command failed:', command?.type, error)
+            this.diag('command-error', { userId: attachment.userId, cmdType: command?.type })
             this.resync(attachment.userId)
         }
 
@@ -862,10 +781,7 @@ export class Room extends DurableObject<Env> {
     }
 
     async webSocketClose(ws: WebSocket): Promise<void> {
-        const attachment = ws.deserializeAttachment() as {
-            userId: string
-        } | null
-
+        const attachment = ws.deserializeAttachment() as { userId: string } | null
         if (!attachment) return
 
         this.closing.add(ws)
@@ -874,35 +790,27 @@ export class Room extends DurableObject<Env> {
             return
         }
 
+        this.diag('ws-close', { userId: attachment.userId })
         await this.dropMember(attachment.userId, true, true)
     }
 
     async webSocketError(ws: WebSocket): Promise<void> {
+        this.diag('ws-error')
         await this.webSocketClose(ws)
     }
 
     async alarm(): Promise<void> {
-        try {
-            await this.runAlarm()
-        } catch (error) {
-            // Never rethrow: a failing alarm is retried by Cloudflare and would repeat the failure.
-            console.error('Room alarm failed:', error)
-        }
-    }
+        this.diag('alarm-fired')
+        await this.maybeFinishRound(true)
+        await this.save()
 
-    private async runAlarm(): Promise<void> {
-        if (this.ctx.getWebSockets().length > 0) {
-            await this.maybeFinishRound(true)
-            await this.save()
-            return
-        }
+        if (this.ctx.getWebSockets().length > 0) return
 
         await this.env.LOBBY
             .get(this.env.LOBBY.idFromName('main'))
             .remove(this.st.name)
 
         await this.ctx.storage.deleteAll()
-        this.rankedPool = null
         this.st = fresh()
     }
 
@@ -913,9 +821,6 @@ export class Room extends DurableObject<Env> {
 
         const roomName = this.st.name
         const sockets = this.ctx.getWebSockets()
-
-        this.rankedPool = null
-        await this.ctx.storage.delete('rankedPool')
 
         this.st = fresh()
         await this.save()
@@ -948,14 +853,16 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                // Ranked Match: "select" always gives a random level of the room's tier.
-                if (state.settings.type === 'rankedRoom') {
-                    if (!(await this.rollRankedLevel(true))) return this.resync(uid)
-                    return
+                if (
+                    state.settings.type === 'rankedRoom' ||
+                    (state.settings.type === 'casualRoom' && state.settings.random)
+                ) {
+                    return this.resync(uid)
                 }
 
-                if (state.settings.type === 'casualRoom' && state.settings.random) {
-                    return this.resync(uid)
+                if (state.levelOptions.length > 0) {
+                    state.levelOptions = []
+                    this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
                 }
 
                 state.level = {
@@ -985,48 +892,88 @@ export class Room extends DurableObject<Env> {
                         ? parseSettings(cmd.optionValues)
                         : null
 
-                // Only the form of the current room type is offered: the type never changes.
+                const member = state.members.find((entry) => entry.id === uid)
+                const tournamentHost = member?.handle === TOURNAMENT_HOST_HANDLE
+
+                const structural =
+                    !!next &&
+                    (next.type !== state.settings.type ||
+                        next.scoring !== state.settings.scoring ||
+                        next.group !== state.settings.group ||
+                        next.title !== state.settings.title ||
+                        next.tier !== state.settings.tier ||
+                        next.customSongs !== state.settings.customSongs)
+
                 if (
                     !isHost ||
                     !next ||
-                    next.type !== state.settings.type ||
-                    state.status !== 'selecting'
+                    (!tournamentHost && !isOpenType(next.type)) ||
+                    state.status !== 'selecting' ||
+                    (structural && state.history.length > 0)
                 ) {
                     return this.resync(uid)
                 }
+
+                const randomChanged = next.random !== state.settings.random
+                const modeChanged = next.scoring !== state.settings.scoring
+                const typeChanged = next.type !== state.settings.type
+                const titleChanged =
+                    typeChanged ||
+                    next.group !== state.settings.group ||
+                    next.title !== state.settings.title ||
+                    next.tier !== state.settings.tier
 
                 if (next.type === 'casualRoom' && !next.title) {
                     next.title = 'Custom Room'
                 }
 
-                const prev = state.settings
-
-                const structural =
-                    next.scoring !== prev.scoring ||
-                    next.group !== prev.group ||
-                    next.title !== prev.title ||
-                    next.tier !== prev.tier ||
-                    next.customSongs !== prev.customSongs ||
-                    next.customOnly !== prev.customOnly
-
-                if (structural && state.history.length > 0) {
-                    return this.resync(uid)
-                }
-
-                const randomChanged = next.random !== prev.random
-                const modeChanged = next.scoring !== prev.scoring
-
-                const poolChanged =
-                    next.tier !== prev.tier ||
-                    next.customSongs !== prev.customSongs ||
-                    next.customOnly !== prev.customOnly
-
-                const titleChanged =
-                    next.group !== prev.group ||
-                    next.title !== prev.title ||
-                    next.tier !== prev.tier
-
                 state.settings = next
+
+                if (typeChanged) {
+                    let editionData: EditionData | null = null
+
+                    if (!isOpenType(next.type)) {
+                        try {
+                            editionData = await getEditionData()
+                        } catch (error) {
+                            console.error('Could not reload edition sheet:', error)
+                        }
+                    }
+
+                    if (editionData) {
+                        state.edition = editionData.edition
+                        state.divisions = cleanDivisions(editionData.divisions)
+                        state.suggestions = suggestionsFromCharts(
+                            chartsForType(editionData, next.type),
+                            uid,
+                        )
+                    } else {
+                        state.suggestions = await songPoolSuggestions(next.type, uid)
+                    }
+
+                    const updateSuggestions = {
+                        type: 'updateSuggestions',
+                        suggestions: state.suggestions,
+                    }
+
+                    if (isOpenType(next.type)) {
+                        this.sendAll(updateSuggestions)
+                    } else {
+                        this.sendHost(updateSuggestions)
+                    }
+
+                    this.sendAll({
+                        type: 'updateIsSuggestionsLocked',
+                        isSuggestionsLocked: next.type !== 'casualRoom',
+                    })
+
+                    if (state.levelOptions.length > 0) {
+                        state.levelOptions = []
+                        this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+                    }
+
+                    if (state.level) this.sendLevel()
+                }
 
                 this.sendAll({
                     type: 'updateOptionValues',
@@ -1047,11 +994,6 @@ export class Room extends DurableObject<Env> {
                     })
 
                     this.pushScoreboard()
-                }
-
-                if (poolChanged && next.type === 'rankedRoom') {
-                    await this.loadRankedSongs()
-                    await this.rollRankedLevel(true)
                 }
 
                 if (randomChanged) await this.applyRandomLevel(true)
@@ -1078,7 +1020,6 @@ export class Room extends DurableObject<Env> {
 
                 for (const socket of this.socketsOf(target)) {
                     this.closing.add(socket)
-
                     try {
                         socket.close(4001, 'kicked')
                     } catch {
@@ -1167,11 +1108,7 @@ export class Room extends DurableObject<Env> {
                 if (!isHost) return this.resync(uid)
 
                 state.suggestions = []
-
-                this.sendHost({
-                    type: 'clearSuggestions',
-                })
-
+                this.sendHost({ type: 'clearSuggestions' })
                 return
             }
 
@@ -1214,8 +1151,6 @@ export class Room extends DurableObject<Env> {
             case 'updateLevelOption': {
                 const entry = cmd.levelOption
 
-                // Level options (speed, ...) can only be changed in Custom Rooms.
-                // Group Stage / Final / Ranked Match always use the default options.
                 if (
                     !isHost ||
                     state.settings.type !== 'casualRoom' ||
@@ -1240,7 +1175,6 @@ export class Room extends DurableObject<Env> {
 
             case 'updateUserStatus': {
                 const wanted = cmd.status as UserStatus
-
                 const allowed: UserStatus[] = isHost
                     ? ['waiting', 'ready', 'skipped']
                     : ['waiting', 'ready']
@@ -1297,6 +1231,7 @@ export class Room extends DurableObject<Env> {
                     !state.results[uid]
 
                 if (!valid) {
+                    this.diag('finishGameplay-rejected', { userId: uid })
                     return this.resync(uid)
                 }
 
@@ -1325,10 +1260,8 @@ export class Room extends DurableObject<Env> {
 
                 this.sendResult(uid, result)
                 this.pushScoreboard()
+                this.diag('finishGameplay-accepted', { userId: uid, grade: result.grade })
 
-                // Do not automatically leave the result screen.
-                // The host changes the room back to selecting manually.
-                this.resync(uid)
                 await this.maybeFinishRound(false)
                 return
             }
@@ -1366,10 +1299,7 @@ export class Room extends DurableObject<Env> {
                         message,
                     }
 
-                    if (
-                        member.id === uid &&
-                        typeof cmd.nonce === 'number'
-                    ) {
+                    if (member.id === uid && typeof cmd.nonce === 'number') {
                         event.nonce = cmd.nonce
                     }
 
@@ -1392,8 +1322,6 @@ export class Room extends DurableObject<Env> {
         const state = this.st
         const current = state.status
 
-        console.log('[Room] status', state.name, state.settings.type, current, '->', next)
-
         const waitAll = () => {
             for (const member of state.members) {
                 state.statuses[member.id] = 'waiting'
@@ -1402,21 +1330,32 @@ export class Room extends DurableObject<Env> {
 
         if (current === 'selecting' && next === 'preparing') {
             if (state.settings.type === 'rankedRoom') {
-                // A match never starts with an old song: after each round a new one from the ranked list is needed.
-                if (!state.level || state.rankedNeedsRoll) await this.rollRankedLevel(true)
+                let pick: SheetChart | null = null
 
-                if (
-                    state.status !== 'selecting' ||
-                    !state.level ||
-                    state.rankedNeedsRoll
-                ) {
+                try {
+                    pick = await pickRankedLevel(
+                        state.settings.tier as RankedTier,
+                        state.settings.customSongs,
+                        this.env,
+                    )
+                } catch (error) {
+                    console.error('Could not pick a ranked level:', error)
+                }
+
+                if (state.status !== 'selecting' || !pick) {
                     return this.resync(uid)
                 }
+
+                state.level = { address: pick.address, name: pick.name }
+                state.levelInfo = null
+                state.levelOptions = []
+
+                this.sendAll({ type: 'updateLevel', level: state.level })
+                this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
             } else if (
                 state.settings.type === 'casualRoom' &&
                 state.settings.random
             ) {
-                // Random level: every round gets a fresh random suggestion.
                 await this.applyRandomLevel(true)
                 if (state.status !== 'selecting') return this.resync(uid)
             }
@@ -1427,7 +1366,6 @@ export class Room extends DurableObject<Env> {
                 state.levelInfo = await fetchLevelInfo(state.level)
             }
 
-            // The room may have changed while the level metadata was loading.
             if (state.status !== 'selecting' || !state.level) {
                 return this.resync(uid)
             }
@@ -1435,9 +1373,6 @@ export class Room extends DurableObject<Env> {
             state.status = 'preparing'
             waitAll()
 
-            // Tournament players do not know the level while selecting. The protocol forbids
-            // "preparing" without a level (clients disconnect with a fatal error), so reveal it now.
-            // UpdateLevel is only valid while the room is still "selecting", so it goes first.
             if (!isOpenType(state.settings.type)) {
                 for (const member of state.members) {
                     if (member.id !== state.hostId) {
@@ -1453,6 +1388,7 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'preparing',
             })
+            this.diag('status-preparing', { level: state.level.name })
         } else if (current === 'preparing' && next === 'selecting') {
             state.status = 'selecting'
             waitAll()
@@ -1461,8 +1397,7 @@ export class Room extends DurableObject<Env> {
                 type: 'updateStatus',
                 status: 'selecting',
             })
-
-            this.sendLevelOptions()
+            this.diag('status-selecting-from-preparing')
         } else if (current === 'preparing' && next === 'playing') {
             const readyMembers = state.members.filter(
                 (member) =>
@@ -1481,7 +1416,6 @@ export class Room extends DurableObject<Env> {
                 seed: Math.random(),
             }
 
-            // Same rule as the client: skipped users go back to waiting when the round starts.
             for (const member of state.members) {
                 if (state.statuses[member.id] === 'skipped') {
                     state.statuses[member.id] = 'waiting'
@@ -1504,6 +1438,7 @@ export class Room extends DurableObject<Env> {
             }
 
             this.pushScoreboard()
+            this.diag('status-playing', { readyCount: readyMembers.length })
         } else if (current === 'playing' && next === 'selecting') {
             if (Object.keys(state.results).length > 0) {
                 state.history.push(this.makeRoundRecord())
@@ -1514,18 +1449,19 @@ export class Room extends DurableObject<Env> {
             state.status = 'selecting'
             waitAll()
 
-            state.rankedNeedsRoll = state.settings.type === 'rankedRoom'
+            if (state.settings.type === 'rankedRoom') {
+                state.level = null
+                state.levelInfo = null
+            }
 
             this.sendAll({
                 type: 'updateStatus',
                 status: 'selecting',
             })
 
-            this.sendLevelOptions()
             this.pushScoreboard()
-
-            if (state.settings.type === 'rankedRoom') await this.rollRankedLevel(true)
-            else await this.applyRandomLevel(true)
+            await this.applyRandomLevel(true)
+            this.diag('status-selecting-from-playing')
         } else {
             return this.resync(uid)
         }
@@ -1546,36 +1482,28 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    /** Everybody sees the scoreboard and everybody's results. */
     private canSee(_uid: string): boolean {
         return true
     }
 
-    /** Custom / Ranked rooms show the level to everybody; tournament rooms only to the host until preparing. */
     private sendLevel(): void {
         if (!this.st.level) return
 
         const event = { type: 'updateLevel', level: this.st.level }
-
         if (isOpenType(this.st.settings.type)) this.sendAll(event)
         else this.sendHost(event)
-
-        this.sendLevelOptions()
-    }
-
-    /** Custom Rooms: re-send the chosen level options so a client never falls back to the defaults. */
-    private sendLevelOptions(): void {
-        if (this.st.settings.type !== 'casualRoom' || this.st.levelOptions.length === 0) return
-
-        this.sendAll({
-            type: 'updateLevelOptions',
-            levelOptions: this.st.levelOptions,
-        })
     }
 
     private sendResult(uid: string, result: GameplayResult): void {
+        const activeIds = new Set(
+            this.st.members
+                .filter((member) => this.socketsOf(member.id).length > 0)
+                .map((member) => member.id),
+        )
+        if (!activeIds.has(uid)) return
+
         for (const member of this.st.members) {
-            if (this.canSee(member.id)) {
+            if (activeIds.has(member.id) && this.canSee(member.id)) {
                 this.sendTo(member.id, {
                     type: 'addResult',
                     result: { userId: uid, result },
@@ -1584,7 +1512,6 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    /** Custom Room "Random level": pick a random suggestion. */
     private async applyRandomLevel(force: boolean): Promise<void> {
         const s = this.st
 
@@ -1612,87 +1539,16 @@ export class Room extends DurableObject<Env> {
         s.level = { address: pick.address, name: pick.name }
         s.levelInfo = null
 
+        if (s.levelOptions.length > 0) {
+            s.levelOptions = []
+            this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+        }
+
         this.sendLevel()
         this.pushScoreboard()
 
         s.levelInfo = await fetchLevelInfo(s.level)
         this.pushScoreboard()
-    }
-
-    private rankedBucket(): R2Bucket | undefined {
-        return (this.env as Env & { RANKED_BUCKET?: R2Bucket }).RANKED_BUCKET
-    }
-
-    private rankedMode(): RankedCustomMode {
-        const s = this.st.settings
-
-        return !s.customSongs ? 'off' : s.customOnly ? 'only' : 'on'
-    }
-
-    /** Loads the song list of the room's tier from the bucket. Only when the room opens / its ranked options change. */
-    private async loadRankedSongs(): Promise<void> {
-        try {
-            const charts = await loadRankedPool(
-                this.rankedBucket(),
-                this.st.settings.tier as RankedTier,
-                this.rankedMode(),
-            )
-
-            this.rankedPool = charts.map((chart) => ({
-                address: chart.address,
-                name: chart.name,
-            }))
-
-            await this.ctx.storage.put('rankedPool', this.rankedPool)
-        } catch (error) {
-            console.error('Could not load the ranked song list:', error)
-        }
-    }
-
-    private async rankedSongs(): Promise<Sil[]> {
-        if (!this.rankedPool) {
-            this.rankedPool = (await this.ctx.storage.get<Sil[]>('rankedPool')) ?? null
-        }
-
-        if (!this.rankedPool || this.rankedPool.length === 0) {
-            await this.loadRankedSongs()
-        }
-
-        return this.rankedPool ?? []
-    }
-
-    /** Ranked Match: put a random song of the room's song list as the current level. */
-    private async rollRankedLevel(announce: boolean): Promise<boolean> {
-        if (this.st.settings.type !== 'rankedRoom') return false
-
-        const pick = pickFromPool(await this.rankedSongs(), this.st.level)
-
-        if (!pick) {
-            console.warn('Ranked song list is empty for tier', this.st.settings.tier)
-            return false
-        }
-
-        if (this.st.status !== 'selecting') return false
-
-        const level = { address: pick.address, name: pick.name }
-
-        this.st.level = level
-        this.st.levelInfo = null
-        this.st.rankedNeedsRoll = false
-
-        if (announce) {
-            this.sendLevel()
-            this.pushScoreboard()
-
-            const info = await fetchLevelInfo(level)
-
-            if (this.st.level === level) {
-                this.st.levelInfo = info
-                this.pushScoreboard()
-            }
-        }
-
-        return true
     }
 
     private hostIsTournament(): boolean {
@@ -1711,10 +1567,6 @@ export class Room extends DurableObject<Env> {
         )
     }
 
-    /**
-     * The show is over when nobody is loading or playing any more.
-     * immediate = false waits a few seconds so players can still look at their result.
-     */
     private async maybeFinishRound(immediate: boolean): Promise<void> {
         const s = this.st
 
@@ -1724,7 +1576,6 @@ export class Room extends DurableObject<Env> {
             if (this.ctx.getWebSockets().length > 0) {
                 await this.ctx.storage.setAlarm(Date.now() + 8000)
             }
-
             return
         }
 
@@ -1737,17 +1588,12 @@ export class Room extends DurableObject<Env> {
     private view(uid: string): Ev {
         const state = this.st
         const isHost = uid === state.hostId
-        const master = this.hostPresent()
-            ? state.hostId
-            : null
+        const master = this.hostPresent() ? state.hostId : null
 
         const activeMembers = state.members.filter(
             (member) => this.socketsOf(member.id).length > 0,
         )
-
-        const activeIds = new Set(
-            activeMembers.map((member) => member.id),
-        )
+        const activeIds = new Set(activeMembers.map((member) => member.id))
 
         return {
             type: 'update',
@@ -1757,25 +1603,16 @@ export class Room extends DurableObject<Env> {
             status: state.status,
             master,
             lead: master,
-
-            // Every client receives the form matching the room's settings.
-            // Server-side checks below still restrict who can change settings.
             options: [
-                // Only the settings of the current room type (+ the close button for the host).
-                ...roomForms(this.hostIsTournament(), state.settings.type),
+                ...roomForms(this.hostIsTournament()),
                 ...(isHost ? [closeRoomForm] : []),
             ],
-
             optionValues: serializeSettings(state.settings),
-
-            // Tournament players only know the level from "preparing" on (the protocol requires it).
             level: isHost ||
                 isOpenType(state.settings.type) ||
                 state.status !== 'selecting'
                 ? state.level
                 : null,
-
-            // Custom Rooms keep their level options. The other room types always use the defaults.
             levelOptions: state.settings.type === 'casualRoom'
                 ? state.levelOptions
                 : [],
@@ -1786,19 +1623,14 @@ export class Room extends DurableObject<Env> {
                 ? state.suggestions
                 : [],
             scoreboardDescription: this.description(),
-            scoreboardSections: this.canSee(uid) ? this.safeSections() : [],
-
-            // Players always get their own result, everyone's only if they may see the scoreboard.
+            scoreboardSections: this.canSee(uid) ? this.sections() : [],
             results: Object.entries(state.results)
                 .filter(([id]) => activeIds.has(id) && (this.canSee(uid) || id === uid))
                 .map(([userId, result]) => ({
                     userId,
                     result,
                 })),
-
-            // Only send currently connected users and their current credentials.
             users: activeMembers.map((member) => member.roomUser),
-
             userStatuses: activeMembers.map((member) => ({
                 userId: member.id,
                 status: state.statuses[member.id] ?? 'waiting',
@@ -1819,22 +1651,10 @@ export class Room extends DurableObject<Env> {
         return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}`
     }
 
-    /** A scoring error must never break the room (the client would show a fatal error). */
-    private safeSections(): ScoreboardSection[] {
-        try {
-            return this.sections()
-        } catch (error) {
-            console.error('Could not build the scoreboard:', error)
-            return []
-        }
-    }
-
-    private sections(): ScoreboardSection[] {
+    private sections() {
         const state = this.st
         const mode = state.settings.scoring
 
-        // The client raises a fatal error for scoreboard entries of users that are not in the room,
-        // so only connected players are shown. Their records stay on the server.
         const presentMembers = state.members.filter(
             (member) => this.socketsOf(member.id).length > 0,
         )
@@ -1846,9 +1666,7 @@ export class Room extends DurableObject<Env> {
                 ? this.makeRoundRecord()
                 : null
 
-        const history = live
-            ? [...state.history, live]
-            : state.history
+        const history = live ? [...state.history, live] : state.history
 
         const output: {
             title: string
@@ -1861,12 +1679,9 @@ export class Room extends DurableObject<Env> {
         const divisions = this.getDivisions(presentMembers)
 
         for (const division of divisions) {
-            const divisionIds = new Set(
-                division.members.map((member) => member.id),
-            )
-
+            const divisionIds = new Set(division.members.map((member) => member.id))
             const divisionTotals = totals(history, mode)
-                .filter((total) => divisionIds.has(total.userId))
+                .filter((total) => divisionIds.has(total.userId) && present.has(total.userId))
 
             output.push({
                 title: isOpenType(state.settings.type) && state.settings.type === 'casualRoom'
@@ -1879,8 +1694,6 @@ export class Room extends DurableObject<Env> {
             })
         }
 
-        // Players who left: the client cannot show scoreboard entries of users that are not in the
-        // room, so their totals are kept as text sections instead of being dropped.
         if (state.settings.type !== 'casualRoom') {
             const allTotals = totals(history, mode)
 
@@ -1897,12 +1710,8 @@ export class Room extends DurableObject<Env> {
             }
         }
 
-        const roundSection = (
-            round: RoundRecord,
-            label: string,
-        ) => {
+        const roundSection = (round: RoundRecord, label: string) => {
             const song = round.levelTitle || round.level?.name
-
             const title = song
                 ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
                 : label
@@ -1915,24 +1724,15 @@ export class Room extends DurableObject<Env> {
                     value: fmtDetail(result, mode, round),
                 }))
 
-            output.push({
-                title,
-                scores,
-            })
+            output.push({ title, scores })
         }
 
         if (live) {
-            roundSection(
-                live,
-                `Round ${state.history.length + 1} (live)`,
-            )
+            roundSection(live, `Round ${state.history.length + 1} (live)`)
         }
 
         for (let index = state.history.length - 1; index >= 0; index--) {
-            roundSection(
-                state.history[index]!,
-                `Round ${index + 1}`,
-            )
+            roundSection(state.history[index]!, `Round ${index + 1}`)
         }
 
         return output
@@ -1942,10 +1742,7 @@ export class Room extends DurableObject<Env> {
         const type = this.st.settings.type
 
         if (isOpenType(type)) {
-            return [{
-                title: '',
-                members,
-            }]
+            return [{ title: '', members }]
         }
 
         if (type === 'groupStage') {
@@ -1963,26 +1760,17 @@ export class Room extends DurableObject<Env> {
             const groups = groupNames.map((group) => ({
                 title: `Group ${group}`,
                 members: members.filter(
-                    (member) =>
-                        this.st.divisions[member.handle] === `Group ${group}`,
+                    (member) => this.st.divisions[member.handle] === `Group ${group}`,
                 ),
             })).filter((division) => division.members.length > 0)
 
             const assigned = new Set(
-                groups.flatMap((division) =>
-                    division.members.map((member) => member.id),
-                ),
+                groups.flatMap((division) => division.members.map((member) => member.id)),
             )
 
-            const unassigned = members.filter(
-                (member) => !assigned.has(member.id),
-            )
-
+            const unassigned = members.filter((member) => !assigned.has(member.id))
             if (unassigned.length > 0) {
-                groups.push({
-                    title: 'Unassigned',
-                    members: unassigned,
-                })
+                groups.push({ title: 'Unassigned', members: unassigned })
             }
 
             return groups
@@ -1992,41 +1780,31 @@ export class Room extends DurableObject<Env> {
             {
                 title: 'Upper Bracket',
                 members: members.filter(
-                    (member) =>
-                        this.st.divisions[member.handle] === 'Upper Bracket',
+                    (member) => this.st.divisions[member.handle] === 'Upper Bracket',
                 ),
             },
             {
                 title: 'Lower Bracket',
                 members: members.filter(
-                    (member) =>
-                        this.st.divisions[member.handle] === 'Lower Bracket',
+                    (member) => this.st.divisions[member.handle] === 'Lower Bracket',
                 ),
             },
         ].filter((division) => division.members.length > 0)
 
         const assigned = new Set(
-            brackets.flatMap((division) =>
-                division.members.map((member) => member.id),
-            ),
+            brackets.flatMap((division) => division.members.map((member) => member.id)),
         )
 
-        const unassigned = members.filter(
-            (member) => !assigned.has(member.id),
-        )
-
+        const unassigned = members.filter((member) => !assigned.has(member.id))
         if (unassigned.length > 0) {
-            brackets.push({
-                title: 'Unassigned',
-                members: unassigned,
-            })
+            brackets.push({ title: 'Unassigned', members: unassigned })
         }
 
         return brackets
     }
 
     private pushScoreboard(): void {
-        const scoreboardSections = this.safeSections()
+        const scoreboardSections = this.sections()
 
         for (const member of this.st.members) {
             if (this.canSee(member.id)) {
@@ -2045,7 +1823,6 @@ export class Room extends DurableObject<Env> {
     ): Promise<void> {
         const state = this.st
         const member = state.members.find((entry) => entry.id === uid)
-
         if (!member) return
 
         if (retain) {
@@ -2067,25 +1844,19 @@ export class Room extends DurableObject<Env> {
                 }
 
                 state.results[uid] = result
-
                 if (announce) this.sendResult(uid, result)
             }
 
             state.statuses[uid] = 'waiting'
 
             if (announce) {
-                // Remove the disconnected user's old Sonolus credentials
-                // from the live room roster while keeping their score record.
                 this.sendAll({
                     type: 'removeUser',
                     user: member.roomUser,
                 })
             }
         } else {
-            state.members = state.members.filter(
-                (entry) => entry.id !== uid,
-            )
-
+            state.members = state.members.filter((entry) => entry.id !== uid)
             delete state.statuses[uid]
             delete state.results[uid]
 
@@ -2104,29 +1875,26 @@ export class Room extends DurableObject<Env> {
 
         const otherSockets = this.ctx.getWebSockets().filter(
             (socket) =>
-                (socket.deserializeAttachment() as {
-                    userId?: string
-                } | null)?.userId !== uid,
+                (socket.deserializeAttachment() as { userId?: string } | null)?.userId !== uid,
         )
 
         if (otherSockets.length === 0) {
-            // Empty room: kept (with the results of players who left) for EMPTY_ROOM_TTL_MS, then deleted.
-            await this.ctx.storage.setAlarm(Date.now() + EMPTY_ROOM_TTL_MS)
+            await this.ctx.storage.setAlarm(
+                Date.now() +
+                    (state.settings.type === 'casualRoom'
+                        ? EMPTY_ROOM_TTL_MS
+                        : KEEP_LEFT_RESULTS_MS),
+            )
         }
     }
 
-    /** Sockets that are being closed still show up in getWebSockets(); never treat them as connected. */
     private closing = new WeakSet<WebSocket>()
 
     private socketsOf = (uid: string) =>
         this.ctx.getWebSockets().filter(
             (socket) =>
                 !this.closing.has(socket) &&
-                (
-                    socket.deserializeAttachment() as {
-                        userId?: string
-                    } | null
-                )?.userId === uid,
+                (socket.deserializeAttachment() as { userId?: string } | null)?.userId === uid,
         )
 
     private send(ws: WebSocket, event: Ev) {
@@ -2170,9 +1938,7 @@ export class Room extends DurableObject<Env> {
     }
 
     private async syncLobby(): Promise<void> {
-        const lobby = this.env.LOBBY.get(
-            this.env.LOBBY.idFromName('main'),
-        )
+        const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName('main'))
 
         await lobby.upsert({
             name: this.st.name,
