@@ -47,7 +47,6 @@ export const ROOM_TYPES = {
     rankedRoom: 'Ranked Match',
 } as const
 
-/** Ranked Match room titles (shown in UPPER case). The level ranges live in sheets.ts. */
 export const RANKED_TIER_NAMES = [
     'master',
     'diamond',
@@ -60,7 +59,18 @@ export const RANKED_TIER_NAMES = [
 
 export const TOURNAMENT_HOST_HANDLE = '163292'
 
-/** Everybody sees the scoreboard (kept for reference, room.ts always shows it now). */
+export const STAFF_CHAT_HANDLES = [
+    '163292',
+    '283420',
+    '3227470',
+] as const
+
+export const STAFF_CHAT_SHORTCUTS = [
+    '@Bell',
+    '@Noct',
+    '@Ʌstra',
+] as const
+
 export const SCOREBOARD_PUBLIC = true
 
 export type RoomType = keyof typeof ROOM_TYPES
@@ -74,13 +84,11 @@ export type ScoringMode = keyof typeof SCORING_MODES
 
 export const DEFAULT_TYPE: RoomType = 'groupStage'
 export const DEFAULT_SCORING: ScoringMode = 'pp'
-/** Custom Rooms and Ranked Match rooms default to Ranked scoring. */
 export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 
-export const SERVER_TITLE = 'XX! Championship'
-export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\nAXX!A's server!"
+export const SERVER_TITLE = 'XX!'
+export const SERVER_DESCRIPTION = "AXX!A's server!\n\nhttps://discord.gg/xxsrG9G6f"
 
-/** Maximum room lifespan is strictly 3 minutes. */
 export const MAX_ROOM_LIFESPAN_MS = 3 * 60 * 1000
 export const EMPTY_ROOM_TTL_MS = 3 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 3 * 60 * 1000
