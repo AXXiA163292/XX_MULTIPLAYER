@@ -297,7 +297,7 @@ function buildCustomLevels(rows: Row[]): SheetChart[] {
 
 export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
     const cached = await readBucketJson<SheetChart[]>(env, R2_LEVEL_LIST_KEY)
-    if (cached) return cached
+    if (cached) return [...cached].sort(compareIdDescending)
 
     const charts = buildCustomLevels(await customRows())
     await writeBucketJson(env, R2_LEVEL_LIST_KEY, charts).catch((e) =>
@@ -311,7 +311,7 @@ export async function getCustomLevelPage(
     env?: Env,
 ): Promise<{ charts: SheetChart[]; pageCount: number }> {
     const all = await getCustomLevels(env)
-    const safePage = Number.isFinite(page) ? Math.max(0, Math.floor(page)) : 0
+    const safePage = Number.isInteger(page) && page >= 0 ? page : 0
     const pageCount = Math.max(1, Math.ceil(all.length / CUSTOM_LEVEL_PAGE_SIZE))
     const start = safePage * CUSTOM_LEVEL_PAGE_SIZE
 
@@ -615,7 +615,6 @@ export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
         errors: [],
     }
 
-    // 1. Read "custom" tab once for level-list, playlists, and ranked/CUSTOM.
     try {
         const rows = await customRows()
 
@@ -636,7 +635,6 @@ export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
         summary.errors.push(`custom: ${msg}`)
     }
 
-    // 2. Read "METADATA_RAW" once and write ranked-match/<TIER>/pool.json for each tier.
     try {
         const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
         const tiers = Object.keys(RANKED_TIERS) as RankedTier[]
