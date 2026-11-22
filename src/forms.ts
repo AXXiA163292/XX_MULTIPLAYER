@@ -64,6 +64,19 @@ const customSongsOption = {
     query: 'customSongs',
     name: 'Custom songs',
     required: false,
+    type: 'select' as const,
+    def: 'off',
+    values: [
+        { name: 'off', title: 'Off' },
+        { name: 'on', title: 'On' },
+    ],
+}
+
+/** Only used when Custom songs is On. */
+const customOnlyOption = {
+    query: 'customOnly',
+    name: 'Custom only (needs Custom songs On)',
+    required: false,
     type: 'toggle' as const,
     def: false,
 }
@@ -125,7 +138,7 @@ export const roomForms = (isTournamentHost = false, only?: RoomType) =>
                     ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
                     : type === 'rankedRoom'
                         // Ranked Match: always public, always Ranked scoring, never random.
-                        ? [tierOption, customSongsOption]
+                        ? [tierOption, customSongsOption, customOnlyOption]
                         : [tournamentScoringOption, tournamentVisibilityOption],
         }))
 
@@ -138,6 +151,7 @@ export type RoomSettings = {
     random: boolean
     tier: string
     customSongs: boolean
+    customOnly: boolean
 }
 
 export const serializeSettings = (s: RoomSettings) => {
@@ -156,7 +170,8 @@ export const serializeSettings = (s: RoomSettings) => {
     }
     if (s.type === 'rankedRoom') {
         values.push(`tier=${encodeURIComponent(s.tier || 'master')}`)
-        values.push(`customSongs=${s.customSongs ? '1' : '0'}`)
+        values.push(`customSongs=${s.customSongs ? 'on' : 'off'}`)
+        values.push(`customOnly=${s.customOnly ? '1' : '0'}`)
     }
 
     return values.join('&')
@@ -198,6 +213,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
 
     const random = type === 'casualRoom' && isOn(p.get('random'))
     const customSongs = type === 'rankedRoom' && isOn(p.get('customSongs'))
+    const customOnly = customSongs && isOn(p.get('customOnly'))
 
     if (!(scoring in SCORING_MODES)) return null
     if (type === 'groupStage' && group.length > 24) return null
@@ -213,5 +229,6 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
         random,
         tier,
         customSongs,
+        customOnly,
     }
 }
