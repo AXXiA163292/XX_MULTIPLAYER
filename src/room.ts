@@ -8,6 +8,7 @@ import {
 } from './config.ts'
 import {
     closeRoomForm,
+    defaultCustomRoomTitle,
     normalizeCustomSongsMode,
     parseSettings,
     roomFormsForType,
@@ -20,6 +21,7 @@ import {
     fmtDetail,
     fmtScore,
     totals,
+    type RoundKind,
     type RoundRecord,
 } from './scoring.ts'
 import {
@@ -62,11 +64,22 @@ type LevelInfo = {
     difficulty: string
 }
 
+type ConstantEntry = {
+    constant: number
+    difficulty?: string
+}
+
 type RoomState = {
     name: string
     createdAt: number
     edition: string
     divisions: Record<string, string>
+    poolSongKeys: string[]
+    primarySongKey: string
+    playedSongCounts: Record<string, number>
+    playedTournamentSong: boolean
+    warmupCount: number
+    freeplayCount: number
     reserved: Reservation | null
     configured: boolean
     hostId: string
@@ -89,6 +102,12 @@ const fresh = (): RoomState => ({
     createdAt: 0,
     edition: '',
     divisions: {},
+    poolSongKeys: [],
+    primarySongKey: '',
+    playedSongCounts: {},
+    playedTournamentSong: false,
+    warmupCount: 0,
+    freeplayCount: 0,
     reserved: null,
     configured: false,
     hostId: '',
@@ -118,7 +137,14 @@ const fresh = (): RoomState => ({
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-const getRoomTitle = (settings: RoomSettings, edition = '') => {
+const stripTrailingSlash = (value: string) => value.trim().replace(/\/+$/, '')
+
+const songKeyOf = (level: Sil | null | undefined): string => {
+    if (!level) return ''
+    return `${stripTrailingSlash(level.address)}::${level.name.trim()}`
+}
+
+const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
     if (settings.type === 'rankedRoom') {
         return String(settings.tier || 'master').toUpperCase()
     }
@@ -128,7 +154,7 @@ const getRoomTitle = (settings: RoomSettings, edition = '') => {
     }
 
     if (settings.type === 'casualRoom') {
-        return settings.title || 'Custom Room'
+        return settings.title || defaultCustomRoomTitle(hostName)
     }
 
     return `${edition || 'Final'} Final`
@@ -223,20 +249,6 @@ function descriptionText(value: any): string {
     return ''
 }
 
-function extractDescriptionNumber(
-    description: string,
-    label: string,
-): number | null {
-    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const match = description.match(
-        new RegExp(`${escaped}\\s*(?:•|:)\\s*(\\d+(?:\\.\\d+)?)`, 'i'),
-    )
-
-    if (!match) return null
-    const value = Number(match[1])
-    return Number.isFinite(value) ? value : null
-}
-
 function extractDifficulty(description: string): string {
     const match = description.match(
         /(?:^|\n)\s*Difficulty\s*(?:•|:)\s*(EASY|NORMAL|HARD|EXPERT|MASTER|APPEND)\b/i,
@@ -254,7 +266,73 @@ function extractComboCount(description: string): number | null {
     return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
-async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
+async function lookupConstantFromR2(
+    env: Env,
+    level: Sil,
+): Promise<ConstantEntry | null> {
+    if (!env.R2) return null
+
+    const normalizedAddress = stripTrailingSlash(level.address)
+    const candidates = [
+        normalizedAddress,
+        `${normalizedAddress}/levels/${level.name}`,
+        `${normalizedAddress}/sonolus/levels/${level.name}`,
+    ]
+
+    for (const key of ['constants.json', 'custom-songs.json', 'metadata/constants.json']) {
+        try {
+            const obj = await env.R2.get(key)
+            if (!obj) continue
+            const raw = await obj.json<any>()
+
+            if (Array.isArray(raw)) {
+                for (const row of raw) {
+                    const rowInput = stripTrailingSlash(String(row?.input ?? row?.url ?? ''))
+                    if (!rowInput) continue
+                    if (candidates.includes(rowInput)) {
+                        const c = Number(row?.Constant ?? row?.constant)
+                        if (Number.isFinite(c) && c > 0) {
+                            return {
+                                constant: Math.round(c * 10) / 10,
+                                difficulty: typeof row?.Difficulty === 'string'
+                                    ? row.Difficulty.toUpperCase()
+                                    : typeof row?.difficulty === 'string'
+                                        ? row.difficulty.toUpperCase()
+                                        : undefined,
+                            }
+                        }
+                    }
+                }
+            } else if (raw && typeof raw === 'object') {
+                for (const cand of candidates) {
+                    const entry = raw[cand]
+                    if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
+                        return { constant: Math.round(entry * 10) / 10 }
+                    }
+                    if (entry && typeof entry === 'object') {
+                        const c = Number(entry.Constant ?? entry.constant)
+                        if (Number.isFinite(c) && c > 0) {
+                            return {
+                                constant: Math.round(c * 10) / 10,
+                                difficulty: typeof entry.difficulty === 'string'
+                                    ? entry.difficulty.toUpperCase()
+                                    : undefined,
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            // Ignore malformed constant table in R2.
+        }
+    }
+
+    return null
+}
+
+async function fetchLevelInfo(level: Sil, env: Env): Promise<LevelInfo | null> {
+    const r2Constant = await lookupConstantFromR2(env, level)
+
     try {
         const base = new URL(level.address)
 
@@ -263,7 +341,16 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
             base.username ||
             base.password
         ) {
-            return null
+            return r2Constant
+                ? {
+                    title: level.name,
+                    firstTag: r2Constant.difficulty ?? '',
+                    rating: r2Constant.constant,
+                    constant: r2Constant.constant,
+                    noteCount: null,
+                    difficulty: r2Constant.difficulty ?? '',
+                }
+                : null
         }
 
         const encodedName = encodeURIComponent(level.name)
@@ -312,6 +399,7 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     taggedDifficulty.toUpperCase().match(
                         /EASY|NORMAL|HARD|EXPERT|MASTER|APPEND/,
                     )?.[0] ||
+                    r2Constant?.difficulty ||
                     ''
 
                 const firstTag = difficulty || taggedDifficulty
@@ -328,8 +416,7 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     ? Math.round(parsedRating * 10) / 10
                     : null
 
-                const descriptionConstant = extractDescriptionNumber(description, 'Constant')
-                const constant = descriptionConstant ?? rating
+                const constant = r2Constant?.constant ?? rating
 
                 return {
                     title: localize(item.title) || level.name,
@@ -345,6 +432,17 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
         }
     } catch (error) {
         console.warn('Invalid level address:', level.address, error)
+    }
+
+    if (r2Constant) {
+        return {
+            title: level.name,
+            firstTag: r2Constant.difficulty ?? '',
+            rating: r2Constant.constant,
+            constant: r2Constant.constant,
+            noteCount: null,
+            difficulty: r2Constant.difficulty ?? '',
+        }
     }
 
     return null
@@ -427,6 +525,18 @@ export class Room extends DurableObject<Env> {
                 },
                 edition: typeof saved?.edition === 'string' ? saved.edition : '',
                 divisions: cleanDivisions(saved?.divisions),
+                poolSongKeys: Array.isArray(saved?.poolSongKeys)
+                    ? saved.poolSongKeys.filter((k): k is string => typeof k === 'string')
+                    : [],
+                primarySongKey: typeof saved?.primarySongKey === 'string'
+                    ? saved.primarySongKey
+                    : '',
+                playedSongCounts: saved?.playedSongCounts && typeof saved.playedSongCounts === 'object'
+                    ? saved.playedSongCounts as Record<string, number>
+                    : {},
+                playedTournamentSong: saved?.playedTournamentSong === true,
+                warmupCount: typeof saved?.warmupCount === 'number' ? saved.warmupCount : 0,
+                freeplayCount: typeof saved?.freeplayCount === 'number' ? saved.freeplayCount : 0,
                 reserved: saved?.reserved ?? null,
                 configured: saved?.configured === true,
                 hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
@@ -658,8 +768,11 @@ export class Room extends DurableObject<Env> {
             return false
         }
 
-        if (settings.type === 'casualRoom' && !settings.title) {
-            settings.title = 'Custom Room'
+        const normalizedSettings: RoomSettings = {
+            ...settings,
+            title: settings.type === 'casualRoom'
+                ? (settings.title || defaultCustomRoomTitle(host.name))
+                : settings.title,
         }
 
         let editionData: EditionData | null = null
@@ -670,28 +783,36 @@ export class Room extends DurableObject<Env> {
             console.error('Could not load edition sheet while configuring room:', error)
         }
 
+        let charts: SheetChart[] = []
         if (editionData) {
             this.st.edition = editionData.edition
             this.st.divisions = cleanDivisions(editionData.divisions)
-            this.st.suggestions = suggestionsFromCharts(
-                chartsForType(editionData, settings.type),
-                host.id,
-            )
+            charts = chartsForType(editionData, normalizedSettings.type)
+            this.st.suggestions = suggestionsFromCharts(charts, host.id)
         } else {
             this.st.edition ||= 'Final'
             this.st.divisions = {}
-            this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
+            this.st.suggestions = await songPoolSuggestions(normalizedSettings.type, host.id)
         }
+
+        this.st.poolSongKeys = this.st.suggestions.map((s) => songKeyOf(s.level)).filter(Boolean)
+        this.st.primarySongKey = this.st.poolSongKeys[0] ?? ''
+        this.st.playedSongCounts = {}
+        this.st.playedTournamentSong = false
+        this.st.warmupCount = 0
+        this.st.freeplayCount = 0
+
+        const firstLevel = this.st.suggestions[0]?.level ?? null
 
         this.st.createdAt = Date.now()
         this.st.configured = true
         this.st.hostId = host.id
         this.st.hostName = host.name
-        this.st.settings = { ...settings }
+        this.st.settings = normalizedSettings
         this.st.reserved = null
         this.st.status = 'selecting'
-        this.st.level = null
-        this.st.levelInfo = null
+        this.st.level = firstLevel ? { ...firstLevel } : null
+        this.st.levelInfo = firstLevel ? await fetchLevelInfo(firstLevel, this.env) : null
         this.st.levelOptions = []
         this.st.round = null
         this.st.results = {}
@@ -723,7 +844,7 @@ export class Room extends DurableObject<Env> {
 
         return {
             name: this.st.name,
-            title: getRoomTitle(this.st.settings, this.st.edition),
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
             subtitle: this.subtitle(),
             master: this.st.hostName,
             hostId: this.st.hostId,
@@ -782,6 +903,12 @@ export class Room extends DurableObject<Env> {
             typeof join.roomUser.signature !== 'string'
         ) {
             return new Response('No such room', { status: 404 })
+        }
+
+        if (!this.st.level && !isOpenType(this.st.settings.type) && this.st.suggestions.length > 0) {
+            const first = this.st.suggestions[0]!.level
+            this.st.level = { ...first }
+            this.st.levelInfo = await fetchLevelInfo(first, this.env)
         }
 
         const { 0: client, 1: server } = new WebSocketPair()
@@ -845,7 +972,7 @@ export class Room extends DurableObject<Env> {
 
         this.send(server, {
             type: 'updateTitle',
-            title: getRoomTitle(this.st.settings, this.st.edition),
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
         })
 
         this.diag('ws-join', { userId: user.id, wasConnected })
@@ -979,7 +1106,7 @@ export class Room extends DurableObject<Env> {
                 this.sendLevel()
                 this.pushScoreboard()
 
-                state.levelInfo = await fetchLevelInfo(state.level)
+                state.levelInfo = await fetchLevelInfo(state.level, this.env)
                 this.pushScoreboard()
                 return
             }
@@ -994,7 +1121,7 @@ export class Room extends DurableObject<Env> {
 
                 const next =
                     typeof cmd.optionValues === 'string'
-                        ? parseSettings(cmd.optionValues, state.settings)
+                        ? parseSettings(cmd.optionValues, state.settings, state.hostName)
                         : null
 
                 const member = state.members.find((entry) => entry.id === uid)
@@ -1018,20 +1145,20 @@ export class Room extends DurableObject<Env> {
                     next.tier !== state.settings.tier
 
                 if (next.type === 'casualRoom' && !next.title) {
-                    next.title = 'Custom Room'
+                    next.title = defaultCustomRoomTitle(state.hostName)
                 }
 
                 state.settings = next
 
                 this.sendAll({
                     type: 'updateOptionValues',
-                    optionValues: serializeSettings(next),
+                    optionValues: serializeSettings(next, state.hostName),
                 })
 
                 if (titleChanged) {
                     this.sendAll({
                         type: 'updateTitle',
-                        title: getRoomTitle(next, state.edition),
+                        title: getRoomTitle(next, state.edition, state.hostName),
                     })
                 }
 
@@ -1084,6 +1211,10 @@ export class Room extends DurableObject<Env> {
 
                 state.history = []
                 state.results = {}
+                state.playedSongCounts = {}
+                state.playedTournamentSong = false
+                state.warmupCount = 0
+                state.freeplayCount = 0
                 this.pushScoreboard()
                 return
             }
@@ -1422,7 +1553,7 @@ export class Room extends DurableObject<Env> {
 
         if (current === 'selecting' && next === 'preparing' && state.level) {
             if (!state.levelInfo) {
-                state.levelInfo = await fetchLevelInfo(state.level)
+                state.levelInfo = await fetchLevelInfo(state.level, this.env)
             }
 
             if (state.status !== 'selecting' || !state.level) {
@@ -1535,17 +1666,60 @@ export class Room extends DurableObject<Env> {
     }
 
     private makeRoundRecord(): RoundRecord {
-        const info = this.st.levelInfo
+        const state = this.st
+        const info = state.levelInfo
+        const key = songKeyOf(state.level) || state.level?.name || 'unknown'
+        const isTournamentRoom = state.settings.type === 'groupStage' || state.settings.type === 'final'
+        const inPool = isTournamentRoom && state.poolSongKeys.includes(key)
+
+        const prevCount = state.playedSongCounts[key] ?? 0
+        const nextCount = prevCount + 1
+        state.playedSongCounts[key] = nextCount
+
+        let roundKind: RoundKind = 'tournament'
+        let roundLabel = `Round ${state.history.length + 1}`
+        let countsTowardScore = true
+        let isReplay = nextCount > 1
+
+        if (isTournamentRoom) {
+            if (inPool) {
+                state.playedTournamentSong = true
+                if (nextCount === 1) {
+                    roundLabel = 'Round 1'
+                } else if (nextCount === 2) {
+                    roundKind = 'rewind'
+                    roundLabel = 'Round 1 - Rewind'
+                } else {
+                    roundKind = 'rewind'
+                    roundLabel = `Round 1 - Rewind ${nextCount - 1}`
+                }
+            } else if (!state.playedTournamentSong) {
+                state.warmupCount += 1
+                roundKind = 'warmup'
+                roundLabel = `Warmup - Round ${state.warmupCount}`
+                countsTowardScore = false
+            } else {
+                state.freeplayCount += 1
+                roundKind = 'freeplay'
+                roundLabel = `Freeplay • Round ${state.freeplayCount}`
+            }
+        } else {
+            roundLabel = `Round ${state.history.length + 1}`
+        }
 
         return {
-            level: this.st.level,
+            level: state.level,
             levelTitle: info?.title,
             levelTag: info?.firstTag,
             levelRating: info?.rating ?? undefined,
             levelConstant: info?.constant ?? undefined,
             noteCount: info?.noteCount ?? undefined,
             difficulty: info?.difficulty || info?.firstTag || undefined,
-            results: { ...this.st.results },
+            roundKind,
+            roundLabel,
+            countsTowardScore,
+            isReplay,
+            results: { ...state.results },
         }
     }
 
@@ -1616,7 +1790,7 @@ export class Room extends DurableObject<Env> {
         this.sendLevel()
         this.pushScoreboard()
 
-        s.levelInfo = await fetchLevelInfo(s.level)
+        s.levelInfo = await fetchLevelInfo(s.level, this.env)
         this.pushScoreboard()
     }
 
@@ -1669,7 +1843,7 @@ export class Room extends DurableObject<Env> {
             type: 'update',
             allowOtherServers: true,
             reportUserOptions: [],
-            title: getRoomTitle(state.settings, state.edition),
+            title: getRoomTitle(state.settings, state.edition, state.hostName),
             status: state.status,
             master,
             lead: master,
@@ -1677,7 +1851,7 @@ export class Room extends DurableObject<Env> {
                 ...roomFormsForType(state.settings.type, this.hostIsTournament()),
                 ...(isHost ? [closeRoomForm] : []),
             ],
-            optionValues: serializeSettings(state.settings),
+            optionValues: serializeSettings(state.settings, state.hostName),
             level: isHost ||
                 isOpenType(state.settings.type) ||
                 state.status !== 'selecting'
@@ -1709,16 +1883,7 @@ export class Room extends DurableObject<Env> {
     }
 
     private description(): string {
-        const mode = this.st.settings.scoring
-        const tieBreakers = 'Tiebreakers: most perfects, then highest combo.'
-
-        if (mode === 'pp') {
-            return PP_CONFIGURED
-                ? `PP scoring. Each round is rounded up before the total. ${tieBreakers}`
-                : `PP scoring unavailable. ${tieBreakers}`
-        }
-
-        return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}`
+        return ''
     }
 
     private sections() {
@@ -1738,6 +1903,10 @@ export class Room extends DurableObject<Env> {
                     : null
 
             const history = live ? [...state.history, live] : state.history
+            const computedTotals = totals(history, mode)
+            const scoreByUser = new Map<string, number>(
+                computedTotals.map((t) => [t.userId, t.score]),
+            )
 
             const output: {
                 title: string
@@ -1750,38 +1919,37 @@ export class Room extends DurableObject<Env> {
             const divisions = this.getDivisions(presentMembers)
 
             for (const division of divisions) {
-                const divisionIds = new Set(division.members.map((member) => member.id))
-                const divisionTotals = totals(history, mode)
-                    .filter((total) => divisionIds.has(total.userId) && present.has(total.userId))
+                const sortedMembers = [...division.members].sort(
+                    (a, b) => (scoreByUser.get(b.id) ?? 0) - (scoreByUser.get(a.id) ?? 0),
+                )
+
+                const sectionTitle = division.title
+                    ? `      Scoreboard · ${division.title}      `
+                    : '      Scoreboard      '
 
                 output.push({
-                    title: division.title
-                        ? `Standings · ${division.title}`
-                        : 'Standings',
-                    scores: divisionTotals.map((total) => ({
-                        userId: total.userId,
-                        value: fmtScore(total.score, mode),
+                    title: sectionTitle,
+                    scores: sortedMembers.map((member) => ({
+                        userId: member.id,
+                        value: fmtScore(scoreByUser.get(member.id) ?? 0, mode),
                     })),
                 })
             }
 
             if (state.settings.type !== 'casualRoom') {
-                const allTotals = totals(history, mode)
-
                 for (const member of state.members) {
                     if (present.has(member.id)) continue
-
-                    const total = allTotals.find((t) => t.userId === member.id)
-                    if (!total) continue
+                    if (!scoreByUser.has(member.id)) continue
 
                     output.push({
-                        title: `Left · ${member.name || member.handle} · ${fmtScore(total.score, mode)}`,
+                        title: `Left · ${member.name || member.handle} · ${fmtScore(scoreByUser.get(member.id) ?? 0, mode)}`,
                         scores: [],
                     })
                 }
             }
 
-            const roundSection = (round: RoundRecord, label: string) => {
+            const roundSection = (round: RoundRecord, fallbackLabel: string) => {
+                const label = round.roundLabel || fallbackLabel
                 const song = round.levelTitle || round.level?.name
                 const title = song
                     ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
@@ -2016,7 +2184,7 @@ export class Room extends DurableObject<Env> {
 
         await lobby.upsert({
             name: this.st.name,
-            title: getRoomTitle(this.st.settings, this.st.edition),
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
             subtitle: this.subtitle(),
             master: this.st.hostName,
             hostId: this.st.hostId,
