@@ -33,6 +33,38 @@ const titleOption = {
     shortcuts: [],
 }
 
+const tournamentVisibilityOption = {
+    query: 'visibility',
+    name: 'Room access',
+    required: false,
+    type: 'select' as const,
+    def: 'locked',
+    values: [
+        { name: 'public', title: 'Public' },
+        { name: 'locked', title: 'Locked' },
+    ],
+}
+
+const customVisibilityOption = {
+    query: 'visibility',
+    name: 'Room access',
+    required: false,
+    type: 'select' as const,
+    def: 'public',
+    values: [
+        { name: 'public', title: 'Public' },
+        { name: 'private', title: 'Private' },
+    ],
+}
+
+const randomOption = {
+    query: 'random',
+    name: 'Random level',
+    required: false,
+    type: 'toggle' as const,
+    def: false,
+}
+
 export const closeRoomForm = {
     type: 'closeRoom',
     title: 'Close Room',
@@ -49,10 +81,10 @@ export const roomForms = (isTournamentHost = false) =>
             title: ROOM_TYPES[type],
             requireConfirmation: false,
             options: type === 'groupStage'
-                ? [groupOption, scoringOption]
+                ? [groupOption, scoringOption, tournamentVisibilityOption]
                 : type === 'casualRoom'
-                    ? [titleOption, scoringOption]
-                    : [scoringOption],
+                    ? [titleOption, scoringOption, customVisibilityOption, randomOption]
+                    : [scoringOption, tournamentVisibilityOption],
         }))
 
 export type RoomSettings = {
@@ -60,10 +92,25 @@ export type RoomSettings = {
     scoring: ScoringMode
     group: string
     title: string
+    visibility: 'public' | 'private' | 'locked'
+    random: boolean
 }
 
-export const serializeSettings = (s: RoomSettings) =>
-    `type=${s.type}&scoring=${s.scoring}&group=${encodeURIComponent(s.group || 'A')}&title=${encodeURIComponent(s.title || '')}`
+export const serializeSettings = (s: RoomSettings) => {
+    const values = [
+        `type=${s.type}`,
+        `scoring=${s.scoring}`,
+        `visibility=${s.visibility}`,
+    ]
+
+    if (s.type === 'groupStage') values.push(`group=${encodeURIComponent(s.group || 'A')}`)
+    if (s.type === 'casualRoom') {
+        values.push(`title=${encodeURIComponent(s.title || '')}`)
+        values.push(`random=${s.random ? 'true' : 'false'}`)
+    }
+
+    return values.join('&')
+}
 
 export function parseSettings(input: string | URLSearchParams): RoomSettings | null {
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
@@ -72,6 +119,14 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
     const scoring = p.get('scoring') || DEFAULT_SCORING
     const group = (p.get('group') || 'A').trim() || 'A'
     const title = (p.get('title') || '').trim()
+    const rawVisibility = p.get('visibility')
+
+    const visibility = type === 'casualRoom'
+        ? (rawVisibility === 'private' ? 'private' : 'public')
+        : (rawVisibility === 'public' ? 'public' : 'locked')
+
+    const random = type === 'casualRoom' &&
+        ['true', '1', 'on'].includes((p.get('random') || '').toLowerCase())
 
     if (!(type in ROOM_TYPES) || !(scoring in SCORING_MODES)) return null
     if (type === 'groupStage' && group.length > 24) return null
@@ -82,5 +137,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
         scoring: scoring as ScoringMode,
         group,
         title,
+        visibility,
+        random,
     }
 }
