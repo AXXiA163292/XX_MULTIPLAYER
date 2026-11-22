@@ -28,9 +28,9 @@ const isDisqualified = (r: GameplayResult) =>
 export const rankedScore = (r: GameplayResult): number =>
     isDisqualified(r)
         ? 0
-        : r.perfect * RANKED_POINTS.perfect +
-          r.great * RANKED_POINTS.great +
-          r.good * RANKED_POINTS.good
+        : (Number(r.perfect) || 0) * RANKED_POINTS.perfect +
+          (Number(r.great) || 0) * RANKED_POINTS.great +
+          (Number(r.good) || 0) * RANKED_POINTS.good
 
 export function ppScore(
     r: GameplayResult,
@@ -49,17 +49,24 @@ export function ppScore(
         noteCount <= 0
     ) return 0
 
-    return calculatePP({
+    const great = Number(r.great) || 0
+    const good = Number(r.good) || 0
+    const miss = Number(r.miss) || 0
+    const combo = Number(r.combo) || 0
+
+    const value = calculatePP({
         rating,
         noteCount,
-        perfect: noteCount - r.great - r.good - r.miss,
-        great: r.great,
-        good: r.good,
+        perfect: Math.max(0, noteCount - great - good - miss),
+        great,
+        good,
         bad: 0,
-        miss: r.miss,
-        combo: r.combo,
+        miss,
+        combo,
         difficulty: round.difficulty ?? round.levelTag ?? 'MASTER',
     }).pp
+
+    return Number.isFinite(value) ? value : 0
 }
 
 export const roundScore = (
@@ -81,8 +88,8 @@ export function compareResults(
         roundScore(b, mode, round) -
         roundScore(a, mode, round) ||
         Number(isDisqualified(a)) - Number(isDisqualified(b)) ||
-        b.perfect - a.perfect ||
-        b.combo - a.combo
+        (Number(b.perfect) || 0) - (Number(a.perfect) || 0) ||
+        (Number(b.combo) || 0) - (Number(a.combo) || 0)
     )
 }
 
@@ -103,12 +110,13 @@ export function totals(
                 bestCombo: 0,
             }
 
-            total.score += mode === 'pp'
+            const added = mode === 'pp'
                 ? roundPP(ppScore(result, round))
                 : rankedScore(result)
 
-            total.perfect += result.perfect
-            total.bestCombo = Math.max(total.bestCombo, result.combo)
+            total.score += Number.isFinite(added) ? added : 0
+            total.perfect += Number(result.perfect) || 0
+            total.bestCombo = Math.max(total.bestCombo, Number(result.combo) || 0)
 
             map.set(userId, total)
         }
@@ -125,14 +133,21 @@ export function totals(
 export const fmtScore = (
     n: number,
     mode: ScoringMode,
-) => `${Math.round(n)}`
+) => `${Math.round(Number.isFinite(n) ? n : 0)}`
 
 export function fmtDetail(
     result: GameplayResult,
     mode: ScoringMode,
     round?: RoundRecord,
 ): string {
-    if (isDisqualified(result)) return 'X'
+    const great = Number(result.great) || 0
+    const good = Number(result.good) || 0
+    const miss = Number(result.miss) || 0
+    const combo = Number(result.combo) || 0
+
+    if (isDisqualified(result)) {
+        return `0 | F • ${combo}x (${great}/${good}/${miss})`
+    }
 
     const score = roundScore(result, mode, round)
 
@@ -141,7 +156,7 @@ export function fmtDetail(
         : result.grade === 'fullCombo'
             ? 'FC'
             : mode === 'pp'
-                ? result.miss > PP_SETTINGS.skill.failedMissThreshold
+                ? miss > PP_SETTINGS.skill.failedMissThreshold
                     ? 'F'
                     : 'P'
                 : result.grade === 'pass'
@@ -152,5 +167,5 @@ export function fmtDetail(
         ? formatPP(score)
         : `${score}`
 
-    return `${formattedScore} | ${grade} • ${result.combo}x (${result.great}/${result.good}/${result.miss})`
+    return `${formattedScore} | ${grade} • ${combo}x (${great}/${good}/${miss})`
 }
