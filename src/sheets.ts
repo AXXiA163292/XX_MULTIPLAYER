@@ -6,9 +6,10 @@ const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
 const INDEX_SHEET_TAB = 'index'
 const METADATA_TAB = 'METADATA_RAW'
 
-const R2_LEVEL_LIST_KEY = 'level-list/index.json'
-const R2_PLAYLISTS_KEY = 'playlists/index.json'
-const R2_RANKED_POOLS_KEY = 'ranked/pools.json'
+const R2_LEVEL_LIST_KEY = 'server/level-list/index.json'
+const R2_PLAYLISTS_KEY = 'server/playlists/index.json'
+const rankedTierKey = (tier: RankedTier) => `ranked-match/${tier.toUpperCase()}/pool.json`
+const R2_RANKED_CUSTOM_KEY = 'ranked-match/CUSTOM/pool.json'
 const DAY_MS = 24 * 60 * 60 * 1000
 
 type Row = {
@@ -41,14 +42,6 @@ type StoredSnapshot<T> = {
     updatedAt: number
     data: T
 }
-
-export type RankedPoolsSnapshot = Record<
-    RankedTier,
-    {
-        official: SheetChart[]
-        custom: SheetChart[]
-    }
->
 
 function parseCSV(input: string): string[][] {
     const rows: string[][] = []
@@ -565,51 +558,86 @@ async function customRankedPoolFromSheet(
     return pool
 }
 
-async function buildRankedPoolsSnapshot(): Promise<RankedPoolsSnapshot> {
-    const [metaRows, customSheetRows] = await Promise.all([
+async function allCustomRankedPoolFromSheet(values: string[][]): Promise<SheetChart[]> {
+    const headerIndex = values.findIndex((row) =>
+        row.some((cell) => normalizeId(cell).toLowerCase() === 'ranked'),
+    )
+    if (headerIndex < 0) return []
+
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+    const col = (name: string) => headers.indexOf(name)
+    const pool: SheetChart[] = []
+
+    for (const cells of values.slice(headerIndex + 1)) {
+        const id = normalizeId(cells[col('id')])
+        if (!isCustomLevelId(id)) continue
+        if (normalizeId(cells[col('ranked')]).toLowerCase() !== 'true') continue
+
+        const row: Row = {
+            id,
+            input: normalizeId(cells[col('input')]),
+            serverId: normalizeId(cells[col('serverid')]),
+            privacy: normalizeId(cells[col('privacy')]),
+        }
+        if (!isPublicLevel(row)) continue
+
+        const chart = chartFromUrl(id, row.input)
+        if (chart) pool.push(chart)
+    }
+
+    return pool
+}
+
+async function getRankedTierOfficialPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
+    const cached = await readBucketJson<SheetChart[]>(env, rankedTierKey(tier))
+    if (cached) return cached
+
+    const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+    const charts = await officialRankedPoolFromSheet(metaRows, tier)
+    await writeBucketJson(env, rankedTierKey(tier), charts)
+    return charts
+}
+
+async function getRankedCustomPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
+    const allCustom = await readBucketJson<SheetChart[]>(env, R2_RANKED_CUSTOM_KEY)
+    const customSheetRows = allCustom ? null : await fetchSheet(CUSTOM_SHEET_ID, 'custom')
+
+    if (!allCustom && customSheetRows) {
+        const builtAll = await allCustomRankedPoolFromSheet(customSheetRows)
+        await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, builtAll)
+    }
+
+    const sourceRows = customSheetRows ?? await fetchSheet(CUSTOM_SHEET_ID, 'custom')
+    return customRankedPoolFromSheet(sourceRows, tier)
+}
+
+export async function refreshDailyAssets(env: Env): Promise<void> {
+    console.log('[Cron] Refreshing daily R2 assets...')
+
+    const [customCharts, playlists, metaRows, customSheetRows] = await Promise.all([
+        fetchCustomLevelsFromSheet(),
+        fetchPlaylistsFromSheet(),
         fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB),
         fetchSheet(CUSTOM_SHEET_ID, 'custom'),
     ])
 
     const tiers = Object.keys(RANKED_TIERS) as RankedTier[]
-    const snapshot = {} as RankedPoolsSnapshot
+    const allCustomRanked = await allCustomRankedPoolFromSheet(customSheetRows)
 
-    for (const tier of tiers) {
-        snapshot[tier] = {
-            official: await officialRankedPoolFromSheet(metaRows, tier),
-            custom: await customRankedPoolFromSheet(customSheetRows, tier),
-        }
-    }
-
-    return snapshot
-}
-
-export async function getRankedPools(env?: Env): Promise<RankedPoolsSnapshot> {
-    const cached = await readBucketJson<RankedPoolsSnapshot>(env, R2_RANKED_POOLS_KEY)
-    if (cached) return cached
-
-    const snapshot = await buildRankedPoolsSnapshot()
-    await writeBucketJson(env, R2_RANKED_POOLS_KEY, snapshot)
-    return snapshot
-}
-
-export async function refreshDailyAssets(env: Env): Promise<void> {
-    console.log('[Cron] Refreshing daily R2 assets (level-list, playlists, ranked pools)...')
-
-    const [customCharts, playlists, rankedPools] = await Promise.all([
-        fetchCustomLevelsFromSheet(),
-        fetchPlaylistsFromSheet(),
-        buildRankedPoolsSnapshot(),
-    ])
-
-    await Promise.all([
+    const writes: Promise<void>[] = [
         writeBucketJson(env, R2_LEVEL_LIST_KEY, customCharts),
         writeBucketJson(env, R2_PLAYLISTS_KEY, playlists),
-        writeBucketJson(env, R2_RANKED_POOLS_KEY, rankedPools),
-    ])
+        writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustomRanked),
+    ]
 
+    for (const tier of tiers) {
+        const officialPool = await officialRankedPoolFromSheet(metaRows, tier)
+        writes.push(writeBucketJson(env, rankedTierKey(tier), officialPool))
+    }
+
+    await Promise.all(writes)
     console.log(
-        `[Cron] Refreshed R2 assets: ${customCharts.length} levels, ${playlists.length} playlists.`,
+        `[Cron] Refreshed R2 assets: ${customCharts.length} levels, ${playlists.length} playlists, ${tiers.length} ranked tiers + CUSTOM.`,
     )
 }
 
@@ -623,15 +651,15 @@ export async function pickRankedLevel(
             ? (customSongs ? 'on' : 'off')
             : customSongs
 
-    const pools = await getRankedPools(env)
-    const tierPool = pools[tier] ?? { official: [], custom: [] }
+    const officialPool = mode === 'customOnly'
+        ? []
+        : await getRankedTierOfficialPool(tier, env)
 
-    const pool = mode === 'customOnly'
-        ? tierPool.custom
-        : mode === 'on'
-            ? [...tierPool.official, ...tierPool.custom]
-            : tierPool.official
+    const customPool = mode === 'off'
+        ? []
+        : await getRankedCustomPool(tier, env)
 
+    const pool = [...officialPool, ...customPool]
     if (pool.length === 0) return null
     return pool[Math.floor(Math.random() * pool.length)]!
 }
