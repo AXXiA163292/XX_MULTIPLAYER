@@ -85,26 +85,74 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-async function roomItems(env: Env) {
+async function roomItems(env: Env, session: AuthSession | null) {
     const rooms = await lobby(env).list()
 
-    return Promise.all(
+    const items = await Promise.all(
         rooms.map(async (room) => {
             const current = await roomStub(env, room.name).summary()
-            return { ...(current ?? room), tags: [] }
+
+            if (!current) {
+                // The room no longer exists (expired or closed): clean the stale entry.
+                await lobby(env).remove(room.name)
+                return null
+            }
+
+            // Private rooms are only listed for their host. Others join through the room link.
+            if (current.visibility === 'private' && current.hostId !== session?.user.id) {
+                return null
+            }
+
+            return {
+                name: current.name,
+                title: current.title,
+                subtitle: current.subtitle,
+                master: current.master,
+                tags: [],
+            }
         }),
     )
+
+    return items.filter((item) => item !== null)
 }
 
 const canManagePosts = (session: AuthSession | null) =>
     session?.user.handle === TOURNAMENT_HOST_HANDLE
 
-function postForm(category: 'announcements' | 'news') {
-    const announcement = category === 'announcements'
+type PostKind = 'announcements' | 'posts' | 'results'
+
+const POST_LABELS: Record<PostKind, {
+    section: string
+    create: string
+    titlePlaceholder: string
+    bodyPlaceholder: string
+}> = {
+    announcements: {
+        section: 'Announcements',
+        create: 'Create announcement',
+        titlePlaceholder: 'Announcement title',
+        bodyPlaceholder: 'Write your announcement...',
+    },
+    posts: {
+        section: 'Posts',
+        create: 'Create post',
+        titlePlaceholder: 'Post title',
+        bodyPlaceholder: 'Write your post...',
+    },
+    results: {
+        section: 'Results',
+        create: 'Create result',
+        titlePlaceholder: 'Result title',
+        bodyPlaceholder: 'Write the results...',
+    },
+}
+
+function postForm(category: PostKind) {
+    const label = POST_LABELS[category]
 
     return {
         type: 'post',
-        title: announcement ? 'Create announcement' : 'Create news post',
+        title: label.create,
         requireConfirmation: false,
         options: [
             {
@@ -113,9 +161,7 @@ function postForm(category: 'announcements' | 'news') {
                 required: true,
                 type: 'text',
                 def: '',
-                placeholder: announcement
-                    ? 'Announcement title'
-                    : 'News title',
+                placeholder: label.titlePlaceholder,
                 limit: 100,
                 shortcuts: [],
             },
@@ -125,9 +171,7 @@ function postForm(category: 'announcements' | 'news') {
                 required: true,
                 type: 'textArea',
                 def: '',
-                placeholder: announcement
-                    ? 'Write your announcement...'
-                    : 'Write your news post...',
+                placeholder: label.bodyPlaceholder,
                 limit: 5000,
                 shortcuts: [],
             },
@@ -157,10 +201,10 @@ const deletePostForm = {
     options: [],
 }
 
-function postCategory(url: URL): 'announcements' | 'news' {
-    return url.searchParams.get('type') === 'announcements'
-        ? 'announcements'
-        : 'news'
+/** `?type=` of the post requests. Old "news" posts and links are treated as "posts". */
+function postCategory(url: URL): PostKind {
+    const type = url.searchParams.get('type')
+    return type === 'announcements' || type === 'results' ? type : 'posts'
 }
 
 function playlistSlug(name: string): string {
@@ -364,9 +408,15 @@ export default {
                     },
                     {
                         type: 'post',
-                        title: 'News',
+                        title: 'Posts',
                         icon: 'post',
-                        infoType: 'news',
+                        infoType: 'posts',
+                    },
+                    {
+                        type: 'post',
+                        title: 'Results',
+                        icon: 'medal',
+                        infoType: 'results',
                     },
                     { type: 'level' },
                     { type: 'playlist' },
@@ -411,7 +461,7 @@ export default {
             })
         }
 
-        // Posts: Announcements and News
+        // Posts: Announcements, Posts and Results (only the tournament host can create / delete)
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const category = postCategory(url)
@@ -425,9 +475,7 @@ export default {
                 searches: [],
                 sections: [
                     {
-                        title: category === 'announcements'
-                            ? 'Announcements'
-                            : 'News',
+                        title: POST_LABELS[category].section,
                         itemType: 'post',
                         items: posts.map((post) => post.item),
                     },
@@ -918,16 +966,18 @@ export default {
                     {
                         title: 'Rooms',
                         itemType: 'room',
-                        items: await roomItems(env),
+                        items: await roomItems(env, session),
                     },
                 ],
             })
         }
 
         if (path === '/sonolus/rooms/list' && req.method === 'GET') {
+            const session = await sessionOf(req, env)
+
             return json({
                 pageCount: 1,
-                items: await roomItems(env),
+                items: await roomItems(env, session),
                 searches: [],
             })
         }
@@ -958,7 +1008,13 @@ export default {
             if (!item) return new Response(null, { status: 404 })
 
             return json({
-                item: { ...item, tags: [] },
+                item: {
+                    name: item.name,
+                    title: item.title,
+                    subtitle: item.subtitle,
+                    master: item.master,
+                    tags: [],
+                },
                 actions: [],
                 hasCommunity: false,
                 leaderboards: [],
@@ -1001,8 +1057,15 @@ export default {
                 ) {
                     return message(403, 'You can only create Custom Rooms.')
                 }
-            } else if (!(await stub.isOpen())) {
-                return new Response(null, { status: 404 })
+            } else {
+                if (!(await stub.isOpen())) {
+                    return new Response(null, { status: 404 })
+                }
+
+                // Locked rooms only accept registered players of that stage.
+                const denied = await stub.canJoin(user)
+
+                if (denied) return message(403, denied)
             }
 
             const session = await signToken(env.SESSION_SECRET, {
