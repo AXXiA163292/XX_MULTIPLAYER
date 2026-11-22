@@ -1,6 +1,15 @@
+import type { CustomSongsMode } from './forms.ts'
+import type { Env } from './types.ts'
+
 const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
 const INDEX_SHEET_TAB = 'index'
+const METADATA_TAB = 'METADATA_RAW'
+
+const R2_LEVEL_LIST_KEY = 'level-list/index.json'
+const R2_PLAYLISTS_KEY = 'playlists/index.json'
+const R2_RANKED_POOLS_KEY = 'ranked/pools.json'
+const DAY_MS = 24 * 60 * 60 * 1000
 
 type Row = {
     id: string
@@ -27,6 +36,19 @@ export type PlaylistData = {
     name: string
     charts: SheetChart[]
 }
+
+type StoredSnapshot<T> = {
+    updatedAt: number
+    data: T
+}
+
+export type RankedPoolsSnapshot = Record<
+    RankedTier,
+    {
+        official: SheetChart[]
+        custom: SheetChart[]
+    }
+>
 
 function parseCSV(input: string): string[][] {
     const rows: string[][] = []
@@ -72,8 +94,6 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
 
     try {
         console.log(`[Sheets] Requesting spreadsheet ${id}, tab "${tab}".`)
-        console.log(`[Sheets] Exact tab request: ${url}`)
-
         const response = await fetch(url, {
             headers: {
                 Accept: 'text/csv,text/plain,*/*',
@@ -100,12 +120,9 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
         }
 
         const parsed = parseCSV(content)
-
         if (!parsed.length) {
             throw new Error(`The "${tab}" tab is empty.`)
         }
-
-        console.log(`[Sheets] Successfully read ${parsed.length} rows from tab "${tab}".`)
 
         return parsed
     } catch (error) {
@@ -139,28 +156,18 @@ function chartFromUrl(id: string, rawInput: string): SheetChart | null {
         }
 
         const url = new URL(candidate)
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
 
-        if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-            return null
-        }
+        const match = url.pathname.match(/\/levels\/([^/]+)\/?$/i)
+        if (!match) return null
 
-        // Keep a path prefix of the server (https://host/prefix/levels/x -> https://host/prefix).
-        const match = url.pathname.match(/^(.*)\/levels\/([^/]+)\/?$/i)
-
-        if (!match) {
-            console.warn('[Sheets] Level URL has no /levels/{name} path:', id, raw)
-            return null
-        }
-
-        const name = decodeURIComponent(match[2]!)
-        const prefix = match[1]!.replace(/\/sonolus$/i, '')
-
+        const name = decodeURIComponent(match[1]!)
         if (!name) return null
 
         return {
             id,
             url: raw,
-            address: url.origin + prefix,
+            address: url.origin,
             name,
         }
     } catch (error) {
@@ -193,16 +200,13 @@ async function customRows(): Promise<Row[]> {
         throw new Error('The custom tab must contain id, input, serverId and privacy headers.')
     }
 
-    const headers = values[headerIndex]!.map((cell) =>
-        normalizeId(cell).toLowerCase(),
-    )
-
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const idIndex = headers.indexOf('id')
     const inputIndex = headers.indexOf('input')
     const serverIdIndex = headers.indexOf('serverid')
     const privacyIndex = headers.indexOf('privacy')
 
-    const result = values
+    return values
         .slice(headerIndex + 1)
         .map((cells) => ({
             id: normalizeId(cells[idIndex]),
@@ -211,10 +215,6 @@ async function customRows(): Promise<Row[]> {
             privacy: normalizeId(cells[privacyIndex]),
         }))
         .filter((row) => row.id && row.input)
-
-    console.log(`[Sheets] Read ${result.length} rows from custom tab.`)
-
-    return result
 }
 
 function isCustomLevelId(id: string): boolean {
@@ -225,14 +225,80 @@ function isCustomLevelId(id: string): boolean {
 function isPublicLevel(row: Row): boolean {
     const privacy = normalizeId(row.privacy).toLowerCase()
     const serverId = normalizeId(row.serverId)
-
     return privacy !== 'unlisted' && serverId !== '-'
 }
 
 export const CUSTOM_LEVEL_PAGE_SIZE = 10
 
-export async function getCustomLevelPage(page: number): Promise<{ charts: SheetChart[]; pageCount: number }> {
-    const all = await getCustomLevels()
+async function readBucketJson<T>(
+    env: Env | undefined,
+    key: string,
+    maxAgeMs = DAY_MS,
+): Promise<T | null> {
+    const bucket = env?.POSTS_BUCKET
+    if (!bucket) return null
+
+    try {
+        const obj = await bucket.get(key)
+        if (!obj) return null
+
+        const parsed = (await obj.json()) as StoredSnapshot<T>
+        if (!parsed || typeof parsed.updatedAt !== 'number' || !('data' in parsed)) {
+            return null
+        }
+
+        if (Date.now() - parsed.updatedAt > maxAgeMs) {
+            return null
+        }
+
+        return parsed.data
+    } catch (error) {
+        console.warn(`[R2] Failed reading ${key}:`, error)
+        return null
+    }
+}
+
+async function writeBucketJson<T>(
+    env: Env | undefined,
+    key: string,
+    data: T,
+): Promise<void> {
+    const bucket = env?.POSTS_BUCKET
+    if (!bucket) return
+
+    const payload: StoredSnapshot<T> = {
+        updatedAt: Date.now(),
+        data,
+    }
+
+    await bucket.put(key, JSON.stringify(payload), {
+        httpMetadata: { contentType: 'application/json' },
+    })
+}
+
+async function fetchCustomLevelsFromSheet(): Promise<SheetChart[]> {
+    const rows = await customRows()
+    return rows
+        .filter((row) => isCustomLevelId(row.id) && isPublicLevel(row))
+        .map((row) => chartFromUrl(row.id, row.input))
+        .filter((chart): chart is SheetChart => chart !== null)
+        .sort(compareIdDescending)
+}
+
+export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
+    const cached = await readBucketJson<SheetChart[]>(env, R2_LEVEL_LIST_KEY)
+    if (cached) return cached
+
+    const charts = await fetchCustomLevelsFromSheet()
+    await writeBucketJson(env, R2_LEVEL_LIST_KEY, charts)
+    return charts
+}
+
+export async function getCustomLevelPage(
+    page: number,
+    env?: Env,
+): Promise<{ charts: SheetChart[]; pageCount: number }> {
+    const all = await getCustomLevels(env)
     const safePage = Number.isFinite(page) ? Math.max(0, Math.floor(page)) : 0
     const pageCount = Math.max(1, Math.ceil(all.length / CUSTOM_LEVEL_PAGE_SIZE))
     const start = safePage * CUSTOM_LEVEL_PAGE_SIZE
@@ -243,40 +309,14 @@ export async function getCustomLevelPage(page: number): Promise<{ charts: SheetC
     }
 }
 
-export async function getCustomLevels(): Promise<SheetChart[]> {
-    const rows = await customRows()
-
-    const matchingRows = rows.filter((row) => isCustomLevelId(row.id))
-    const publicRows = matchingRows.filter(isPublicLevel)
-
-    const charts = publicRows
-        .map((row) => chartFromUrl(row.id, row.input))
-        .filter((chart): chart is SheetChart => chart !== null)
-        .sort(compareIdDescending)
-
-    console.log(
-        `[Sheets] Levels: ${charts.length} valid public charts from ${matchingRows.length} matching IDs. ${matchingRows.length - publicRows.length} excluded by privacy/serverId.`,
-    )
-
-    console.log(
-        '[Sheets] Public level IDs:',
-        charts.map((chart) => chart.id).join(', '),
-    )
-
-    return charts
-}
-
 function suduPlaylistName(id: string): string | null {
     const match = normalizeId(id).toUpperCase().match(/^D(\d{2})/)
-
     if (!match) return null
-
     return `SUDU-${match[1]!.padStart(3, '0')}`
 }
 
-export async function getPlaylists(): Promise<PlaylistData[]> {
+async function fetchPlaylistsFromSheet(): Promise<PlaylistData[]> {
     const rows = await customRows()
-
     const charts = rows
         .filter((row) => {
             const id = normalizeId(row.id).toUpperCase()
@@ -295,20 +335,16 @@ export async function getPlaylists(): Promise<PlaylistData[]> {
             title = suduPlaylistName(id)
         } else {
             const xMatch = id.match(/^X(\d+)/)
-
-            if (xMatch) {
-                title = `XX! Championship 20${xMatch[1]}`
-            }
+            if (xMatch) title = `XX! Championship 20${xMatch[1]}`
         }
 
         if (!title) continue
-
         const list = groups.get(title) ?? []
         list.push(chart)
         groups.set(title, list)
     }
 
-    const playlists = [...groups.entries()]
+    return [...groups.entries()]
         .map(([name, items]) => ({
             name,
             charts: items.sort(compareIdDescending),
@@ -317,23 +353,20 @@ export async function getPlaylists(): Promise<PlaylistData[]> {
             const aSudu = a.name.match(/^SUDU-(\d+)$/)
             const bSudu = b.name.match(/^SUDU-(\d+)$/)
 
-            if (aSudu && bSudu) {
-                return Number(aSudu[1]) - Number(bSudu[1])
-            }
-
+            if (aSudu && bSudu) return Number(aSudu[1]) - Number(bSudu[1])
             if (aSudu) return -1
             if (bSudu) return 1
 
-            return a.name.localeCompare(b.name, undefined, {
-                numeric: true,
-            })
+            return a.name.localeCompare(b.name, undefined, { numeric: true })
         })
+}
 
-    console.log(
-        `[Sheets] Playlists: ${playlists.length}.`,
-        playlists.map((playlist) => `${playlist.name} (${playlist.charts.length})`).join(', '),
-    )
+export async function getPlaylists(env?: Env): Promise<PlaylistData[]> {
+    const cached = await readBucketJson<PlaylistData[]>(env, R2_PLAYLISTS_KEY)
+    if (cached) return cached
 
+    const playlists = await fetchPlaylistsFromSheet()
+    await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists)
     return playlists
 }
 
@@ -349,8 +382,6 @@ function isGroupHeader(header: string): boolean {
 }
 
 export async function getEditionData(): Promise<EditionData> {
-    console.log(`[INDEX] Reading spreadsheet ${INDEX_SHEET_ID}, tab "${INDEX_SHEET_TAB}".`)
-
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
     if (rows.length < 2) {
@@ -361,38 +392,28 @@ export async function getEditionData(): Promise<EditionData> {
     const normalized = headers.map((cell) => cell.toUpperCase())
 
     if (normalizeId(headers[0]).toLowerCase() !== 'index') {
-        throw new Error(
-            `[INDEX] Wrong tab data received. Expected cell A1 to be "Index" from the "${INDEX_SHEET_TAB}" tab, received "${headers[0] ?? ''}". Refusing to load another tab.`,
-        )
+        throw new Error(`[INDEX] Expected cell A1 to be "Index", received "${headers[0] ?? ''}".`)
     }
 
     if (!normalized.includes('G1') || !normalized.includes('F1')) {
-        throw new Error(
-            `[INDEX] The "${INDEX_SHEET_TAB}" tab has an unexpected header row. Expected G1 and F1 columns.`,
-        )
+        throw new Error(`[INDEX] Expected G1 and F1 columns in "${INDEX_SHEET_TAB}".`)
     }
 
-    console.log(`[INDEX] Verified tab "${INDEX_SHEET_TAB}". A1="${headers[0]}". Headers:`, headers)
-
     let activeRow: string[] | null = null
-
     for (let i = rows.length - 1; i >= 1; i--) {
-        const row = rows[i]!
-
-        if (normalizeId(row[0])) {
-            activeRow = row
+        if (normalizeId(rows[i]![0])) {
+            activeRow = rows[i]!
             break
         }
     }
 
     if (!activeRow) {
-        throw new Error(`No edition was found in column A of the "${INDEX_SHEET_TAB}" tab.`)
+        throw new Error(`No edition found in column A of "${INDEX_SHEET_TAB}".`)
     }
 
     const edition = normalizeId(activeRow[0])
-
     if (!edition) {
-        throw new Error(`The current edition name in column A of the "${INDEX_SHEET_TAB}" tab is empty.`)
+        throw new Error(`Current edition name in column A of "${INDEX_SHEET_TAB}" is empty.`)
     }
 
     const groupStage: SheetChart[] = []
@@ -402,30 +423,18 @@ export async function getEditionData(): Promise<EditionData> {
     for (let column = 0; column < headers.length; column++) {
         const header = normalized[column] ?? ''
         const value = String(activeRow[column] ?? '').trim()
-
         if (!header || !value) continue
 
         const groupMatch = header.match(/^G(\d+)$/)
         const finalMatch = header.match(/^F(\d+)$/)
 
         if (groupMatch || finalMatch) {
-            const id = groupMatch
-                ? `G${groupMatch[1]}`
-                : `F${finalMatch![1]}`
-
+            const id = groupMatch ? `G${groupMatch[1]}` : `F${finalMatch![1]}`
             const chart = chartFromUrl(id, value)
+            if (!chart) continue
 
-            if (!chart) {
-                console.warn(`[INDEX] Invalid ${id} URL:`, value)
-                continue
-            }
-
-            if (groupMatch) {
-                groupStage.push(chart)
-            } else {
-                final.push(chart)
-            }
-
+            if (groupMatch) groupStage.push(chart)
+            else final.push(chart)
             continue
         }
 
@@ -433,15 +442,11 @@ export async function getEditionData(): Promise<EditionData> {
             for (const handle of splitHandles(value)) {
                 divisions[handle] = `Group ${header}`
             }
-
             continue
         }
 
         if (header === 'UB' || header === 'LB') {
-            const division = header === 'UB'
-                ? 'Upper Bracket'
-                : 'Lower Bracket'
-
+            const division = header === 'UB' ? 'Upper Bracket' : 'Lower Bracket'
             for (const handle of splitHandles(value)) {
                 divisions[handle] = division
             }
@@ -451,19 +456,12 @@ export async function getEditionData(): Promise<EditionData> {
     const sortByNumber = (a: SheetChart, b: SheetChart) =>
         Number(a.id.slice(1)) - Number(b.id.slice(1))
 
-    const result: EditionData = {
+    return {
         edition,
         groupStage: groupStage.sort(sortByNumber),
         final: final.sort(sortByNumber),
         divisions,
     }
-
-    console.log(`[INDEX] Current edition from "${INDEX_SHEET_TAB}"!A${rows.indexOf(activeRow) + 1}:`, edition)
-    console.log('[INDEX] Group Stage songs:', groupStage.length, groupStage)
-    console.log('[INDEX] Final songs:', final.length, final)
-    console.log('[INDEX] Divisions:', divisions)
-
-    return result
 }
 
 export async function getCurrentEdition(): Promise<string> {
@@ -471,20 +469,9 @@ export async function getCurrentEdition(): Promise<string> {
 }
 
 export function clearSheetCache(): void {
-    // Sheets are read fresh on every request.
+    // R2 acts as the persistent daily cache.
 }
 
-
-// ───────────────────────── Ranked Match song pool ─────────────────────────
-//
-// Song lists live in the R2 bucket "ranked-match" (binding RANKED_BUCKET):
-//   <TIER>/official.json   official songs of the tier   e.g. MASTER/official.json
-//   CUSTOM/<TIER>.json     ranked custom songs of the tier   e.g. CUSTOM/MASTER.json
-// Rooms only read the bucket (fast). The bucket is refreshed from the sheets when a room opens.
-
-const METADATA_TAB = 'METADATA_RAW'
-
-/** [min, max] play level per tier. `append` = range for APPEND charts (only master and diamond use them). */
 export const RANKED_TIERS = {
     master:   { main: [30, 37] as const, append: [28, 99] as const },
     diamond:  { main: [29, 32] as const, append: [27, 30] as const },
@@ -497,100 +484,65 @@ export const RANKED_TIERS = {
 
 export type RankedTier = keyof typeof RANKED_TIERS
 
-/** off = official only, on = official + custom, only = custom only. */
-export type RankedCustomMode = 'off' | 'on' | 'only'
-
-type StoredSong = { id: string; url: string }
-
 const OFFICIAL_DIFFS = ['ez', 'nm', 'hr', 'ex', 'ms', 'ap'] as const
-
-const officialKey = (tier: RankedTier) => `${tier.toUpperCase()}/official.json`
-const customKey = (tier: RankedTier) => `CUSTOM/${tier.toUpperCase()}.json`
 
 function inRange(level: number, range: readonly [number, number] | null): boolean {
     return !!range && level >= range[0] && level <= range[1]
 }
 
-// Short cache so several builds in a row do not re-download the whole metadata sheet.
-const METADATA_CACHE_MS = 2 * 60_000
-let metadataCache: { at: number; values: string[][] } | null = null
-
-async function metadataRows(): Promise<string[][]> {
-    if (metadataCache && Date.now() - metadataCache.at < METADATA_CACHE_MS) {
-        return metadataCache.values
-    }
-
-    const values = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
-    metadataCache = { at: Date.now(), values }
-
-    return values
-}
-
-/** Official songs: every difficulty whose play level fits the tier (links from <diff>LevelLinkSbuga). */
-async function officialRankedSongs(tier: RankedTier): Promise<StoredSong[]> {
-    const values = await metadataRows()
-
+async function officialRankedPoolFromSheet(
+    values: string[][],
+    tier: RankedTier,
+): Promise<SheetChart[]> {
     const headerIndex = values.findIndex((row) =>
-        row.some((cell) => normalizeId(cell).toLowerCase().endsWith('levellinksbuga')),
+        row.some((cell) => normalizeId(cell).toLowerCase() === 'hrlevellinksbuga'),
     )
-
     if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
 
     const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const idCol = headers.indexOf('id')
     const rules = RANKED_TIERS[tier]
-    const songs: StoredSong[] = []
-
-    const usable = OFFICIAL_DIFFS.filter(
-        (diff) =>
-            headers.includes(`${diff}playlevel`) &&
-            headers.includes(`${diff}levellinksbuga`),
-    )
+    const pool: SheetChart[] = []
 
     for (const cells of values.slice(headerIndex + 1)) {
-        for (const diff of usable) {
-            const rawLevel = normalizeId(cells[headers.indexOf(`${diff}playlevel`)])
-            const link = normalizeId(cells[headers.indexOf(`${diff}levellinksbuga`)])
+        for (const diff of OFFICIAL_DIFFS) {
+            const levelCol = headers.indexOf(`${diff}playlevel`)
+            const linkCol = headers.indexOf(`${diff}levellinksbuga`)
+            if (levelCol < 0 || linkCol < 0) continue
 
-            if (!rawLevel || !link || link === '-') continue
-
-            const level = Number(rawLevel)
-
-            if (!Number.isFinite(level)) continue
+            const level = Number(normalizeId(cells[levelCol]))
+            const link = normalizeId(cells[linkCol])
+            if (!Number.isFinite(level) || !link || link === '-') continue
 
             const fits = diff === 'ap'
                 ? inRange(level, rules.append)
                 : inRange(level, rules.main)
-
             if (!fits) continue
 
-            songs.push({ id: `${normalizeId(cells[idCol])}-${diff}`, url: link })
+            const chart = chartFromUrl(`${normalizeId(cells[idCol])}-${diff}`, link)
+            if (chart) pool.push(chart)
         }
     }
 
-    console.log(`[Ranked] Built official list for ${tier}: ${songs.length} songs.`)
-
-    return songs
+    return pool
 }
 
-/** Custom songs: rows of the custom tab with Ranked = true (playLevel + difficulty columns). */
-async function customRankedSongs(tier: RankedTier): Promise<StoredSong[]> {
-    const values = await fetchSheet(CUSTOM_SHEET_ID, 'custom')
-
+async function customRankedPoolFromSheet(
+    values: string[][],
+    tier: RankedTier,
+): Promise<SheetChart[]> {
     const headerIndex = values.findIndex((row) =>
         row.some((cell) => normalizeId(cell).toLowerCase() === 'ranked'),
     )
-
     if (headerIndex < 0) return []
 
     const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const col = (name: string) => headers.indexOf(name)
     const rules = RANKED_TIERS[tier]
-    const songs: StoredSong[] = []
+    const pool: SheetChart[] = []
 
     for (const cells of values.slice(headerIndex + 1)) {
         const id = normalizeId(cells[col('id')])
-
         if (!isCustomLevelId(id)) continue
         if (normalizeId(cells[col('ranked')]).toLowerCase() !== 'true') continue
 
@@ -600,134 +552,86 @@ async function customRankedSongs(tier: RankedTier): Promise<StoredSong[]> {
             serverId: normalizeId(cells[col('serverid')]),
             privacy: normalizeId(cells[col('privacy')]),
         }
-
         if (!isPublicLevel(row)) continue
 
         const level = Number(normalizeId(cells[col('playlevel')]))
         const isAppend = normalizeId(cells[col('difficulty')]).toLowerCase() === 'append'
-
-        if (!Number.isFinite(level)) continue
         if (!inRange(level, isAppend ? rules.append : rules.main)) continue
 
-        songs.push({ id, url: row.input })
+        const chart = chartFromUrl(id, row.input)
+        if (chart) pool.push(chart)
     }
 
-    console.log(`[Ranked] Built custom list for ${tier}: ${songs.length} songs.`)
-
-    return songs
+    return pool
 }
 
-async function readList(bucket: R2Bucket, key: string): Promise<StoredSong[] | null> {
-    try {
-        const object = await bucket.get(key)
+async function buildRankedPoolsSnapshot(): Promise<RankedPoolsSnapshot> {
+    const [metaRows, customSheetRows] = await Promise.all([
+        fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB),
+        fetchSheet(CUSTOM_SHEET_ID, 'custom'),
+    ])
 
-        if (!object) return null
+    const tiers = Object.keys(RANKED_TIERS) as RankedTier[]
+    const snapshot = {} as RankedPoolsSnapshot
 
-        const data: unknown = JSON.parse(await object.text())
-
-        return Array.isArray(data)
-            ? data.filter(
-                (entry): entry is StoredSong =>
-                    !!entry &&
-                    typeof entry.id === 'string' &&
-                    typeof entry.url === 'string',
-            )
-            : null
-    } catch (error) {
-        console.error('[Ranked] Could not read bucket list', key, error)
-        return null
-    }
-}
-
-async function writeList(bucket: R2Bucket, key: string, songs: StoredSong[]): Promise<void> {
-    try {
-        await bucket.put(key, JSON.stringify(songs), {
-            httpMetadata: { contentType: 'application/json' },
-        })
-    } catch (error) {
-        console.error('[Ranked] Could not write bucket list', key, error)
-    }
-}
-
-/** Bucket first (fast). If the file does not exist yet, build it from the sheet and store it. */
-async function listFor(
-    bucket: R2Bucket | undefined,
-    key: string,
-    build: () => Promise<StoredSong[]>,
-): Promise<StoredSong[]> {
-    const stored = bucket ? await readList(bucket, key) : null
-
-    if (stored) return stored
-
-    const built = await build()
-
-    if (bucket) await writeList(bucket, key, built)
-
-    return built
-}
-
-function toCharts(songs: StoredSong[]): SheetChart[] {
-    const charts: SheetChart[] = []
-
-    for (const song of songs) {
-        const chart = chartFromUrl(song.id, song.url)
-        if (chart) charts.push(chart)
+    for (const tier of tiers) {
+        snapshot[tier] = {
+            official: await officialRankedPoolFromSheet(metaRows, tier),
+            custom: await customRankedPoolFromSheet(customSheetRows, tier),
+        }
     }
 
-    return charts
+    return snapshot
 }
 
-/** Song list of a Ranked Match room. Called when the room opens, never between rounds. */
-export async function loadRankedPool(
-    bucket: R2Bucket | undefined,
+export async function getRankedPools(env?: Env): Promise<RankedPoolsSnapshot> {
+    const cached = await readBucketJson<RankedPoolsSnapshot>(env, R2_RANKED_POOLS_KEY)
+    if (cached) return cached
+
+    const snapshot = await buildRankedPoolsSnapshot()
+    await writeBucketJson(env, R2_RANKED_POOLS_KEY, snapshot)
+    return snapshot
+}
+
+export async function refreshDailyAssets(env: Env): Promise<void> {
+    console.log('[Cron] Refreshing daily R2 assets (level-list, playlists, ranked pools)...')
+
+    const [customCharts, playlists, rankedPools] = await Promise.all([
+        fetchCustomLevelsFromSheet(),
+        fetchPlaylistsFromSheet(),
+        buildRankedPoolsSnapshot(),
+    ])
+
+    await Promise.all([
+        writeBucketJson(env, R2_LEVEL_LIST_KEY, customCharts),
+        writeBucketJson(env, R2_PLAYLISTS_KEY, playlists),
+        writeBucketJson(env, R2_RANKED_POOLS_KEY, rankedPools),
+    ])
+
+    console.log(
+        `[Cron] Refreshed R2 assets: ${customCharts.length} levels, ${playlists.length} playlists.`,
+    )
+}
+
+export async function pickRankedLevel(
     tier: RankedTier,
-    custom: RankedCustomMode,
-): Promise<SheetChart[]> {
-    const [official, extra] = await Promise.all([
-        custom === 'only'
-            ? Promise.resolve([] as StoredSong[])
-            : listFor(bucket, officialKey(tier), () => officialRankedSongs(tier)),
-        custom === 'off'
-            ? Promise.resolve([] as StoredSong[])
-            : listFor(bucket, customKey(tier), () => customRankedSongs(tier)).catch((error) => {
-                console.error('[Ranked] Could not load custom songs:', error)
-                return [] as StoredSong[]
-            }),
-    ])
+    customSongs: CustomSongsMode | boolean,
+    env?: Env,
+): Promise<SheetChart | null> {
+    const mode: CustomSongsMode =
+        typeof customSongs === 'boolean'
+            ? (customSongs ? 'on' : 'off')
+            : customSongs
 
-    const charts = toCharts([...official, ...extra])
+    const pools = await getRankedPools(env)
+    const tierPool = pools[tier] ?? { official: [], custom: [] }
 
-    console.log(`[Ranked] Pool for ${tier} (custom ${custom}): ${charts.length} songs.`)
+    const pool = mode === 'customOnly'
+        ? tierPool.custom
+        : mode === 'on'
+            ? [...tierPool.official, ...tierPool.custom]
+            : tierPool.official
 
-    return charts
-}
-
-/** Rebuilds the bucket lists of a tier from the sheets (run in the background when a room opens). */
-export async function refreshRankedBucket(bucket: R2Bucket, tier: RankedTier): Promise<void> {
-    const [official, custom] = await Promise.allSettled([
-        officialRankedSongs(tier),
-        customRankedSongs(tier),
-    ])
-
-    if (official.status === 'fulfilled') await writeList(bucket, officialKey(tier), official.value)
-    else console.error('[Ranked] Official refresh failed:', official.reason)
-
-    if (custom.status === 'fulfilled') await writeList(bucket, customKey(tier), custom.value)
-    else console.error('[Ranked] Custom refresh failed:', custom.reason)
-}
-
-/** Random song of the pool, avoiding `exclude` (the song just played) when possible. */
-export function pickFromPool<T extends { address: string; name: string }>(
-    pool: T[],
-    exclude?: { address: string; name: string } | null,
-): T | null {
     if (pool.length === 0) return null
-
-    const others = exclude
-        ? pool.filter((entry) => !(entry.address === exclude.address && entry.name === exclude.name))
-        : pool
-
-    const list = others.length > 0 ? others : pool
-
-    return list[Math.floor(Math.random() * list.length)]!
+    return pool[Math.floor(Math.random() * pool.length)]!
 }
