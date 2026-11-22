@@ -29,6 +29,25 @@ const message = (status: number, text: string) =>
 const addressOf = (req: Request, env: Env) =>
     (env.PUBLIC_ADDRESS ?? new URL(req.url).origin).replace(/\/+$/, '')
 
+function isAuthorizedRefresh(req: Request, url: URL, env: Env): boolean {
+    const anyEnv = env as Env & { REFRESH_SECRET?: string }
+    const expected = (anyEnv.REFRESH_SECRET || env.SESSION_SECRET || '').trim()
+    if (!expected) return false
+
+    const authHeader = req.headers.get('Authorization') ?? ''
+    const bearerToken = authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : ''
+
+    const provided = (
+        url.searchParams.get('key') ??
+        req.headers.get('x-refresh-key') ??
+        bearerToken
+    ).trim()
+
+    return provided.length > 0 && provided === expected
+}
+
 async function verifySigned(
     req: Request,
     env: Env,
@@ -532,6 +551,24 @@ export default {
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                 },
             })
+        }
+
+        if (path === '/admin/refresh' && (req.method === 'GET' || req.method === 'POST')) {
+            if (!isAuthorizedRefresh(req, url, env)) {
+                return message(401, 'Unauthorized')
+            }
+
+            try {
+                await refreshDailyAssets(env)
+                levelIndex = null
+                return json({
+                    ok: true,
+                    refreshedAt: new Date().toISOString(),
+                })
+            } catch (error) {
+                console.error('[Refresh] Failed to refresh R2 assets:', error)
+                return message(500, 'Failed to refresh R2 assets.')
+            }
         }
 
         const ws = path.match(/^\/ws\/([\w-]+)$/)
