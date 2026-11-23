@@ -20,7 +20,14 @@ import type { PostCategory, PostComment, StoredPost } from './lobby.ts'
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
 
-const CHAT_PFP_HANDLES = new Set(['163292', '283420', '3227470'])
+const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
+const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
+
+const CHAT_CARD_PROFILES: Record<string, { handle: string; name: string }> = {
+    '163292': { handle: '163292', name: 'AXX!A' },
+    '283420': { handle: '283420', name: 'Astra' },
+    '3227470': { handle: '3227470', name: 'Nocturne' },
+}
 
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
@@ -62,7 +69,7 @@ function formatAuthorTag(author: string | undefined, handle: string | undefined)
 
 function chatPfpPath(handle: string | undefined): string | null {
     const clean = String(handle ?? '').trim()
-    if (!CHAT_PFP_HANDLES.has(clean)) return null
+    if (!CHAT_PFP_HANDLE_SET.has(clean)) return null
     return `/api/chat/pfp/${encodeURIComponent(clean)}`
 }
 
@@ -127,6 +134,46 @@ async function sessionOf(
 ): Promise<AuthSession | null> {
     const token = extractSessionToken(req, url)
     return token ? verifyToken<AuthSession>(env.SESSION_SECRET, token) : null
+}
+
+function pickedProfile(handle?: string | null): UserProfile | null {
+    const clean = String(handle ?? '').trim()
+    if (!clean || !isStaffChatHandle(clean)) return null
+    const known = CHAT_CARD_PROFILES[clean]
+    return {
+        id: known ? known.handle : clean,
+        handle: clean,
+        name: known ? known.name : clean,
+    }
+}
+
+async function resolveChatUser(
+    req: Request,
+    env: Env,
+    url: URL,
+    body?: any,
+): Promise<{ user: UserProfile; fromSonolus: boolean; token: string } | null> {
+    const token = extractSessionToken(req, url) ?? ''
+    const session = token
+        ? await verifyToken<AuthSession>(env.SESSION_SECRET, token)
+        : null
+
+    if (session && isStaffChatHandle(session.user.handle)) {
+        return { user: session.user, fromSonolus: true, token }
+    }
+
+    const pickedHandle =
+        url.searchParams.get('handle') ??
+        req.headers.get('X-Chat-Handle') ??
+        body?.handle ??
+        null
+
+    const picked = pickedProfile(pickedHandle)
+    if (picked) {
+        return { user: picked, fromSonolus: false, token: '' }
+    }
+
+    return null
 }
 
 const roomStub = (env: Env, name: string) =>
@@ -389,10 +436,11 @@ function extractCommentText(values: URLSearchParams): string {
     return ''
 }
 
-function externalChatUrl(req: Request, env: Env, url: URL): string | null {
+function externalChatUrl(req: Request, env: Env, url: URL): string {
     const token = extractSessionToken(req, url)
-    if (!token) return null
-    return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
+    const base = `${addressOf(req, env)}/chat`
+    if (!token) return base
+    return `${base}?session=${encodeURIComponent(token)}`
 }
 
 function rawPostCategory(url: URL, req?: Request): string | null {
@@ -454,11 +502,24 @@ function escapeAttr(str: string): string {
         .replace(/>/g, '&gt;')
 }
 
-function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
+function renderStaffChatHtml(
+    user: UserProfile | null,
+    sessionToken: string,
+    fromSonolus: boolean,
+): string {
     const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
         (tag) =>
             `<button type="button" class="chip" data-shortcut="${escapeAttr(tag)}">${escapeAttr(tag)}</button>`,
     ).join('')
+
+    const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
+        const profile = CHAT_CARD_PROFILES[handle] ?? { handle, name: handle }
+        return `<button type="button" class="pick-card" data-pick-handle="${escapeAttr(handle)}">
+          <img class="pick-pfp" src="/api/chat/pfp/${escapeAttr(handle)}" alt="${escapeAttr(profile.name)}"/>
+          <span class="pick-name">${escapeAttr(profile.name)}</span>
+          <span class="pick-handle">#${escapeAttr(handle)}</span>
+        </button>`
+    }).join('')
 
     return `<!doctype html>
 <html lang="en">
@@ -469,8 +530,21 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
-  header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between}
+  header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .header-right{display:flex;align-items:center;gap:8px}
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
+  .switch-btn{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 8px;font-size:11px;cursor:pointer}
+  #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
+  #picker.open{display:flex}
+  .picker-title{font-size:18px;font-weight:700;text-align:center}
+  .picker-grid{display:grid;grid-template-columns:repeat(3,minmax(92px,130px));gap:14px}
+  .pick-card{background:#151922;border:1px solid #283042;border-radius:14px;padding:12px;display:flex;flex-direction:column;align-items:center;gap:8px;color:#f3f4f6;cursor:pointer}
+  .pick-card:hover{border-color:#3b82f6;background:#192131}
+  .pick-pfp{width:64px;height:64px;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
+  .pick-name{font-size:13px;font-weight:700;text-align:center}
+  .pick-handle{font-size:11px;color:#9ca3af}
+  #chatView{flex:1;display:none;flex-direction:column;min-height:0}
+  #chatView.open{display:flex}
   #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
   .row{display:flex;align-items:stretch;gap:8px;max-width:90%}
   .row.me{align-self:flex-end;flex-direction:row-reverse}
@@ -495,30 +569,58 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
 <body>
   <header>
     <span>${escapeAttr(SERVER_TITLE)} chat</span>
-    <span class="badge">${escapeAttr(formatAuthorTag(user.name, user.handle))}</span>
+    <div class="header-right">
+      <span id="userBadge" class="badge"></span>
+      <button id="switchBtn" type="button" class="switch-btn" style="display:none">Switch</button>
+    </div>
   </header>
-  <div id="messages"></div>
-  <div class="bottom-bar">
-    <div class="shortcuts">${shortcutsHtml}</div>
-    <form id="chatForm">
-      <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
-      <button type="submit">Send</button>
-    </form>
+  <div id="picker">
+    <div class="picker-title">Choose your handle</div>
+    <div class="picker-grid">${cardsHtml}</div>
+  </div>
+  <div id="chatView">
+    <div id="messages"></div>
+    <div class="bottom-bar">
+      <div class="shortcuts">${shortcutsHtml}</div>
+      <form id="chatForm">
+        <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
+        <button type="submit">Send</button>
+      </form>
+    </div>
   </div>
 <script>
-  const myHandle = ${JSON.stringify(user.handle)};
-  const sessionToken = ${JSON.stringify(sessionToken)};
+  const STORAGE_KEY = 'xx_chat_handle';
+  const sonolusUser = ${JSON.stringify(fromSonolus && user ? user : null)};
+  const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
+  const profiles = ${JSON.stringify(CHAT_CARD_PROFILES)};
   const pfpMap = ${JSON.stringify({
       '163292': '/api/chat/pfp/163292',
       '283420': '/api/chat/pfp/283420',
       '3227470': '/api/chat/pfp/3227470',
   })};
+
+  const pickerEl = document.getElementById('picker');
+  const chatViewEl = document.getElementById('chatView');
+  const badgeEl = document.getElementById('userBadge');
+  const switchBtn = document.getElementById('switchBtn');
   const box = document.getElementById('messages');
   const input = document.getElementById('chatInput');
 
+  function getActiveUser() {
+    if (sonolusUser) return sonolusUser;
+    const saved = (localStorage.getItem(STORAGE_KEY) || '').trim();
+    if (saved && profiles[saved]) return profiles[saved];
+    return null;
+  }
+
   function authHeaders(extra = {}) {
     const headers = { ...extra };
-    if (sessionToken) headers['Sonolus-Session'] = sessionToken;
+    if (sessionToken) {
+      headers['Sonolus-Session'] = sessionToken;
+    } else {
+      const active = getActiveUser();
+      if (active) headers['X-Chat-Handle'] = active.handle;
+    }
     return headers;
   }
 
@@ -552,6 +654,8 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
   }
 
   function render(messages) {
+    const active = getActiveUser();
+    const myHandle = active ? active.handle : '';
     box.innerHTML = (messages || []).map((m) => {
       const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       const mine = m.handle === myHandle ? 'me' : '';
@@ -569,6 +673,47 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     box.scrollTop = box.scrollHeight;
   }
 
+  async function loadMessages() {
+    const active = getActiveUser();
+    if (!active) return;
+    const res = await fetch('/api/chat', { headers: authHeaders() });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  }
+
+  function syncMode() {
+    const active = getActiveUser();
+    if (!active) {
+      badgeEl.textContent = 'Select handle';
+      switchBtn.style.display = 'none';
+      pickerEl.classList.add('open');
+      chatViewEl.classList.remove('open');
+      return;
+    }
+
+    badgeEl.textContent = formatTag(active.name, active.handle);
+    switchBtn.style.display = sonolusUser ? 'none' : 'inline-block';
+    pickerEl.classList.remove('open');
+    chatViewEl.classList.add('open');
+    loadMessages();
+  }
+
+  document.querySelectorAll('[data-pick-handle]').forEach((card) => {
+    card.addEventListener('click', () => {
+      const picked = card.getAttribute('data-pick-handle') || '';
+      if (!profiles[picked]) return;
+      localStorage.setItem(STORAGE_KEY, picked);
+      syncMode();
+    });
+  });
+
+  switchBtn.addEventListener('click', () => {
+    localStorage.removeItem(STORAGE_KEY);
+    syncMode();
+  });
+
   box.addEventListener('click', async (e) => {
     const delBtn = e.target.closest('[data-delete-id]');
     if (!delBtn) return;
@@ -584,23 +729,17 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     }
   });
 
-  async function loadMessages() {
-    const res = await fetch('/api/chat', { headers: authHeaders() });
-    if (res.ok) {
-      const data = await res.json();
-      render(data.messages || []);
-    }
-  }
-
   document.getElementById('chatForm').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const active = getActiveUser();
+    if (!active) return;
     const text = input.value.trim();
     if (!text) return;
     input.value = '';
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, handle: active.handle }),
     });
     if (res.ok) {
       const data = await res.json();
@@ -608,7 +747,7 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     }
   });
 
-  loadMessages();
+  syncMode();
   setInterval(loadMessages, 3500);
 </script>
 </body>
@@ -1107,7 +1246,7 @@ export default {
         const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
         if (pfpMatch && req.method === 'GET') {
             const handle = decodeURIComponent(pfpMatch[1]!).trim()
-            if (!CHAT_PFP_HANDLES.has(handle) || !env.COMMUNITY_BUCKET) {
+            if (!CHAT_PFP_HANDLE_SET.has(handle) || !env.COMMUNITY_BUCKET) {
                 return new Response(null, { status: 404 })
             }
 
@@ -1124,22 +1263,28 @@ export default {
         }
 
         if (path === '/chat' && req.method === 'GET') {
-            const token = url.searchParams.get('session') ?? ''
-            const session = token
-                ? await verifyToken<AuthSession>(env.SESSION_SECRET, token)
-                : null
-
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return html('<h1>403 Forbidden</h1><p>Chat is restricted.</p>', 403)
+            const resolved = await resolveChatUser(req, env, url)
+            if (resolved) {
+                return html(
+                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus),
+                )
             }
-
-            return html(renderStaffChatHtml(session.user, token))
+            return html(renderStaffChatHtml(null, '', false))
         }
 
         if (path === '/api/chat') {
-            const session = await sessionOf(req, env, url)
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return message(403, 'Chat is restricted.')
+            let body: any = null
+            if (req.method === 'POST') {
+                try {
+                    body = await req.json()
+                } catch {
+                    return message(400, 'Invalid JSON.')
+                }
+            }
+
+            const resolved = await resolveChatUser(req, env, url, body)
+            if (!resolved) {
+                return message(403, 'Choose a valid handle to use chat.')
             }
 
             if (req.method === 'GET') {
@@ -1148,13 +1293,6 @@ export default {
             }
 
             if (req.method === 'POST') {
-                let body: any
-                try {
-                    body = await req.json()
-                } catch {
-                    return message(400, 'Invalid JSON.')
-                }
-
                 if (body?.action === 'delete') {
                     await lobby(env).deleteChatMessage(
                         typeof body?.id === 'string' ? body.id : undefined,
@@ -1167,8 +1305,8 @@ export default {
                 if (!text) return message(400, 'Message cannot be empty.')
 
                 await lobby(env).addChatMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
+                    handle: resolved.user.handle,
+                    author: resolved.user.name || resolved.user.handle,
                     text: text.slice(0, 500),
                 })
 
