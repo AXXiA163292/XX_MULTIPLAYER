@@ -14,7 +14,7 @@ import {
 } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
-import type { AuthSession, Env, JoinSession, UserProfile } from './types.ts'
+import type { AuthSession, ChatMessage, Env, JoinSession, UserProfile } from './types.ts'
 
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
@@ -138,7 +138,15 @@ const chatCommentForm = {
     ],
 }
 
-function buildChatPostItem(latestMessage?: { text?: string } | null) {
+const deleteChatForm = {
+    type: 'deleteChat',
+    title: 'Delete chat',
+    icon: 'delete',
+    requireConfirmation: true,
+    options: [],
+}
+
+function buildChatPostItem(latestMessage?: ChatMessage | null) {
     const newestText = latestMessage?.text?.trim() || 'No messages yet.'
 
     return {
@@ -149,8 +157,14 @@ function buildChatPostItem(latestMessage?: { text?: string } | null) {
         time: 0,
         author: SERVER_TITLE,
         tags: [],
-        actions: [chatCommentForm],
+        actions: [chatCommentForm, deleteChatForm],
     }
+}
+
+function formatChatDetailDescription(messages: ChatMessage[], extUrl: string | null): string {
+    const recent = messages.slice(-15).map((m) => `${m.author} (${m.handle}): ${m.text}`)
+    const logBlock = recent.length ? recent.join('\n') : 'No messages yet.'
+    return extUrl ? `${logBlock}\n\nExternal chat:\n${extUrl}` : logBlock
 }
 
 function externalChatUrl(req: Request, env: Env, url: URL): string | null {
@@ -195,7 +209,9 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
   #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
   .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;max-width:85%}
   .msg.me{align-self:flex-end;background:#1d2b45;border-color:#3b82f6}
-  .meta{font-size:11px;color:#9ca3af;margin-bottom:3px}
+  .meta{font-size:11px;color:#9ca3af;margin-bottom:3px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .del-btn:hover{background:rgba(248,113,113,.15)}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
   .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
   .shortcuts{display:flex;gap:8px;flex-wrap:wrap}
@@ -260,12 +276,28 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
       const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       const mine = m.handle === myHandle ? 'me' : '';
       return '<div class="msg ' + mine + '">' +
-        '<div class="meta">' + escapeHtml(m.author) + ' (' + escapeHtml(m.handle) + ') · ' + escapeHtml(time) + '</div>' +
+        '<div class="meta"><span>' + escapeHtml(m.author) + ' (' + escapeHtml(m.handle) + ') · ' + escapeHtml(time) + '</span>' +
+        '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button></div>' +
         '<div class="text">' + escapeHtml(m.text) + '</div>' +
       '</div>';
     }).join('');
     box.scrollTop = box.scrollHeight;
   }
+
+  box.addEventListener('click', async (e) => {
+    const target = e.target.closest('[data-delete-id]');
+    if (!target) return;
+    const id = target.getAttribute('data-delete-id');
+    if (!id) return;
+    const res = await fetch('/api/chat?id=' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  });
 
   async function loadMessages() {
     const res = await fetch('/api/chat', { headers: authHeaders() });
@@ -755,7 +787,7 @@ export default {
                 headers: {
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Headers': '*',
-                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
                 },
             })
         }
@@ -801,6 +833,14 @@ export default {
                     return message(400, 'Invalid JSON.')
                 }
 
+                if (body?.action === 'delete') {
+                    await lobby(env).deleteChatMessage(
+                        typeof body?.id === 'string' ? body.id : undefined,
+                    )
+                    const messages = await lobby(env).listChatMessages().catch(() => [])
+                    return json({ ok: true, messages })
+                }
+
                 const text = typeof body?.text === 'string' ? body.text.trim() : ''
                 if (!text) return message(400, 'Message cannot be empty.')
 
@@ -810,6 +850,13 @@ export default {
                     text: text.slice(0, 500),
                 })
 
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json({ ok: true, messages })
+            }
+
+            if (req.method === 'DELETE') {
+                const id = url.searchParams.get('id') ?? undefined
+                await lobby(env).deleteChatMessage(id)
                 const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({ ok: true, messages })
             }
@@ -1096,6 +1143,11 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
+                if (actionType === 'deleteChat') {
+                    await lobby(env).deleteChatMessage()
+                    return json({ shouldUpdatePosts: true })
+                }
+
                 const text = (values.get('text') ?? '').trim()
                 if (!text) {
                     return message(400, 'Message cannot be empty.')
@@ -1111,7 +1163,7 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                return json({})
+                return json({ shouldUpdatePosts: true })
             }
 
             if (!canManagePosts(session)) {
@@ -1252,8 +1304,8 @@ export default {
 
                 return json({
                     item: buildChatPostItem(latest),
-                    description: extUrl ? `External chat:\n${extUrl}` : '',
-                    actions: [chatCommentForm],
+                    description: formatChatDetailDescription(messages, extUrl),
+                    actions: [chatCommentForm, deleteChatForm],
                     hasCommunity: false,
                     leaderboards: [],
                     sections: [],
