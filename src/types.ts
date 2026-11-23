@@ -1,19 +1,36 @@
-export interface Env {
-    ROOM: DurableObjectNamespace<import('./room.ts').Room>
-    LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
-    POSTS_BUCKET: R2Bucket
-    SESSION_SECRET: string
-    HOST_HANDLE: string
-    PUBLIC_ADDRESS?: string
-    DEV_SKIP_SIGNATURE?: string
+import type { Lobby } from './lobby.ts'
+import type { Room } from './room.ts'
+
+export interface UserProfile {
+    id: string
+    handle: string
+    name: string
 }
 
-export type Sil = {
+export interface AuthSession {
+    user: UserProfile
+    exp: number
+}
+
+export interface JoinSession {
+    room: string
+    user: UserProfile
+    roomUser: {
+        authentication: string
+        signature: string
+    }
+    exp: number
+}
+
+export interface Sil {
     address: string
     name: string
 }
 
-export type GameplayResult = {
+export type RoomStatus = 'selecting' | 'preparing' | 'playing'
+export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
+
+export interface GameplayResult {
     grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
     disqualified?: boolean
     arcadeScore: number
@@ -26,31 +43,21 @@ export type GameplayResult = {
     totalCount: number
 }
 
-export type UserProfile = {
+export interface ChatMessage {
     id: string
     handle: string
-    name: string
+    author: string
+    text: string
+    time: number
 }
 
-export type RoomUser = {
-    id?: string
-    name?: string
-    handle?: string
-    authentication: string
-    signature: string
-}
-
-export type RoomStatus = 'selecting' | 'preparing' | 'playing'
-export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
-
-export type JoinSession = {
-    room: string
-    user: UserProfile
-    roomUser: RoomUser
-    exp: number
-}
-
-export type AuthSession = {
-    user: UserProfile
-    exp: number
+export interface Env {
+    LOBBY: DurableObjectNamespace<Lobby>
+    ROOM: DurableObjectNamespace<Room>
+    POSTS_BUCKET: R2Bucket
+    SESSION_SECRET: string
+    PUBLIC_ADDRESS?: string
+    DEV_SKIP_SIGNATURE?: string
+    RESEND_API_KEY?: string
+    CHAT_EMAIL_FROM?: string
 }
