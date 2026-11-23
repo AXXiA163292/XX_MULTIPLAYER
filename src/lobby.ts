@@ -9,6 +9,7 @@ export type LobbyRoom = {
     subtitle: string
     master: string
     hostId?: string
+    hostHandle?: string
     visibility?: 'public' | 'private' | 'locked'
 }
 
@@ -104,34 +105,40 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async addChatMessage(msg: Omit<ChatMessage, 'id' | 'time'>): Promise<ChatMessage[]> {
+        const handle = String(msg.handle).trim()
         const current = await this.listChatMessages()
         const entry: ChatMessage = {
             id: crypto.randomUUID(),
-            handle: msg.handle,
-            author: msg.author,
-            text: msg.text.slice(0, 500),
+            handle,
+            author: String(msg.author || handle).trim(),
+            text: String(msg.text).slice(0, 500),
             time: Date.now(),
         }
 
         const updated = [...current.slice(-99), entry]
         await this.ctx.storage.put('staff_chat_messages', updated)
-        await this.markChatRead(msg.handle, entry.time)
+        await this.markChatRead(handle, entry.time)
         return updated
     }
 
     async markChatRead(handle: string, timestamp = Date.now()): Promise<void> {
+        const cleanHandle = String(handle).trim()
+        if (!cleanHandle) return
         const reads = (await this.ctx.storage.get<Record<string, number>>('staff_chat_reads')) ?? {}
-        reads[handle] = timestamp
+        reads[cleanHandle] = Math.max(reads[cleanHandle] ?? 0, timestamp)
         await this.ctx.storage.put('staff_chat_reads', reads)
     }
 
     async getChatUnreadCount(handle: string): Promise<number> {
+        const cleanHandle = String(handle).trim()
+        if (!cleanHandle) return 0
+
         const [messages, reads] = await Promise.all([
             this.listChatMessages(),
             this.ctx.storage.get<Record<string, number>>('staff_chat_reads'),
         ])
 
-        const lastRead = reads?.[handle] ?? 0
-        return messages.filter((m) => m.handle !== handle && m.time > lastRead).length
+        const lastRead = reads?.[cleanHandle] ?? 0
+        return messages.filter((m) => m.handle !== cleanHandle && m.time > lastRead).length
     }
 }
