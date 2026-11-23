@@ -222,7 +222,7 @@ export function parseSettings(
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
 
     const type = p.get('type') || existing?.type || DEFAULT_TYPE
-    if (!(type in ROOM_TYPES)) return null
+    if (!Object.prototype.hasOwnProperty.call(ROOM_TYPES, type)) return null
 
     const open = isOpenType(type as RoomType)
     const scoring = p.get('scoring') || existing?.scoring || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
@@ -250,7 +250,7 @@ export function parseSettings(
         ? normalizeCustomSongsMode(p.get('customSongs') ?? existing?.customSongs)
         : 'off'
 
-    if (!(scoring in SCORING_MODES)) return null
+    if (!Object.prototype.hasOwnProperty.call(SCORING_MODES, scoring)) return null
     if (type === 'groupStage' && group.length > 24) return null
     if (title.length > 48) return null
 
