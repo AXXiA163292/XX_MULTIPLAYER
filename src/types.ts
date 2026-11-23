@@ -33,6 +33,9 @@ export type UserProfile = {
 }
 
 export type RoomUser = {
+    id?: string
+    name?: string
+    handle?: string
     authentication: string
     signature: string
 }
