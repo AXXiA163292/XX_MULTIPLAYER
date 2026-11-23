@@ -3,6 +3,7 @@ export const SERVER_DESCRIPTION = 'XX! Sonolus multiplayer server'
 
 export const TOURNAMENT_HOST_HANDLE = '163292'
 export const STAFF_CHAT_HANDLES = ['163292', '283420', '3227470'] as const
+export const STAFF_CHAT_SHORTCUTS = ['@Bell', '@Noct', '@Ʌstra'] as const
 export const STAFF_CHAT_URL =
     'https://discord.com/channels/1436062333817626835/1436063195462152263'
 export const STAFF_CHAT_ALERT_EMAIL = 'axxia163292@gmail.com'
