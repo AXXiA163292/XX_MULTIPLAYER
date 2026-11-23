@@ -105,7 +105,7 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
                 Accept: 'text/csv,text/plain,*/*',
                 'Cache-Control': 'no-cache',
             },
-            signal: AbortSignal.timeout(20000),
+            signal: AbortSignal.timeout(90000),
             cache: 'no-store',
         })
 
