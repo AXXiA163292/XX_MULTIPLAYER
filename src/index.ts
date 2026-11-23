@@ -360,7 +360,6 @@ function resolveCategory(
     const bodyValueParams = parseEncodedParams(body?.values)
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
-    // Prioritize explicit category / infoType before generic type so "post" doesn't override them.
     const candidates: (string | null | undefined)[] = [
         urlSearchParams?.get('category'),
         bodySearchParams?.get('category'),
@@ -526,6 +525,10 @@ function canDeleteComment(session: AuthSession | null, authorHandle: string): bo
     return session.user.handle === authorHandle || session.user.handle === TOURNAMENT_HOST_HANDLE
 }
 
+function canDeleteChatMessage(actorHandle: string, authorHandle: string): boolean {
+    return actorHandle === authorHandle || actorHandle === TOURNAMENT_HOST_HANDLE
+}
+
 function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
     const latest = messages[messages.length - 1] ?? null
     const pinnedMsg = pinnedId ? messages.find((m) => m.id === pinnedId) ?? null : null
@@ -599,7 +602,6 @@ function externalChatUrl(req: Request, env: Env, url: URL): string {
 function rawPostCategory(url: URL, req?: Request): string | null {
     const searchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
-    // Check category and infoType before generic type so chat/announcements/results aren't misread as posts.
     const fromCategory =
         searchParams?.get('category') ??
         url.searchParams.get('category')
@@ -685,7 +687,7 @@ function renderStaffChatHtml(
 <link rel="manifest" href="/manifest.webmanifest"/>
 <link rel="icon" type="image/png" href="/app-icon.png"/>
 <link rel="apple-touch-icon" href="/app-icon.png"/>
-<title>${escapeAttr(SERVER_TITLE)} · Chat</title>
+<title>XX!</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
@@ -746,16 +748,15 @@ function renderStaffChatHtml(
   <header>
     <div class="header-brand">
       <img class="app-logo" src="/app-icon.png" alt="XX!"/>
-      <span>${escapeAttr(SERVER_TITLE)} · Chat</span>
+      <span>XX!</span>
     </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
       <button id="settingsBtn" type="button" class="btn-sm" style="display:none">Settings</button>
-      <button id="switchBtn" type="button" class="btn-sm" style="display:none">Switch</button>
     </div>
   </header>
   <div id="picker">
-    <div class="picker-title">Choose your handle</div>
+    <div class="picker-title">Hi!, who are you?</div>
     <div class="picker-grid">${cardsHtml}</div>
   </div>
   <div id="chatView">
@@ -799,6 +800,7 @@ function renderStaffChatHtml(
 <script>
   const STORAGE_KEY = 'xx_chat_handle';
   const COOKIE_NAME = ${JSON.stringify(CHAT_HANDLE_COOKIE)};
+  const HOST_HANDLE = ${JSON.stringify(TOURNAMENT_HOST_HANDLE)};
   const knownHandles = ${JSON.stringify([...CHAT_PFP_HANDLES])};
   const sonolusUser = ${JSON.stringify(fromSonolus && user ? user : null)};
   const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
@@ -809,7 +811,6 @@ function renderStaffChatHtml(
   const chatViewEl = document.getElementById('chatView');
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
-  const switchBtn = document.getElementById('switchBtn');
   const box = document.getElementById('messages');
   const shortcutsBar = document.getElementById('shortcutsBar');
   const input = document.getElementById('chatInput');
@@ -962,9 +963,13 @@ function renderStaffChatHtml(
     box.innerHTML = list.map((m) => {
       const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       const mine = m.handle === myHandle ? 'me' : '';
+      const canDelete = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
       const pfpImg = '<img class="pfp" src="' + escapeHtml(pfpUrlFor(m.handle)) + '" alt=""/>';
       const replyHtml = m.replyTo
         ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.author || m.replyTo.handle || '') + ': ' + escapeHtml(m.replyTo.text || '') + '</div>'
+        : '';
+      const delHtml = canDelete
+        ? '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>'
         : '';
       return '<div class="row ' + mine + '">' +
         pfpImg +
@@ -972,7 +977,7 @@ function renderStaffChatHtml(
           '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
-            '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>' +
+            delHtml +
           '</span></div>' +
           replyHtml +
           '<div class="text">' + escapeHtml(m.text) + '</div>' +
@@ -1002,7 +1007,6 @@ function renderStaffChatHtml(
     if (!active) {
       badgeEl.textContent = 'Select handle';
       settingsBtn.style.display = 'none';
-      switchBtn.style.display = 'none';
       pickerEl.classList.add('open');
       chatViewEl.classList.remove('open');
       return;
@@ -1010,7 +1014,6 @@ function renderStaffChatHtml(
 
     badgeEl.textContent = formatTag(active.name, active.handle);
     settingsBtn.style.display = 'inline-block';
-    switchBtn.style.display = sonolusUser ? 'none' : 'inline-block';
     pickerEl.classList.remove('open');
     chatViewEl.classList.add('open');
     renderKnownUserChips();
@@ -1145,12 +1148,6 @@ function renderStaffChatHtml(
       persistHandle(picked);
       syncMode();
     });
-  });
-
-  switchBtn.addEventListener('click', () => {
-    persistHandle('');
-    setReplyTarget(null);
-    syncMode();
   });
 
   box.addEventListener('click', async (e) => {
@@ -1689,8 +1686,8 @@ export default {
 
         if (path === '/manifest.webmanifest' && req.method === 'GET') {
             return new Response(JSON.stringify({
-                name: `${SERVER_TITLE} Chat`,
-                short_name: 'XX! Chat',
+                name: 'XX!',
+                short_name: 'XX!',
                 start_url: '/chat',
                 scope: '/',
                 display: 'standalone',
@@ -1912,12 +1909,8 @@ self.addEventListener('fetch', (event) => {
                     const targetId = typeof body?.id === 'string' ? body.id : undefined
                     const messages = await lobby(env).listChatMessages().catch(() => [])
                     const target = targetId ? messages.find((m) => m.id === targetId) : undefined
-                    if (
-                        target &&
-                        resolved.user.handle !== target.handle &&
-                        resolved.user.handle !== TOURNAMENT_HOST_HANDLE
-                    ) {
-                        return message(403, 'You cannot delete this message.')
+                    if (target && !canDeleteChatMessage(resolved.user.handle, target.handle)) {
+                        return message(403, 'Only 163292 can delete messages from other members.')
                     }
                     await lobby(env).deleteChatMessage(targetId)
                     const updated = await lobby(env).listChatMessages().catch(() => [])
@@ -1952,12 +1945,8 @@ self.addEventListener('fetch', (event) => {
                 if (id) {
                     const messages = await lobby(env).listChatMessages().catch(() => [])
                     const target = messages.find((m) => m.id === id)
-                    if (
-                        target &&
-                        resolved.user.handle !== target.handle &&
-                        resolved.user.handle !== TOURNAMENT_HOST_HANDLE
-                    ) {
-                        return message(403, 'You cannot delete this message.')
+                    if (target && !canDeleteChatMessage(resolved.user.handle, target.handle)) {
+                        return message(403, 'Only 163292 can delete messages from other members.')
                     }
                 }
                 await lobby(env).deleteChatMessage(id)
