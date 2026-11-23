@@ -189,6 +189,23 @@ function compareIdDescending(a: SheetChart, b: SheetChart): number {
     })
 }
 
+function findConstantColumn(headers: string[]): number {
+    const exact = headers.indexOf('constant')
+    if (exact >= 0) return exact
+
+    return headers.findIndex((h) =>
+        ['constant', 'const', 'song constant', 'chart constant', 'cc'].includes(h),
+    )
+}
+
+function parseConstantValue(raw: string): number | null {
+    const cleaned = normalizeId(raw).replace(',', '.')
+    if (!cleaned) return null
+    const num = Number(cleaned)
+    if (!Number.isFinite(num) || num <= 0) return null
+    return Math.round(num * 10) / 10
+}
+
 function parseCustomRows(values: string[][]): Row[] {
     const headerIndex = values.findIndex((row) => {
         const headers = row.map((cell) => normalizeId(cell).toLowerCase())
@@ -214,7 +231,7 @@ function parseCustomRows(values: string[][]): Row[] {
     const rankedIndex = col('ranked')
     const playLevelIndex = col('playlevel')
     const difficultyIndex = col('difficulty')
-    const constantIndex = col('constant')
+    const constantIndex = findConstantColumn(headers)
 
     return values
         .slice(headerIndex + 1)
@@ -306,9 +323,9 @@ function buildConstantsMap(rows: Row[]): Record<string, number> {
     const map: Record<string, number> = {}
     for (const row of rows) {
         const cleanInput = stripTrailingSlash(row.input)
-        const val = Number(row.constant)
-        if (cleanInput && Number.isFinite(val) && val > 0) {
-            map[cleanInput] = Math.round(val * 10) / 10
+        const val = parseConstantValue(row.constant)
+        if (cleanInput && val !== null) {
+            map[cleanInput] = val
         }
     }
     return map
@@ -523,7 +540,7 @@ export function clearSheetCache(): void {
 }
 
 export const RANKED_TIERS = {
-    master:   { main: [30, 37] as const, append: [28, 99] as const },
+    master:   { main: [30, 37] as const, append: [28, 39] as const },
     diamond:  { main: [29, 32] as const, append: [27, 30] as const },
     platinum: { main: [28, 31] as const, append: null },
     gold:     { main: [26, 30] as const, append: null },
@@ -534,10 +551,10 @@ export const RANKED_TIERS = {
 
 export type RankedTier = keyof typeof RANKED_TIERS
 
-const OFFICIAL_DIFFS = ['ez', 'nm', 'hr', 'ex', 'ms', 'ap'] as const
+const OFFICIAL_DIFFS = ['hr', 'ex', 'ms', 'ap'] as const
 
 function inRange(level: number, range: readonly [number, number] | null): boolean {
-    return !!range && level >= range[0] && level <= range[1]
+    return !!range && level >= Math.max(18, range[0]) && level <= Math.min(39, range[1])
 }
 
 function officialRankedPoolFromSheet(
@@ -586,7 +603,7 @@ function buildAllCustomRanked(rows: Row[]): RankedCustomChart[] {
         if (!isPublicLevel(row)) continue
 
         const playLevel = Number(row.playLevel)
-        if (!Number.isFinite(playLevel)) continue
+        if (!Number.isFinite(playLevel) || playLevel < 18 || playLevel > 39) continue
 
         const chart = chartFromUrl(row.id, row.input)
         if (!chart) continue
