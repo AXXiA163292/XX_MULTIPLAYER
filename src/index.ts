@@ -340,6 +340,18 @@ export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
         const url = new URL(request.url)
 
+        if (url.pathname === '/') {
+            return Response.json({
+                ok: true,
+                server: SERVER_TITLE,
+                sonolusInfo: `${url.origin}/sonolus/info`,
+                levelsList: `${url.origin}/sonolus/levels/list`,
+                roomsList: `${url.origin}/sonolus/rooms/list`,
+                postsList: `${url.origin}/sonolus/posts/list`,
+                refresh: `${url.origin}/admin/refresh`,
+            })
+        }
+
         if (url.pathname === '/refresh' || url.pathname === '/admin/refresh') {
             if (!env.POSTS_BUCKET) {
                 return Response.json(
@@ -459,6 +471,7 @@ export default {
             return Response.json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
+                buttons: [],
                 configuration: {
                     options: [],
                 },
