@@ -471,12 +471,14 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
   header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between}
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
-  #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
-  .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;max-width:85%}
-  .msg.me{align-self:flex-end;background:#1d2b45;border-color:#3b82f6}
+  #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+  .row{display:flex;align-items:stretch;gap:8px;max-width:90%}
+  .row.me{align-self:flex-end;flex-direction:row-reverse}
+  .row:not(.me){align-self:flex-start}
+  .pfp{width:46px;min-width:46px;align-self:stretch;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
+  .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;flex:1;min-width:0}
+  .row.me .msg{background:#1d2b45;border-color:#3b82f6}
   .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
-  .author-wrap{display:inline-flex;align-items:center;gap:6px}
-  .pfp{width:16px;height:16px;border-radius:4px;object-fit:cover;image-rendering:pixelated;display:inline-block}
   .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .del-btn:hover{background:rgba(248,113,113,.15)}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
@@ -555,10 +557,13 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
       const mine = m.handle === myHandle ? 'me' : '';
       const pfpUrl = pfpMap[String(m.handle || '').trim()];
       const pfpImg = pfpUrl ? '<img class="pfp" src="' + escapeHtml(pfpUrl) + '" alt=""/>' : '';
-      return '<div class="msg ' + mine + '">' +
-        '<div class="meta"><span class="author-wrap">' + pfpImg + '<span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span></span>' +
-        '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button></div>' +
-        '<div class="text">' + escapeHtml(m.text) + '</div>' +
+      return '<div class="row ' + mine + '">' +
+        pfpImg +
+        '<div class="msg">' +
+          '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
+          '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button></div>' +
+          '<div class="text">' + escapeHtml(m.text) + '</div>' +
+        '</div>' +
       '</div>';
     }).join('');
     box.scrollTop = box.scrollHeight;
@@ -1865,16 +1870,10 @@ export default {
                     lobby(env).getPinnedChatId().catch(() => null),
                 ])
                 const extUrl = externalChatUrl(req, env, url)
-                const pfpLinks = [...CHAT_PFP_HANDLES]
-                    .map((h) => `${addressOf(req, env)}${chatPfpPath(h)}`)
-                    .join('\n')
 
                 return json({
                     item: buildChatPostItem(messages, pinnedId),
-                    description: [
-                        extUrl ? `External chat:\n${extUrl}` : '',
-                        pfpLinks ? `Chat PFPs:\n${pfpLinks}` : '',
-                    ].filter(Boolean).join('\n\n'),
+                    description: extUrl ? `External chat:\n${extUrl}` : '',
                     actions: [],
                     hasCommunity: true,
                     leaderboards: [],
