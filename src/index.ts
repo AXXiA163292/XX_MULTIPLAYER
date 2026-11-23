@@ -688,7 +688,6 @@ function renderStaffChatHtml(
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
   .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}
   .btn-sm:hover{border-color:#3b82f6}
-  .btn-sm:disabled{opacity:.55;cursor:default}
   .btn-danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
   #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
   #picker.open{display:flex}
@@ -747,7 +746,6 @@ function renderStaffChatHtml(
     <div class="header-brand">
       <img class="app-logo" src="/app-icon.png" alt="XX!"/>
       <span>XX! Chat</span>
-      <button id="loadChatsBtn" type="button" class="btn-sm">Load chats</button>
     </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
@@ -814,7 +812,6 @@ function renderStaffChatHtml(
   const chatViewEl = document.getElementById('chatView');
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
-  const loadChatsBtn = document.getElementById('loadChatsBtn');
   const logoutBtn = document.getElementById('logoutBtn');
   const box = document.getElementById('messages');
   const shortcutsBar = document.getElementById('shortcutsBar');
@@ -834,6 +831,7 @@ function renderStaffChatHtml(
   let loggedOut = false;
   let activeReply = null;
   let currentMessages = [];
+  let hasLoadedOnce = false;
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
 
   function readSavedHandle() {
@@ -1027,7 +1025,9 @@ function renderStaffChatHtml(
   async function loadMessages() {
     const active = getActiveUser();
     if (!active) return;
-    loadChatsBtn.disabled = true;
+    if (!hasLoadedOnce) {
+      box.innerHTML = '<div class="empty-state">Loading messages...</div>';
+    }
     try {
       const qs = 'handle=' + encodeURIComponent(active.handle) + '&t=' + Date.now();
       const res = await fetch('/api/chat?' + qs, {
@@ -1041,18 +1041,15 @@ function renderStaffChatHtml(
         Object.assign(prefsMap, data.prefs);
         renderKnownUserChips();
       }
+      hasLoadedOnce = true;
       render(Array.isArray(data.messages) ? data.messages : []);
     } catch (error) {
       console.error('Could not load chat messages:', error);
-      box.innerHTML = '<div class="empty-state">Could not load messages. Try again.</div>';
-    } finally {
-      loadChatsBtn.disabled = false;
+      if (!hasLoadedOnce) {
+        box.innerHTML = '<div class="empty-state">Could not load messages.</div>';
+      }
     }
   }
-
-  loadChatsBtn.addEventListener('click', () => {
-    void loadMessages();
-  });
 
   function syncMode() {
     const active = getActiveUser();
@@ -1074,6 +1071,7 @@ function renderStaffChatHtml(
 
   logoutBtn.addEventListener('click', () => {
     loggedOut = true;
+    hasLoadedOnce = false;
     persistHandle('');
     currentMessages = [];
     render([]);
@@ -1081,6 +1079,21 @@ function renderStaffChatHtml(
     settingsModal.classList.remove('open');
     syncMode();
   });
+
+  async function toggleLikeMessage(id) {
+    const active = getActiveUser();
+    if (!active || !id) return;
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'same-origin',
+      body: JSON.stringify({ action: 'like', id, handle: active.handle }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  }
 
   function updateCropTransform() {
     if (!cropState.loaded) return;
@@ -1209,6 +1222,7 @@ function renderStaffChatHtml(
       const picked = card.getAttribute('data-pick-handle') || '';
       if (!defaultsMap[picked]) return;
       loggedOut = false;
+      hasLoadedOnce = false;
       persistHandle(picked);
       syncMode();
     });
@@ -1217,6 +1231,8 @@ function renderStaffChatHtml(
   let swipeRow = null;
   let swipeStartX = 0;
   let swipeDeltaX = 0;
+  let lastTapId = '';
+  let lastTapAt = 0;
 
   box.addEventListener('touchstart', (e) => {
     const row = e.target.closest('[data-row-id]');
@@ -1248,6 +1264,13 @@ function renderStaffChatHtml(
     }
   });
 
+  box.addEventListener('dblclick', async (e) => {
+    const msgEl = e.target.closest('[data-msg-id]');
+    if (!msgEl) return;
+    const id = msgEl.getAttribute('data-msg-id');
+    if (id) await toggleLikeMessage(id);
+  });
+
   box.addEventListener('click', async (e) => {
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
@@ -1269,6 +1292,21 @@ function renderStaffChatHtml(
       if (res.ok) {
         const data = await res.json();
         render(data.messages || []);
+      }
+      return;
+    }
+
+    const msgEl = e.target.closest('[data-msg-id]');
+    if (msgEl) {
+      const id = msgEl.getAttribute('data-msg-id') || '';
+      const now = Date.now();
+      if (id && id === lastTapId && now - lastTapAt < 320) {
+        lastTapId = '';
+        lastTapAt = 0;
+        await toggleLikeMessage(id);
+      } else {
+        lastTapId = id;
+        lastTapAt = now;
       }
     }
   });
