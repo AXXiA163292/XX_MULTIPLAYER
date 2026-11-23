@@ -23,10 +23,17 @@ export { Lobby } from './lobby.ts'
 const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
 const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
 
-const CHAT_CARD_PROFILES: Record<string, { handle: string; name: string }> = {
+const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = {
     '163292': { handle: '163292', name: 'AXX!A' },
     '283420': { handle: '283420', name: 'Astra' },
     '3227470': { handle: '3227470', name: 'Nocturne' },
+}
+
+type UserChatPrefs = {
+    handle: string
+    displayName: string
+    pfpKey?: string
+    updatedAt: number
 }
 
 const json = (data: unknown, status = 200) =>
@@ -60,6 +67,12 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
 
+function defaultDisplayName(handle: string, fallbackName?: string): string {
+    const cleanHandle = String(handle ?? '').trim()
+    const cleanFallback = String(fallbackName ?? '').trim()
+    return cleanFallback || DEFAULT_CHAT_PROFILES[cleanHandle]?.name || cleanHandle
+}
+
 function formatAuthorTag(author: string | undefined, handle: string | undefined): string {
     const cleanHandle = String(handle ?? '').trim()
     const cleanAuthor = String(author ?? '').trim() || cleanHandle
@@ -67,10 +80,56 @@ function formatAuthorTag(author: string | undefined, handle: string | undefined)
     return `${cleanAuthor}#${cleanHandle}`
 }
 
-function chatPfpPath(handle: string | undefined): string | null {
+async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
-    if (!CHAT_PFP_HANDLE_SET.has(clean)) return null
-    return `/api/chat/pfp/${encodeURIComponent(clean)}`
+    const fallback: UserChatPrefs = {
+        handle: clean,
+        displayName: defaultDisplayName(clean),
+        updatedAt: 0,
+    }
+
+    if (!clean || !env.COMMUNITY_BUCKET) return fallback
+
+    try {
+        const obj = await env.COMMUNITY_BUCKET.get(`chat/users/${clean}.json`)
+        if (!obj) return fallback
+        const parsed = await obj.json() as Partial<UserChatPrefs>
+        const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
+        return {
+            handle: clean,
+            displayName: displayName || fallback.displayName,
+            pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
+            updatedAt: Number(parsed?.updatedAt) || 0,
+        }
+    } catch {
+        return fallback
+    }
+}
+
+async function saveUserChatPrefs(
+    env: Env,
+    handle: string,
+    displayName: string,
+    pfpKey?: string,
+): Promise<UserChatPrefs> {
+    const clean = String(handle ?? '').trim()
+    const current = await getUserChatPrefs(env, clean)
+    const next: UserChatPrefs = {
+        handle: clean,
+        displayName: String(displayName ?? '').trim().slice(0, 40) || current.displayName,
+        pfpKey: pfpKey ?? current.pfpKey,
+        updatedAt: Date.now(),
+    }
+
+    if (env.COMMUNITY_BUCKET) {
+        await env.COMMUNITY_BUCKET.put(
+            `chat/users/${clean}.json`,
+            JSON.stringify(next),
+            { httpMetadata: { contentType: 'application/json' } },
+        )
+    }
+
+    return next
 }
 
 async function verifySigned(
@@ -139,7 +198,7 @@ async function sessionOf(
 function pickedProfile(handle?: string | null): UserProfile | null {
     const clean = String(handle ?? '').trim()
     if (!clean || !isStaffChatHandle(clean)) return null
-    const known = CHAT_CARD_PROFILES[clean]
+    const known = DEFAULT_CHAT_PROFILES[clean]
     return {
         id: known ? known.handle : clean,
         handle: clean,
@@ -159,7 +218,15 @@ async function resolveChatUser(
         : null
 
     if (session && isStaffChatHandle(session.user.handle)) {
-        return { user: session.user, fromSonolus: true, token }
+        const prefs = await getUserChatPrefs(env, session.user.handle)
+        return {
+            user: {
+                ...session.user,
+                name: prefs.displayName || defaultDisplayName(session.user.handle, session.user.name),
+            },
+            fromSonolus: true,
+            token,
+        }
     }
 
     const pickedHandle =
@@ -170,7 +237,15 @@ async function resolveChatUser(
 
     const picked = pickedProfile(pickedHandle)
     if (picked) {
-        return { user: picked, fromSonolus: false, token: '' }
+        const prefs = await getUserChatPrefs(env, picked.handle)
+        return {
+            user: {
+                ...picked,
+                name: prefs.displayName || picked.name,
+            },
+            fromSonolus: false,
+            token: '',
+        }
     }
 
     return null
@@ -207,6 +282,39 @@ const POST_LABELS: Record<PostCategory, {
         bodyPlaceholder: 'Write the results...',
     },
 }
+
+const POST_SEARCHES = [
+    {
+        type: 'search',
+        title: 'Search',
+        icon: 'search',
+        requireConfirmation: false,
+        options: [
+            {
+                query: 'category',
+                name: 'Category',
+                required: false,
+                type: 'select',
+                def: 'posts',
+                values: [
+                    { name: 'announcements', title: 'Announcements' },
+                    { name: 'posts', title: 'Posts' },
+                    { name: 'results', title: 'Results' },
+                ],
+            },
+            {
+                query: 'keywords',
+                name: 'Keywords',
+                required: false,
+                type: 'text',
+                def: '',
+                placeholder: 'Search title, body, or author...',
+                limit: 100,
+                shortcuts: [],
+            },
+        ],
+    },
+]
 
 function parseCategoryString(raw: string | null | undefined): PostCategory | null {
     if (!raw) return null
@@ -288,6 +396,34 @@ function resolveCategory(
     }
 
     return null
+}
+
+function resolveKeywords(url: URL, req?: Request): string {
+    const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
+    const direct =
+        urlSearchParams?.get('keywords') ??
+        url.searchParams.get('keywords') ??
+        url.searchParams.get('query') ??
+        ''
+    if (direct.trim()) return direct.trim().toLowerCase()
+
+    const referer = req?.headers.get('Referer')
+    if (referer) {
+        try {
+            const refUrl = new URL(referer)
+            const refSearchParams = parseEncodedParams(refUrl.searchParams.get('searchValues'))
+            const fromRef =
+                refSearchParams?.get('keywords') ??
+                refUrl.searchParams.get('keywords') ??
+                refUrl.searchParams.get('query') ??
+                ''
+            if (fromRef.trim()) return fromRef.trim().toLowerCase()
+        } catch {
+            // ignore invalid referer
+        }
+    }
+
+    return ''
 }
 
 function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
@@ -506,6 +642,7 @@ function renderStaffChatHtml(
     user: UserProfile | null,
     sessionToken: string,
     fromSonolus: boolean,
+    prefsMap: Record<string, UserChatPrefs>,
 ): string {
     const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
         (tag) =>
@@ -513,10 +650,11 @@ function renderStaffChatHtml(
     ).join('')
 
     const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
-        const profile = CHAT_CARD_PROFILES[handle] ?? { handle, name: handle }
+        const pref = prefsMap[handle]
+        const name = pref?.displayName || DEFAULT_CHAT_PROFILES[handle]?.name || handle
         return `<button type="button" class="pick-card" data-pick-handle="${escapeAttr(handle)}">
-          <img class="pick-pfp" src="/api/chat/pfp/${escapeAttr(handle)}" alt="${escapeAttr(profile.name)}"/>
-          <span class="pick-name">${escapeAttr(profile.name)}</span>
+          <img class="pick-pfp" src="/api/chat/pfp/${escapeAttr(handle)}" alt="${escapeAttr(name)}"/>
+          <span class="pick-name">${escapeAttr(name)}</span>
           <span class="pick-handle">#${escapeAttr(handle)}</span>
         </button>`
     }).join('')
@@ -526,14 +664,15 @@ function renderStaffChatHtml(
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<title>${escapeAttr(SERVER_TITLE)} · chat</title>
+<title>${escapeAttr(SERVER_TITLE)} · Chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
   header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;gap:10px}
   .header-right{display:flex;align-items:center;gap:8px}
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
-  .switch-btn{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 8px;font-size:11px;cursor:pointer}
+  .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}
+  .btn-sm:hover{border-color:#3b82f6}
   #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
   #picker.open{display:flex}
   .picker-title{font-size:18px;font-weight:700;text-align:center}
@@ -546,16 +685,22 @@ function renderStaffChatHtml(
   #chatView{flex:1;display:none;flex-direction:column;min-height:0}
   #chatView.open{display:flex}
   #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
-  .row{display:flex;align-items:stretch;gap:8px;max-width:90%}
+  .row{display:flex;align-items:stretch;gap:8px;max-width:92%}
   .row.me{align-self:flex-end;flex-direction:row-reverse}
   .row:not(.me){align-self:flex-start}
   .pfp{width:46px;min-width:46px;align-self:stretch;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
   .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;flex:1;min-width:0}
   .row.me .msg{background:#1d2b45;border-color:#3b82f6}
   .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .meta-actions{display:flex;align-items:center;gap:6px}
+  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .reply-btn:hover{background:rgba(59,130,246,.18)}
   .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .del-btn:hover{background:rgba(248,113,113,.15)}
+  .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+  .reply-banner{display:none;align-items:center;justify-content:space-between;gap:8px;background:#1e293b;border:1px solid #3b82f6;border-radius:8px;padding:6px 10px;font-size:12px;color:#dbeafe}
+  .reply-banner.open{display:flex}
   .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
   .shortcuts{display:flex;gap:8px;flex-wrap:wrap}
   .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer}
@@ -564,14 +709,23 @@ function renderStaffChatHtml(
   input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
   input:focus{border-color:#3b82f6}
   button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:0 16px;font-weight:700;font-size:14px;cursor:pointer}
+  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20}
+  #settingsModal.open{display:flex}
+  .modal-card{width:100%;max-width:400px;background:#151922;border:1px solid #283042;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .modal-title{font-size:16px;font-weight:700}
+  .field-label{font-size:12px;color:#9ca3af;margin-bottom:4px;display:block}
+  .crop-box{position:relative;width:180px;height:180px;margin:6px auto;border-radius:12px;overflow:hidden;border:2px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
+  .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
 </style>
 </head>
 <body>
   <header>
-    <span>${escapeAttr(SERVER_TITLE)} chat</span>
+    <span>${escapeAttr(SERVER_TITLE)} · Chat</span>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
-      <button id="switchBtn" type="button" class="switch-btn" style="display:none">Switch</button>
+      <button id="settingsBtn" type="button" class="btn-sm" style="display:none">Settings</button>
+      <button id="switchBtn" type="button" class="btn-sm" style="display:none">Switch</button>
     </div>
   </header>
   <div id="picker">
@@ -581,35 +735,94 @@ function renderStaffChatHtml(
   <div id="chatView">
     <div id="messages"></div>
     <div class="bottom-bar">
-      <div class="shortcuts">${shortcutsHtml}</div>
+      <div id="replyBanner" class="reply-banner">
+        <span id="replyText"></span>
+        <button id="cancelReplyBtn" type="button" class="btn-sm">Cancel</button>
+      </div>
+      <div id="shortcutsBar" class="shortcuts">${shortcutsHtml}</div>
       <form id="chatForm">
         <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
         <button type="submit">Send</button>
       </form>
     </div>
   </div>
+  <div id="settingsModal">
+    <div class="modal-card">
+      <div class="modal-title">Chat Settings</div>
+      <div>
+        <label class="field-label" for="displayNameInput">Display Name (also used for @mention)</label>
+        <input id="displayNameInput" type="text" maxlength="40" placeholder="Your display name"/>
+      </div>
+      <div>
+        <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture (R2)</label>
+        <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
+        <div id="cropWrap" style="display:none;margin-top:8px">
+          <div id="cropBox" class="crop-box">
+            <img id="cropImg" alt="Crop preview"/>
+          </div>
+          <label class="field-label" for="zoomRange">Zoom</label>
+          <input id="zoomRange" type="range" min="1" max="3" step="0.02" value="1"/>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="closeSettingsBtn" type="button" class="btn-sm">Close</button>
+        <button id="saveSettingsBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Save</button>
+      </div>
+    </div>
+  </div>
 <script>
   const STORAGE_KEY = 'xx_chat_handle';
   const sonolusUser = ${JSON.stringify(fromSonolus && user ? user : null)};
   const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
-  const profiles = ${JSON.stringify(CHAT_CARD_PROFILES)};
-  const pfpMap = ${JSON.stringify({
-      '163292': '/api/chat/pfp/163292',
-      '283420': '/api/chat/pfp/283420',
-      '3227470': '/api/chat/pfp/3227470',
-  })};
+  const prefsMap = ${JSON.stringify(prefsMap)};
+  const defaultsMap = ${JSON.stringify(DEFAULT_CHAT_PROFILES)};
 
   const pickerEl = document.getElementById('picker');
   const chatViewEl = document.getElementById('chatView');
   const badgeEl = document.getElementById('userBadge');
+  const settingsBtn = document.getElementById('settingsBtn');
   const switchBtn = document.getElementById('switchBtn');
   const box = document.getElementById('messages');
+  const shortcutsBar = document.getElementById('shortcutsBar');
   const input = document.getElementById('chatInput');
+  const replyBanner = document.getElementById('replyBanner');
+  const replyTextEl = document.getElementById('replyText');
+  const cancelReplyBtn = document.getElementById('cancelReplyBtn');
+
+  const settingsModal = document.getElementById('settingsModal');
+  const displayNameInput = document.getElementById('displayNameInput');
+  const pfpFileInput = document.getElementById('pfpFileInput');
+  const cropWrap = document.getElementById('cropWrap');
+  const cropBox = document.getElementById('cropBox');
+  const cropImg = document.getElementById('cropImg');
+  const zoomRange = document.getElementById('zoomRange');
+
+  let activeReply = null;
+  let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
+
+  function pfpUrlFor(handle) {
+    const h = String(handle || '').trim();
+    const ver = prefsMap[h]?.updatedAt || 0;
+    return '/api/chat/pfp/' + encodeURIComponent(h) + (ver ? '?v=' + ver : '');
+  }
+
+  function displayNameFor(handle, fallback) {
+    const h = String(handle || '').trim();
+    return (prefsMap[h]?.displayName || fallback || defaultsMap[h]?.name || h).trim();
+  }
 
   function getActiveUser() {
-    if (sonolusUser) return sonolusUser;
+    if (sonolusUser) {
+      return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
+    }
     const saved = (localStorage.getItem(STORAGE_KEY) || '').trim();
-    if (saved && profiles[saved]) return profiles[saved];
+    if (saved && defaultsMap[saved]) {
+      return {
+        id: saved,
+        handle: saved,
+        name: displayNameFor(saved, defaultsMap[saved].name),
+      };
+    }
     return null;
   }
 
@@ -624,19 +837,58 @@ function renderStaffChatHtml(
     return headers;
   }
 
-  function insertShortcut(tag) {
-    const current = input.value;
-    const spacer = current && !current.endsWith(' ') ? ' ' : '';
-    input.value = current + spacer + tag + ' ';
+  function insertTextAtCursor(snippet) {
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? input.value.length;
+    const before = input.value.slice(0, start);
+    const after = input.value.slice(end);
+    const needSpace = before && !before.endsWith(' ') ? ' ' : '';
+    const insertion = needSpace + snippet + ' ';
+    input.value = before + insertion + after;
+    const nextPos = (before + insertion).length;
     input.focus();
+    input.setSelectionRange(nextPos, nextPos);
+  }
+
+  function renderMentionShortcut() {
+    const active = getActiveUser();
+    const existing = shortcutsBar.querySelector('[data-mention]');
+    if (existing) existing.remove();
+    if (!active) return;
+    const mentionBtn = document.createElement('button');
+    mentionBtn.type = 'button';
+    mentionBtn.className = 'chip';
+    mentionBtn.setAttribute('data-mention', '@' + active.name);
+    mentionBtn.textContent = '@' + active.name;
+    mentionBtn.addEventListener('click', () => insertTextAtCursor('@' + active.name));
+    shortcutsBar.prepend(mentionBtn);
   }
 
   document.querySelectorAll('.chip[data-shortcut]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const tag = btn.getAttribute('data-shortcut') || '';
-      if (tag) insertShortcut(tag);
+      if (tag) insertTextAtCursor(tag);
     });
   });
+
+  function setReplyTarget(msg) {
+    activeReply = msg ? {
+      id: msg.id,
+      author: displayNameFor(msg.handle, msg.author),
+      handle: msg.handle,
+      text: msg.text,
+    } : null;
+    if (activeReply) {
+      replyTextEl.textContent = 'Replying to ' + formatTag(activeReply.author, activeReply.handle) + ': ' + activeReply.text;
+      replyBanner.classList.add('open');
+      insertTextAtCursor('@' + activeReply.author);
+    } else {
+      replyTextEl.textContent = '';
+      replyBanner.classList.remove('open');
+    }
+  }
+
+  cancelReplyBtn.addEventListener('click', () => setReplyTarget(null));
 
   function escapeHtml(str) {
     return String(str).replace(/[<>&"]/g, (ch) => ({
@@ -649,27 +901,35 @@ function renderStaffChatHtml(
 
   function formatTag(author, handle) {
     const h = String(handle || '').trim();
-    const a = String(author || '').trim() || h;
+    const a = displayNameFor(h, author);
     return h ? a + '#' + h : a;
   }
 
   function render(messages) {
     const active = getActiveUser();
     const myHandle = active ? active.handle : '';
-    box.innerHTML = (messages || []).map((m) => {
+    const list = messages || [];
+    box.innerHTML = list.map((m) => {
       const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       const mine = m.handle === myHandle ? 'me' : '';
-      const pfpUrl = pfpMap[String(m.handle || '').trim()];
-      const pfpImg = pfpUrl ? '<img class="pfp" src="' + escapeHtml(pfpUrl) + '" alt=""/>' : '';
+      const pfpImg = '<img class="pfp" src="' + escapeHtml(pfpUrlFor(m.handle)) + '" alt=""/>';
+      const replyHtml = m.replyTo
+        ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.author || m.replyTo.handle || '') + ': ' + escapeHtml(m.replyTo.text || '') + '</div>'
+        : '';
       return '<div class="row ' + mine + '">' +
         pfpImg +
         '<div class="msg">' +
           '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
-          '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button></div>' +
+          '<span class="meta-actions">' +
+            '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
+            '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>' +
+          '</span></div>' +
+          replyHtml +
           '<div class="text">' + escapeHtml(m.text) + '</div>' +
         '</div>' +
       '</div>';
     }).join('');
+    box.dataset.msgs = JSON.stringify(list);
     box.scrollTop = box.scrollHeight;
   }
 
@@ -679,6 +939,10 @@ function renderStaffChatHtml(
     const res = await fetch('/api/chat', { headers: authHeaders() });
     if (res.ok) {
       const data = await res.json();
+      if (data.prefs) {
+        Object.assign(prefsMap, data.prefs);
+        renderMentionShortcut();
+      }
       render(data.messages || []);
     }
   }
@@ -687,6 +951,7 @@ function renderStaffChatHtml(
     const active = getActiveUser();
     if (!active) {
       badgeEl.textContent = 'Select handle';
+      settingsBtn.style.display = 'none';
       switchBtn.style.display = 'none';
       pickerEl.classList.add('open');
       chatViewEl.classList.remove('open');
@@ -694,16 +959,139 @@ function renderStaffChatHtml(
     }
 
     badgeEl.textContent = formatTag(active.name, active.handle);
+    settingsBtn.style.display = 'inline-block';
     switchBtn.style.display = sonolusUser ? 'none' : 'inline-block';
     pickerEl.classList.remove('open');
     chatViewEl.classList.add('open');
+    renderMentionShortcut();
     loadMessages();
   }
+
+  function updateCropTransform() {
+    if (!cropState.loaded) return;
+    const boxSize = 180;
+    const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
+    const totalScale = baseScale * cropState.scale;
+    const scaledW = cropState.imgW * totalScale;
+    const scaledH = cropState.imgH * totalScale;
+    cropState.x = Math.min(0, Math.max(boxSize - scaledW, cropState.x));
+    cropState.y = Math.min(0, Math.max(boxSize - scaledH, cropState.y));
+    cropImg.style.width = scaledW + 'px';
+    cropImg.style.height = scaledH + 'px';
+    cropImg.style.transform = 'translate(' + cropState.x + 'px, ' + cropState.y + 'px)';
+  }
+
+  pfpFileInput.addEventListener('change', () => {
+    const file = pfpFileInput.files && pfpFileInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      cropImg.onload = () => {
+        cropState = {
+          loaded: true,
+          imgW: cropImg.naturalWidth || 180,
+          imgH: cropImg.naturalHeight || 180,
+          scale: Number(zoomRange.value) || 1,
+          x: 0,
+          y: 0,
+          dragging: false,
+          lastX: 0,
+          lastY: 0,
+        };
+        cropWrap.style.display = 'block';
+        updateCropTransform();
+      };
+      cropImg.src = String(reader.result || '');
+    };
+    reader.readAsDataURL(file);
+  });
+
+  zoomRange.addEventListener('input', () => {
+    cropState.scale = Number(zoomRange.value) || 1;
+    updateCropTransform();
+  });
+
+  cropBox.addEventListener('pointerdown', (e) => {
+    if (!cropState.loaded) return;
+    cropState.dragging = true;
+    cropState.lastX = e.clientX;
+    cropState.lastY = e.clientY;
+    cropBox.setPointerCapture(e.pointerId);
+  });
+
+  cropBox.addEventListener('pointermove', (e) => {
+    if (!cropState.dragging) return;
+    cropState.x += e.clientX - cropState.lastX;
+    cropState.y += e.clientY - cropState.lastY;
+    cropState.lastX = e.clientX;
+    cropState.lastY = e.clientY;
+    updateCropTransform();
+  });
+
+  cropBox.addEventListener('pointerup', () => {
+    cropState.dragging = false;
+  });
+
+  async function buildCroppedSquareDataUrl() {
+    if (!cropState.loaded) return null;
+    const outSize = 256;
+    const boxSize = 180;
+    const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
+    const totalScale = baseScale * cropState.scale;
+    const sx = Math.max(0, (-cropState.x) / totalScale);
+    const sy = Math.max(0, (-cropState.y) / totalScale);
+    const sSize = Math.min(cropState.imgW, cropState.imgH, boxSize / totalScale);
+    const canvas = document.createElement('canvas');
+    canvas.width = outSize;
+    canvas.height = outSize;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(cropImg, sx, sy, sSize, sSize, 0, 0, outSize, outSize);
+    return canvas.toDataURL('image/png');
+  }
+
+  settingsBtn.addEventListener('click', () => {
+    const active = getActiveUser();
+    if (!active) return;
+    displayNameInput.value = active.name;
+    pfpFileInput.value = '';
+    zoomRange.value = '1';
+    cropWrap.style.display = 'none';
+    cropState.loaded = false;
+    settingsModal.classList.add('open');
+  });
+
+  closeSettingsBtn.addEventListener('click', () => {
+    settingsModal.classList.remove('open');
+  });
+
+  saveSettingsBtn.addEventListener('click', async () => {
+    const active = getActiveUser();
+    if (!active) return;
+    const displayName = displayNameInput.value.trim() || active.name;
+    const croppedPng = await buildCroppedSquareDataUrl();
+    const res = await fetch('/api/chat/settings', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        handle: active.handle,
+        displayName,
+        pfpDataUrl: croppedPng,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.prefs) {
+        prefsMap[active.handle] = data.prefs;
+      }
+      settingsModal.classList.remove('open');
+      syncMode();
+    }
+  });
 
   document.querySelectorAll('[data-pick-handle]').forEach((card) => {
     card.addEventListener('click', () => {
       const picked = card.getAttribute('data-pick-handle') || '';
-      if (!profiles[picked]) return;
+      if (!defaultsMap[picked]) return;
       localStorage.setItem(STORAGE_KEY, picked);
       syncMode();
     });
@@ -711,10 +1099,20 @@ function renderStaffChatHtml(
 
   switchBtn.addEventListener('click', () => {
     localStorage.removeItem(STORAGE_KEY);
+    setReplyTarget(null);
     syncMode();
   });
 
   box.addEventListener('click', async (e) => {
+    const replyBtn = e.target.closest('[data-reply-id]');
+    if (replyBtn) {
+      const id = replyBtn.getAttribute('data-reply-id');
+      const list = JSON.parse(box.dataset.msgs || '[]');
+      const target = list.find((m) => m.id === id);
+      if (target) setReplyTarget(target);
+      return;
+    }
+
     const delBtn = e.target.closest('[data-delete-id]');
     if (!delBtn) return;
     const id = delBtn.getAttribute('data-delete-id');
@@ -735,11 +1133,13 @@ function renderStaffChatHtml(
     if (!active) return;
     const text = input.value.trim();
     if (!text) return;
+    const replyTo = activeReply;
     input.value = '';
+    setReplyTarget(null);
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ text, handle: active.handle }),
+      body: JSON.stringify({ text, handle: active.handle, replyTo }),
     });
     if (res.ok) {
       const data = await res.json();
@@ -1234,6 +1634,18 @@ export default {
         }
 
         if (path === '/refresh' || path === '/admin/refresh') {
+            const session = await sessionOf(req, env, url)
+            const authHeader = req.headers.get('Authorization') ?? ''
+            const expectedKey = (env as any).REFRESH_KEY as string | undefined
+            const authorized =
+                canManagePosts(session) ||
+                (Boolean(expectedKey) &&
+                    (authHeader === `Bearer ${expectedKey}` || url.searchParams.get('key') === expectedKey))
+
+            if (!authorized) {
+                return message(403, 'Refresh is restricted.')
+            }
+
             const summary = await refreshDailyAssets(env)
             await lobby(env).syncAllToR2().catch(() => {})
             levelIndex = null
@@ -1250,26 +1662,83 @@ export default {
                 return new Response(null, { status: 404 })
             }
 
-            const obj = await env.COMMUNITY_BUCKET.get(`chat/${handle}.png`).catch(() => null)
-            if (!obj) return new Response(null, { status: 404 })
+            const prefs = await getUserChatPrefs(env, handle)
+            const keys = [
+                prefs.pfpKey,
+                `chat/pfp/${handle}.png`,
+                `chat/${handle}.png`,
+            ].filter((k): k is string => Boolean(k))
 
-            return new Response(obj.body, {
-                headers: {
-                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': 'public, max-age=3600',
-                },
-            })
+            for (const key of keys) {
+                const obj = await env.COMMUNITY_BUCKET.get(key).catch(() => null)
+                if (obj) {
+                    return new Response(obj.body, {
+                        headers: {
+                            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                            'Access-Control-Allow-Origin': '*',
+                            'Cache-Control': 'no-cache',
+                        },
+                    })
+                }
+            }
+
+            return new Response(null, { status: 404 })
+        }
+
+        if (path === '/api/chat/settings' && req.method === 'POST') {
+            let body: any
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid JSON.')
+            }
+
+            const resolved = await resolveChatUser(req, env, url, body)
+            if (!resolved) {
+                return message(403, 'Choose a valid handle to update settings.')
+            }
+
+            const handle = resolved.user.handle
+            let pfpKey: string | undefined
+
+            if (typeof body?.pfpDataUrl === 'string' && body.pfpDataUrl.startsWith('data:image/')) {
+                const match = body.pfpDataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
+                if (!match) {
+                    return message(400, 'Invalid image data.')
+                }
+                const mime = match[1]!
+                const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
+                if (rawBytes.byteLength > 2 * 1024 * 1024) {
+                    return message(400, 'Profile image too large.')
+                }
+                if (env.COMMUNITY_BUCKET) {
+                    pfpKey = `chat/pfp/${handle}.png`
+                    await env.COMMUNITY_BUCKET.put(pfpKey, rawBytes, {
+                        httpMetadata: { contentType: mime },
+                    })
+                }
+            }
+
+            const nextDisplayName = typeof body?.displayName === 'string' && body.displayName.trim()
+                ? body.displayName.trim().slice(0, 40)
+                : resolved.user.name
+
+            const savedPrefs = await saveUserChatPrefs(env, handle, nextDisplayName, pfpKey)
+            return json({ ok: true, prefs: savedPrefs })
         }
 
         if (path === '/chat' && req.method === 'GET') {
+            const prefsEntries = await Promise.all(
+                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
+            )
+            const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
             if (resolved) {
                 return html(
-                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus),
+                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus, prefsMap),
                 )
             }
-            return html(renderStaffChatHtml(null, '', false))
+            return html(renderStaffChatHtml(null, '', false, prefsMap))
         }
 
         if (path === '/api/chat') {
@@ -1287,38 +1756,72 @@ export default {
                 return message(403, 'Choose a valid handle to use chat.')
             }
 
+            const prefsEntries = await Promise.all(
+                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
+            )
+            const prefsMap = Object.fromEntries(prefsEntries)
+
             if (req.method === 'GET') {
                 const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ messages })
+                return json({ messages, prefs: prefsMap })
             }
 
             if (req.method === 'POST') {
                 if (body?.action === 'delete') {
-                    await lobby(env).deleteChatMessage(
-                        typeof body?.id === 'string' ? body.id : undefined,
-                    )
+                    const targetId = typeof body?.id === 'string' ? body.id : undefined
                     const messages = await lobby(env).listChatMessages().catch(() => [])
-                    return json({ ok: true, messages })
+                    const target = targetId ? messages.find((m) => m.id === targetId) : undefined
+                    if (
+                        target &&
+                        resolved.user.handle !== target.handle &&
+                        resolved.user.handle !== TOURNAMENT_HOST_HANDLE
+                    ) {
+                        return message(403, 'You cannot delete this message.')
+                    }
+                    await lobby(env).deleteChatMessage(targetId)
+                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
 
                 const text = typeof body?.text === 'string' ? body.text.trim() : ''
                 if (!text) return message(400, 'Message cannot be empty.')
 
+                const replyTo = body?.replyTo && typeof body.replyTo === 'object'
+                    ? {
+                        id: String(body.replyTo.id ?? ''),
+                        author: String(body.replyTo.author ?? ''),
+                        handle: String(body.replyTo.handle ?? ''),
+                        text: String(body.replyTo.text ?? '').slice(0, 120),
+                    }
+                    : undefined
+
                 await lobby(env).addChatMessage({
                     handle: resolved.user.handle,
                     author: resolved.user.name || resolved.user.handle,
                     text: text.slice(0, 500),
-                })
+                    ...(replyTo ? { replyTo } : {}),
+                } as any)
 
                 const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages })
+                return json({ ok: true, messages, prefs: prefsMap })
             }
 
             if (req.method === 'DELETE') {
                 const id = url.searchParams.get('id') ?? undefined
+                if (id) {
+                    const messages = await lobby(env).listChatMessages().catch(() => [])
+                    const target = messages.find((m) => m.id === id)
+                    if (
+                        target &&
+                        resolved.user.handle !== target.handle &&
+                        resolved.user.handle !== TOURNAMENT_HOST_HANDLE
+                    ) {
+                        return message(403, 'You cannot delete this message.')
+                    }
+                }
                 await lobby(env).deleteChatMessage(id)
                 const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages })
+                return json({ ok: true, messages, prefs: prefsMap })
             }
         }
 
@@ -1453,7 +1956,7 @@ export default {
 
             if (isChatCategory(url, req)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ creates: [], searches: [], sections: [] })
+                    return json({ title: 'Chat', creates: [], searches: [], sections: [] })
                 }
 
                 const [messages, pinnedId] = await Promise.all([
@@ -1462,6 +1965,7 @@ export default {
                 ])
 
                 return json({
+                    title: 'Chat',
                     creates: [],
                     searches: [],
                     sections: [
@@ -1496,10 +2000,11 @@ export default {
             )
 
             return json({
+                title: explicit ? POST_LABELS[explicit].section : 'Posts',
                 creates: canManagePosts(session) && explicit
                     ? [postForm(explicit)]
                     : [],
-                searches: [],
+                searches: POST_SEARCHES,
                 sections,
             })
         }
@@ -1527,16 +2032,29 @@ export default {
                 })
             }
 
-            const kind = resolveCategory(url, req)
-            if (!kind) {
-                return message(400, 'Missing category.')
-            }
+            const kind = resolveCategory(url, req) ?? 'posts'
+            const keywords = resolveKeywords(url, req)
 
-            const posts = sortPostsPinnedFirst(
+            const allCategoryPosts = sortPostsPinnedFirst(
                 (await lobby(env).listPosts(kind).catch(() => [])).filter(
                     (p) => p.category === kind,
                 ),
             )
+
+            const posts = keywords
+                ? allCategoryPosts.filter((p) => {
+                    const hay = [
+                        String(p.item?.title ?? ''),
+                        String(p.item?.author ?? ''),
+                        String(p.description ?? ''),
+                    ].join(' ').toLowerCase()
+                    return keywords
+                        .split(/\s+/)
+                        .filter(Boolean)
+                        .every((term) => hay.includes(term))
+                })
+                : allCategoryPosts
+
             const pageCount = Math.max(1, Math.ceil(posts.length / pageSize))
             const slice = posts.slice(page * pageSize, page * pageSize + pageSize)
 
@@ -1544,7 +2062,7 @@ export default {
                 title: POST_LABELS[kind].section,
                 pageCount,
                 items: slice.map(buildPostItemWithBadges),
-                searches: [],
+                searches: POST_SEARCHES,
             })
         }
 
@@ -1696,6 +2214,9 @@ export default {
             }
 
             if (actionType === 'pinPost') {
+                if (!canManagePosts(session)) {
+                    return message(403, 'Only handle 163292 can pin posts.')
+                }
                 await lobby(env).togglePostPin(itemName)
                 return json({
                     key: '',
@@ -1850,6 +2371,9 @@ export default {
             }
 
             if (actionType === 'pinPost') {
+                if (!canManagePosts(session)) {
+                    return message(403, 'Only handle 163292 can pin posts.')
+                }
                 await lobby(env).togglePostPin(postName)
                 return json({
                     key: '',
