@@ -11,6 +11,14 @@ export type LobbyRoom = {
     visibility: 'public' | 'private' | 'locked'
 }
 
+export type PostComment = {
+    id: string
+    handle: string
+    author: string
+    text: string
+    time: number
+}
+
 export type StoredPost = {
     category: 'announcements' | 'posts' | 'results'
     item: {
@@ -26,6 +34,10 @@ export type StoredPost = {
     description: string
     uploadKey?: string
     thumbnailHash?: string
+    likes?: string[]
+    comments?: PostComment[]
+    pinned?: boolean
+    pinnedCommentId?: string | null
 }
 
 type LobbyState = {
@@ -42,6 +54,37 @@ const freshLobby = (): LobbyState => ({
     pinnedChatId: null,
 })
 
+function normalizePost(post: StoredPost): StoredPost {
+    const likes = Array.isArray(post.likes) ? post.likes : []
+    const comments = Array.isArray(post.comments) ? post.comments : []
+    const pinned = Boolean(post.pinned)
+    const likeCount = likes.length
+    const commentCount = comments.length
+
+    const parts: string[] = []
+    if (pinned) parts.push('Pinned')
+    parts.push(`${likeCount} ${likeCount === 1 ? 'like' : 'likes'}`)
+    parts.push(`${commentCount} ${commentCount === 1 ? 'comment' : 'comments'}`)
+
+    const tags: { title: string }[] = []
+    if (pinned) tags.push({ title: 'Pinned' })
+    if (likeCount > 0) tags.push({ title: `${likeCount} ♥` })
+    if (commentCount > 0) tags.push({ title: `${commentCount} 💬` })
+
+    return {
+        ...post,
+        likes,
+        comments,
+        pinned,
+        pinnedCommentId: typeof post.pinnedCommentId === 'string' ? post.pinnedCommentId : null,
+        item: {
+            ...post.item,
+            subtitle: parts.join(' · '),
+            tags,
+        },
+    }
+}
+
 export class Lobby extends DurableObject<Env> {
     st: LobbyState = freshLobby()
 
@@ -52,11 +95,20 @@ export class Lobby extends DurableObject<Env> {
             const saved = await ctx.storage.get<Partial<LobbyState>>('st')
             const base = freshLobby()
 
+            const rawPosts =
+                saved?.posts && typeof saved.posts === 'object' ? saved.posts : {}
+            const posts: Record<string, StoredPost> = {}
+            for (const [k, v] of Object.entries(rawPosts)) {
+                if (v && typeof v === 'object') {
+                    posts[k] = normalizePost(v as StoredPost)
+                }
+            }
+
             this.st = {
                 ...base,
                 ...(saved ?? {}),
                 rooms: saved?.rooms && typeof saved.rooms === 'object' ? saved.rooms : {},
-                posts: saved?.posts && typeof saved.posts === 'object' ? saved.posts : {},
+                posts,
                 chat: Array.isArray(saved?.chat) ? saved.chat.slice(-200) : [],
                 pinnedChatId: typeof saved?.pinnedChatId === 'string' ? saved.pinnedChatId : null,
             }
@@ -84,11 +136,18 @@ export class Lobby extends DurableObject<Env> {
     async listPosts(category?: StoredPost['category']): Promise<StoredPost[]> {
         return Object.values(this.st.posts)
             .filter((post) => !category || post.category === category)
-            .sort((a, b) => b.item.time - a.item.time)
+            .map(normalizePost)
+            .sort((a, b) => {
+                if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+                    return a.pinned ? -1 : 1
+                }
+                return b.item.time - a.item.time
+            })
     }
 
     async getPost(name: string): Promise<StoredPost | null> {
-        return this.st.posts[name] ?? null
+        const post = this.st.posts[name]
+        return post ? normalizePost(post) : null
     }
 
     async findPostByUploadKey(uploadKey: string): Promise<StoredPost | null> {
@@ -99,7 +158,7 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async createPost(post: StoredPost): Promise<void> {
-        this.st.posts[post.item.name] = post
+        this.st.posts[post.item.name] = normalizePost(post)
         await this.persist()
     }
 
@@ -110,12 +169,83 @@ export class Lobby extends DurableObject<Env> {
         post.item.thumbnail = { hash, url }
         post.thumbnailHash = hash
         delete post.uploadKey
+        this.st.posts[name] = normalizePost(post)
         await this.persist()
     }
 
     async removePost(name: string): Promise<void> {
         delete this.st.posts[name]
         await this.persist()
+    }
+
+    async togglePostLike(name: string, handle: string): Promise<StoredPost | null> {
+        const post = this.st.posts[name]
+        if (!post) return null
+
+        const current = new Set(post.likes ?? [])
+        if (current.has(handle)) {
+            current.delete(handle)
+        } else {
+            current.add(handle)
+        }
+        post.likes = [...current]
+        this.st.posts[name] = normalizePost(post)
+        await this.persist()
+        return this.st.posts[name]!
+    }
+
+    async togglePostPin(name: string): Promise<StoredPost | null> {
+        const post = this.st.posts[name]
+        if (!post) return null
+
+        post.pinned = !post.pinned
+        this.st.posts[name] = normalizePost(post)
+        await this.persist()
+        return this.st.posts[name]!
+    }
+
+    async addPostComment(
+        name: string,
+        input: { handle: string; author: string; text: string },
+    ): Promise<StoredPost | null> {
+        const post = this.st.posts[name]
+        if (!post) return null
+
+        const comment: PostComment = {
+            id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+            handle: input.handle,
+            author: input.author || input.handle,
+            text: input.text,
+            time: Date.now(),
+        }
+
+        post.comments = [...(post.comments ?? []).slice(-199), comment]
+        this.st.posts[name] = normalizePost(post)
+        await this.persist()
+        return this.st.posts[name]!
+    }
+
+    async pinPostComment(name: string, commentId: string): Promise<StoredPost | null> {
+        const post = this.st.posts[name]
+        if (!post) return null
+
+        post.pinnedCommentId = post.pinnedCommentId === commentId ? null : commentId
+        this.st.posts[name] = normalizePost(post)
+        await this.persist()
+        return this.st.posts[name]!
+    }
+
+    async deletePostComment(name: string, commentId: string): Promise<StoredPost | null> {
+        const post = this.st.posts[name]
+        if (!post) return null
+
+        post.comments = (post.comments ?? []).filter((c) => c.id !== commentId)
+        if (post.pinnedCommentId === commentId) {
+            post.pinnedCommentId = null
+        }
+        this.st.posts[name] = normalizePost(post)
+        await this.persist()
+        return this.st.posts[name]!
     }
 
     async listChatMessages(): Promise<ChatMessage[]> {
