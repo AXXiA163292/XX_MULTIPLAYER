@@ -29,6 +29,12 @@ const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = 
     '3227470': { handle: '3227470', name: 'Nocturne' },
 }
 
+const HANDLE_TIMEZONES: Record<string, string> = {
+    '163292': 'Europe/Paris',
+    '283420': 'Europe/Paris',
+    '3227470': 'Etc/GMT+6',
+}
+
 type UserChatPrefs = {
     handle: string
     displayName: string
@@ -60,6 +66,9 @@ const message = (status: number, text: string) =>
 
 const addressOf = (req: Request, env: Env) =>
     (env.PUBLIC_ADDRESS ?? new URL(req.url).origin).replace(/\/+$/, '')
+
+const isDevSkipSignature = (env: Env): boolean =>
+    String(env.DEV_SKIP_SIGNATURE ?? '').trim().toLowerCase() === 'true'
 
 const isStaffChatHandle = (handle?: string | null): boolean =>
     Boolean(
@@ -166,7 +175,13 @@ async function verifySigned(
         body.address.replace(/\/+$/, '') !== addressOf(req, env)
     ) return null
 
-    if (typeof body.time !== 'number' || body.time + 60_000 < Date.now()) {
+    const now = Date.now()
+    if (
+        typeof body.time !== 'number' ||
+        !Number.isFinite(body.time) ||
+        body.time + 60_000 < now ||
+        body.time - 60_000 > now
+    ) {
         return null
     }
 
@@ -175,7 +190,7 @@ async function verifySigned(
         return null
     }
 
-    if (!env.DEV_SKIP_SIGNATURE) {
+    if (!isDevSkipSignature(env)) {
         const sig = req.headers.get('Sonolus-Signature')
         if (!sig || !(await verifySonolusSignature(raw, sig))) {
             return null
@@ -301,8 +316,8 @@ function makePostSearches(defaultCategory: PostCategory) {
     return [
         {
             type: 'search',
-            title: 'Search',
-            icon: 'search',
+            title: 'More',
+            icon: 'more',
             requireConfirmation: false,
             options: [
                 {
@@ -352,7 +367,7 @@ function parseEncodedParams(raw: string | null | undefined): URLSearchParams | n
 
 function resolveCategory(
     url: URL,
-    req?: Request,
+    _req?: Request,
     body?: any,
     values?: URLSearchParams,
 ): PostCategory | null {
@@ -360,27 +375,27 @@ function resolveCategory(
     const bodyValueParams = parseEncodedParams(body?.values)
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
+    // Sonolus sends the button's infoType directly as `type` on /sonolus/posts/info,
+    // and sends the form's `type` inside `values` on /sonolus/posts/create.
     const candidates: (string | null | undefined)[] = [
-        urlSearchParams?.get('category'),
-        bodySearchParams?.get('category'),
+        values?.get('type'),
+        bodyValueParams?.get('type'),
+        body?.type,
+        url.searchParams.get('type'),
+        url.searchParams.get('infoType'),
+        url.searchParams.get('postType'),
+        body?.infoType,
+        body?.postType,
         url.searchParams.get('category'),
         values?.get('category'),
         bodyValueParams?.get('category'),
         body?.category,
+        urlSearchParams?.get('category'),
+        bodySearchParams?.get('category'),
         urlSearchParams?.get('infoType'),
         bodySearchParams?.get('infoType'),
-        url.searchParams.get('infoType'),
-        values?.get('infoType'),
-        bodyValueParams?.get('infoType'),
-        body?.infoType,
-        url.searchParams.get('postType'),
-        body?.postType,
         urlSearchParams?.get('type'),
         bodySearchParams?.get('type'),
-        url.searchParams.get('type'),
-        values?.get('type'),
-        bodyValueParams?.get('type'),
-        body?.type,
     ]
 
     for (const c of candidates) {
@@ -388,58 +403,18 @@ function resolveCategory(
         if (parsed) return parsed
     }
 
-    const referer = req?.headers.get('Referer')
-    if (referer) {
-        try {
-            const refUrl = new URL(referer)
-            const refSearchParams = parseEncodedParams(refUrl.searchParams.get('searchValues'))
-            const refCandidates: (string | null | undefined)[] = [
-                refSearchParams?.get('category'),
-                refUrl.searchParams.get('category'),
-                refSearchParams?.get('infoType'),
-                refUrl.searchParams.get('infoType'),
-                refUrl.searchParams.get('postType'),
-                refSearchParams?.get('type'),
-                refUrl.searchParams.get('type'),
-            ]
-            for (const c of refCandidates) {
-                const parsed = parseCategoryString(c)
-                if (parsed) return parsed
-            }
-        } catch {
-            // ignore invalid referer
-        }
-    }
-
     return null
 }
 
-function resolveKeywords(url: URL, req?: Request): string {
+function resolveKeywords(url: URL): string {
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
     const direct =
-        urlSearchParams?.get('keywords') ??
         url.searchParams.get('keywords') ??
         url.searchParams.get('query') ??
+        urlSearchParams?.get('keywords') ??
+        urlSearchParams?.get('query') ??
         ''
-    if (direct.trim()) return direct.trim().toLowerCase()
-
-    const referer = req?.headers.get('Referer')
-    if (referer) {
-        try {
-            const refUrl = new URL(referer)
-            const refSearchParams = parseEncodedParams(refUrl.searchParams.get('searchValues'))
-            const fromRef =
-                refSearchParams?.get('keywords') ??
-                refUrl.searchParams.get('keywords') ??
-                refUrl.searchParams.get('query') ??
-                ''
-            if (fromRef.trim()) return fromRef.trim().toLowerCase()
-        } catch {
-            // ignore invalid referer
-        }
-    }
-
-    return ''
+    return direct.trim().toLowerCase()
 }
 
 function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
@@ -599,60 +574,103 @@ function externalChatUrl(req: Request, env: Env, url: URL): string {
     return `${base}?session=${encodeURIComponent(token)}`
 }
 
-function rawPostCategory(url: URL, req?: Request): string | null {
+function rawPostCategory(url: URL): string | null {
     const searchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
-    const fromCategory =
-        searchParams?.get('category') ??
-        url.searchParams.get('category')
-    if (fromCategory) {
-        return String(fromCategory).trim().toLowerCase()
-    }
+    const candidates = [
+        url.searchParams.get('type'),
+        url.searchParams.get('infoType'),
+        url.searchParams.get('postType'),
+        url.searchParams.get('category'),
+        searchParams?.get('category'),
+        searchParams?.get('infoType'),
+        searchParams?.get('type'),
+    ]
 
-    const fromInfoType =
-        searchParams?.get('infoType') ??
-        url.searchParams.get('infoType')
-    if (fromInfoType) {
-        return String(fromInfoType).trim().toLowerCase()
-    }
-
-    const fromDirect =
-        url.searchParams.get('postType') ??
-        searchParams?.get('type') ??
-        url.searchParams.get('type')
-    if (fromDirect) {
-        return String(fromDirect).trim().toLowerCase()
-    }
-
-    const referer = req?.headers.get('Referer')
-    if (referer) {
-        try {
-            const refUrl = new URL(referer)
-            const refSearch = parseEncodedParams(refUrl.searchParams.get('searchValues'))
-            const fromRef =
-                refSearch?.get('category') ??
-                refUrl.searchParams.get('category') ??
-                refSearch?.get('infoType') ??
-                refUrl.searchParams.get('infoType') ??
-                refUrl.searchParams.get('postType') ??
-                refSearch?.get('type') ??
-                refUrl.searchParams.get('type')
-            if (fromRef) return String(fromRef).trim().toLowerCase()
-        } catch {
-            // ignore invalid referer
+    for (const candidate of candidates) {
+        if (candidate && candidate.trim()) {
+            return String(candidate).trim().toLowerCase()
         }
     }
 
     return null
 }
 
-const isChatCategory = (url: URL, req?: Request) => {
-    const raw = rawPostCategory(url, req)
+const isChatCategory = (url: URL) => {
+    const raw = rawPostCategory(url)
     return raw === 'chat' || raw === 'staff-chat'
 }
 
 const isChatItemName = (name: string) =>
     name === 'chat' || name === 'staff-chat'
+
+function getImageDimensions(
+    bytes: Uint8Array,
+    contentType: string,
+): { width: number; height: number } | null {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
+    if (contentType === 'image/png' && bytes.length >= 24) {
+        return {
+            width: view.getUint32(16, false),
+            height: view.getUint32(20, false),
+        }
+    }
+
+    if (contentType === 'image/jpeg') {
+        let offset = 2
+        while (offset + 9 < bytes.length) {
+            if (bytes[offset] !== 0xff) {
+                offset++
+                continue
+            }
+            const marker = bytes[offset + 1]!
+            if (marker === 0xd8 || marker === 0xd9) {
+                offset += 2
+                continue
+            }
+            const segLen = view.getUint16(offset + 2, false)
+            if (segLen < 2 || offset + 2 + segLen > bytes.length) break
+            if (
+                (marker >= 0xc0 && marker <= 0xc3) ||
+                (marker >= 0xc5 && marker <= 0xc7) ||
+                (marker >= 0xc9 && marker <= 0xcb) ||
+                (marker >= 0xcd && marker <= 0xcf)
+            ) {
+                return {
+                    height: view.getUint16(offset + 5, false),
+                    width: view.getUint16(offset + 7, false),
+                }
+            }
+            offset += 2 + segLen
+        }
+    }
+
+    if (contentType === 'image/webp' && bytes.length >= 30) {
+        const chunk = String.fromCharCode(...bytes.slice(12, 16))
+        if (chunk === 'VP8X' && bytes.length >= 30) {
+            const w = 1 + (bytes[24]! | (bytes[25]! << 8) | (bytes[26]! << 16))
+            const h = 1 + (bytes[27]! | (bytes[28]! << 8) | (bytes[29]! << 16))
+            return { width: w, height: h }
+        }
+        if (chunk === 'VP8 ' && bytes.length >= 30) {
+            const w = view.getUint16(26, true) & 0x3fff
+            const h = view.getUint16(28, true) & 0x3fff
+            return { width: w, height: h }
+        }
+        if (chunk === 'VP8L' && bytes.length >= 25) {
+            const b0 = bytes[21]!
+            const b1 = bytes[22]!
+            const b2 = bytes[23]!
+            const b3 = bytes[24]!
+            const w = 1 + (((b1 & 0x3f) << 8) | b0)
+            const h = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
+            return { width: w, height: h }
+        }
+    }
+
+    return null
+}
 
 function escapeAttr(str: string): string {
     return String(str)
@@ -704,26 +722,33 @@ function renderStaffChatHtml(
   .picker-grid{display:grid;grid-template-columns:repeat(3,minmax(92px,130px));gap:14px}
   .pick-card{background:#151922;border:1px solid #283042;border-radius:14px;padding:12px;display:flex;flex-direction:column;align-items:center;gap:8px;color:#f3f4f6;cursor:pointer}
   .pick-card:hover{border-color:#3b82f6;background:#192131}
-  .pick-pfp{width:64px;height:64px;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
+  .pick-pfp{width:64px;height:64px;aspect-ratio:1/1;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
   .pick-name{font-size:13px;font-weight:700;text-align:center}
   .pick-handle{font-size:11px;color:#9ca3af}
   #chatView{flex:1;display:none;flex-direction:column;min-height:0}
   #chatView.open{display:flex}
   #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
-  .row{display:flex;align-items:stretch;gap:8px;max-width:92%}
+  .empty-state{color:#9ca3af;font-size:13px;text-align:center;margin:auto}
+  .row{display:flex;align-items:flex-start;gap:8px;max-width:92%;transition:transform .14s ease;touch-action:pan-y}
   .row.me{align-self:flex-end;flex-direction:row-reverse}
   .row:not(.me){align-self:flex-start}
-  .pfp{width:46px;min-width:46px;align-self:stretch;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
-  .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;flex:1;min-width:0}
+  .pfp{width:44px;height:44px;min-width:44px;min-height:44px;aspect-ratio:1/1;flex-shrink:0;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
+  .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;flex:1;min-width:0;user-select:none}
   .row.me .msg{background:#1d2b45;border-color:#3b82f6}
   .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
   .meta-actions{display:flex;align-items:center;gap:6px}
-  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
-  .reply-btn:hover{background:rgba(59,130,246,.18)}
+  .reply-btn,.react-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .reply-btn:hover,.react-btn:hover{background:rgba(59,130,246,.18)}
   .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .del-btn:hover{background:rgba(248,113,113,.15)}
   .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+  .msg-footer{margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+  .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 7px;font-size:11px;color:#fda4af}
+  .like-avatars{display:inline-flex;align-items:center;gap:3px}
+  .like-pfp{width:14px;height:14px;aspect-ratio:1/1;border-radius:4px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
+  .reaction-pill{display:inline-flex;align-items:center;gap:4px;background:#232938;border:1px solid #374151;border-radius:999px;padding:2px 7px;font-size:11px;color:#f3f4f6;cursor:pointer}
+  .reaction-pill.active{border-color:#60a5fa;background:#1e3a5f}
   .reply-banner{display:none;align-items:center;justify-content:space-between;gap:8px;background:#1e293b;border:1px solid #3b82f6;border-radius:8px;padding:6px 10px;font-size:12px;color:#dbeafe}
   .reply-banner.open{display:flex}
   .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
@@ -734,11 +759,14 @@ function renderStaffChatHtml(
   input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
   input:focus{border-color:#3b82f6}
   button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:0 16px;font-weight:700;font-size:14px;cursor:pointer}
-  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20}
-  #settingsModal.open{display:flex}
+  #settingsModal,#reactModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20}
+  #settingsModal.open,#reactModal.open{display:flex}
   .modal-card{width:100%;max-width:400px;background:#151922;border:1px solid #283042;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px}
   .modal-title{font-size:16px;font-weight:700}
   .field-label{font-size:12px;color:#9ca3af;margin-bottom:4px;display:block}
+  .quick-emojis{display:flex;flex-wrap:wrap;gap:6px}
+  .emoji-opt{background:#232938;border:1px solid #374151;border-radius:8px;padding:6px 10px;font-size:16px;cursor:pointer}
+  .emoji-opt:hover{border-color:#3b82f6}
   .crop-box{position:relative;width:180px;height:180px;margin:6px auto;border-radius:12px;overflow:hidden;border:2px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
   .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
   .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
@@ -773,6 +801,27 @@ function renderStaffChatHtml(
       </form>
     </div>
   </div>
+  <div id="reactModal">
+    <div class="modal-card">
+      <div class="modal-title">Add Reaction</div>
+      <div class="quick-emojis">
+        <button type="button" class="emoji-opt" data-emoji="👍">👍</button>
+        <button type="button" class="emoji-opt" data-emoji="❤️">❤️</button>
+        <button type="button" class="emoji-opt" data-emoji="😂">😂</button>
+        <button type="button" class="emoji-opt" data-emoji="🔥">🔥</button>
+        <button type="button" class="emoji-opt" data-emoji="😭">😭</button>
+        <button type="button" class="emoji-opt" data-emoji="👀">👀</button>
+      </div>
+      <div>
+        <label class="field-label" for="customEmojiInput">Or type any emoji</label>
+        <input id="customEmojiInput" type="text" maxlength="16" placeholder="Any emoji..."/>
+      </div>
+      <div class="modal-actions">
+        <button id="closeReactBtn" type="button" class="btn-sm">Cancel</button>
+        <button id="applyReactBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Apply</button>
+      </div>
+    </div>
+  </div>
   <div id="settingsModal">
     <div class="modal-card">
       <div class="modal-title">Chat Settings</div>
@@ -802,6 +851,7 @@ function renderStaffChatHtml(
   const COOKIE_NAME = ${JSON.stringify(CHAT_HANDLE_COOKIE)};
   const HOST_HANDLE = ${JSON.stringify(TOURNAMENT_HOST_HANDLE)};
   const knownHandles = ${JSON.stringify([...CHAT_PFP_HANDLES])};
+  const tzMap = ${JSON.stringify(HANDLE_TIMEZONES)};
   const sonolusUser = ${JSON.stringify(fromSonolus && user ? user : null)};
   const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
   const prefsMap = ${JSON.stringify(prefsMap)};
@@ -818,6 +868,11 @@ function renderStaffChatHtml(
   const replyTextEl = document.getElementById('replyText');
   const cancelReplyBtn = document.getElementById('cancelReplyBtn');
 
+  const reactModal = document.getElementById('reactModal');
+  const customEmojiInput = document.getElementById('customEmojiInput');
+  const closeReactBtn = document.getElementById('closeReactBtn');
+  const applyReactBtn = document.getElementById('applyReactBtn');
+
   const settingsModal = document.getElementById('settingsModal');
   const displayNameInput = document.getElementById('displayNameInput');
   const pfpFileInput = document.getElementById('pfpFileInput');
@@ -827,6 +882,8 @@ function renderStaffChatHtml(
   const zoomRange = document.getElementById('zoomRange');
 
   let activeReply = null;
+  let reactingMsgId = null;
+  let currentMessages = [];
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
 
   function readSavedHandle() {
@@ -869,6 +926,16 @@ function renderStaffChatHtml(
     return (prefsMap[h]?.displayName || fallback || defaultsMap[h]?.name || h).trim();
   }
 
+  function formatAuthorTime(msg) {
+    const h = String(msg.handle || '').trim();
+    const zone = tzMap[h] || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    try {
+      return new Date(msg.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: zone });
+    } catch {
+      return new Date(msg.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+  }
+
   function getActiveUser() {
     if (sonolusUser) {
       return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
@@ -909,7 +976,10 @@ function renderStaffChatHtml(
   }
 
   function renderKnownUserChips() {
-    shortcutsBar.innerHTML = knownHandles.map((h) => {
+    const active = getActiveUser();
+    const myHandle = active ? active.handle : '';
+    const others = knownHandles.filter((h) => h !== myHandle);
+    shortcutsBar.innerHTML = others.map((h) => {
       const label = '@' + displayNameFor(h, defaultsMap[h]?.name || h);
       return '<button type="button" class="chip" data-mention-handle="' + escapeAttr(h) + '">' + escapeHtml(label) + '</button>';
     }).join('');
@@ -957,11 +1027,17 @@ function renderStaffChatHtml(
   }
 
   function render(messages) {
+    currentMessages = Array.isArray(messages) ? messages : [];
     const active = getActiveUser();
     const myHandle = active ? active.handle : '';
-    const list = messages || [];
-    box.innerHTML = list.map((m) => {
-      const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    if (currentMessages.length === 0) {
+      box.innerHTML = '<div class="empty-state">No messages yet.</div>';
+      return;
+    }
+
+    box.innerHTML = currentMessages.map((m) => {
+      const time = formatAuthorTime(m);
       const mine = m.handle === myHandle ? 'me' : '';
       const canDelete = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
       const pfpImg = '<img class="pfp" src="' + escapeHtml(pfpUrlFor(m.handle)) + '" alt=""/>';
@@ -971,35 +1047,60 @@ function renderStaffChatHtml(
       const delHtml = canDelete
         ? '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>'
         : '';
-      return '<div class="row ' + mine + '">' +
+
+      const likers = Array.isArray(m.likes) ? m.likes : [];
+      const avatarsHtml = likers.map((h) =>
+        '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt="' + escapeHtml(h) + '"/>'
+      ).join('');
+      const likeBadgeHtml = likers.length > 0
+        ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span> ' + likers.length + '</span>'
+        : '';
+
+      const reactions = m.reactions && typeof m.reactions === 'object' ? m.reactions : {};
+      const reactionPills = Object.entries(reactions)
+        .filter(([, users]) => Array.isArray(users) && users.length > 0)
+        .map(([emoji, users]) => {
+          const isMine = myHandle && users.includes(myHandle);
+          return '<button type="button" class="reaction-pill ' + (isMine ? 'active' : '') + '" data-react-id="' + escapeHtml(m.id) + '" data-react-emoji="' + escapeAttr(emoji) + '">' +
+            escapeHtml(emoji) + ' <span>' + users.length + '</span></button>';
+        }).join('');
+
+      return '<div class="row ' + mine + '" data-row-id="' + escapeHtml(m.id) + '">' +
         pfpImg +
-        '<div class="msg">' +
+        '<div class="msg" data-msg-id="' + escapeHtml(m.id) + '">' +
           '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
+            '<button type="button" class="react-btn" data-open-react="' + escapeHtml(m.id) + '">+</button>' +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
             delHtml +
           '</span></div>' +
           replyHtml +
           '<div class="text">' + escapeHtml(m.text) + '</div>' +
+          '<div class="msg-footer">' + likeBadgeHtml + reactionPills + '</div>' +
         '</div>' +
       '</div>';
     }).join('');
-    box.dataset.msgs = JSON.stringify(list);
     box.scrollTop = box.scrollHeight;
   }
 
   async function loadMessages() {
     const active = getActiveUser();
     if (!active) return;
-    const res = await fetch('/api/chat', { headers: authHeaders() });
-    if (res.ok) {
-      const data = await res.json();
-      if (data.prefs) {
-        Object.assign(prefsMap, data.prefs);
-        renderKnownUserChips();
+    try {
+      const res = await fetch('/api/chat?handle=' + encodeURIComponent(active.handle), {
+        headers: authHeaders(),
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.prefs) {
+          Object.assign(prefsMap, data.prefs);
+          renderKnownUserChips();
+        }
+        render(data.messages || []);
       }
-      render(data.messages || []);
-    }
+    } catch {}
   }
 
   function syncMode() {
@@ -1019,6 +1120,67 @@ function renderStaffChatHtml(
     renderKnownUserChips();
     loadMessages();
   }
+
+  async function toggleLikeMessage(id) {
+    const active = getActiveUser();
+    if (!active || !id) return;
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'same-origin',
+      body: JSON.stringify({ action: 'like', id, handle: active.handle }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  }
+
+  async function toggleReaction(id, emoji) {
+    const active = getActiveUser();
+    const cleanEmoji = String(emoji || '').trim().slice(0, 16);
+    if (!active || !id || !cleanEmoji) return;
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'same-origin',
+      body: JSON.stringify({ action: 'react', id, emoji: cleanEmoji, handle: active.handle }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  }
+
+  function openReactionPicker(id) {
+    reactingMsgId = id;
+    customEmojiInput.value = '';
+    reactModal.classList.add('open');
+    customEmojiInput.focus();
+  }
+
+  document.querySelectorAll('.emoji-opt[data-emoji]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const emoji = btn.getAttribute('data-emoji') || '';
+      const id = reactingMsgId;
+      reactModal.classList.remove('open');
+      reactingMsgId = null;
+      if (id && emoji) await toggleReaction(id, emoji);
+    });
+  });
+
+  closeReactBtn.addEventListener('click', () => {
+    reactModal.classList.remove('open');
+    reactingMsgId = null;
+  });
+
+  applyReactBtn.addEventListener('click', async () => {
+    const emoji = customEmojiInput.value.trim();
+    const id = reactingMsgId;
+    reactModal.classList.remove('open');
+    reactingMsgId = null;
+    if (id && emoji) await toggleReaction(id, emoji);
+  });
 
   function updateCropTransform() {
     if (!cropState.loaded) return;
@@ -1125,6 +1287,7 @@ function renderStaffChatHtml(
     const res = await fetch('/api/chat/settings', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'same-origin',
       body: JSON.stringify({
         handle: active.handle,
         displayName,
@@ -1150,27 +1313,102 @@ function renderStaffChatHtml(
     });
   });
 
+  // Swipe right to reply + double-tap to like
+  let swipeRow = null;
+  let swipeStartX = 0;
+  let swipeDeltaX = 0;
+  let lastTapId = '';
+  let lastTapAt = 0;
+
+  box.addEventListener('touchstart', (e) => {
+    const row = e.target.closest('[data-row-id]');
+    if (!row || e.touches.length !== 1) return;
+    swipeRow = row;
+    swipeStartX = e.touches[0].clientX;
+    swipeDeltaX = 0;
+  }, { passive: true });
+
+  box.addEventListener('touchmove', (e) => {
+    if (!swipeRow || e.touches.length !== 1) return;
+    const dx = e.touches[0].clientX - swipeStartX;
+    if (dx > 0) {
+      swipeDeltaX = Math.min(80, dx);
+      swipeRow.style.transform = 'translateX(' + swipeDeltaX + 'px)';
+    }
+  }, { passive: true });
+
+  box.addEventListener('touchend', () => {
+    if (!swipeRow) return;
+    const rowId = swipeRow.getAttribute('data-row-id') || '';
+    swipeRow.style.transform = '';
+    const triggered = swipeDeltaX >= 48;
+    swipeRow = null;
+    swipeDeltaX = 0;
+    if (triggered && rowId) {
+      const target = currentMessages.find((m) => m.id === rowId);
+      if (target) setReplyTarget(target);
+    }
+  });
+
+  box.addEventListener('dblclick', async (e) => {
+    const msgEl = e.target.closest('[data-msg-id]');
+    if (!msgEl) return;
+    const id = msgEl.getAttribute('data-msg-id');
+    if (id) await toggleLikeMessage(id);
+  });
+
   box.addEventListener('click', async (e) => {
+    const reactPill = e.target.closest('[data-react-id]');
+    if (reactPill) {
+      const id = reactPill.getAttribute('data-react-id') || '';
+      const emoji = reactPill.getAttribute('data-react-emoji') || '';
+      if (id && emoji) await toggleReaction(id, emoji);
+      return;
+    }
+
+    const openReact = e.target.closest('[data-open-react]');
+    if (openReact) {
+      const id = openReact.getAttribute('data-open-react') || '';
+      if (id) openReactionPicker(id);
+      return;
+    }
+
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
       const id = replyBtn.getAttribute('data-reply-id');
-      const list = JSON.parse(box.dataset.msgs || '[]');
-      const target = list.find((m) => m.id === id);
+      const target = currentMessages.find((m) => m.id === id);
       if (target) setReplyTarget(target);
       return;
     }
 
     const delBtn = e.target.closest('[data-delete-id]');
-    if (!delBtn) return;
-    const id = delBtn.getAttribute('data-delete-id');
-    if (!id) return;
-    const res = await fetch('/api/chat?id=' + encodeURIComponent(id), {
-      method: 'DELETE',
-      headers: authHeaders(),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      render(data.messages || []);
+    if (delBtn) {
+      const id = delBtn.getAttribute('data-delete-id');
+      if (!id) return;
+      const res = await fetch('/api/chat?id=' + encodeURIComponent(id), {
+        method: 'DELETE',
+        headers: authHeaders(),
+        credentials: 'same-origin',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        render(data.messages || []);
+      }
+      return;
+    }
+
+    const msgEl = e.target.closest('[data-msg-id]');
+    if (msgEl) {
+      const id = msgEl.getAttribute('data-msg-id') || '';
+      const now = Date.now();
+      if (id && id === lastTapId && now - lastTapAt < 320) {
+        lastTapId = '';
+        lastTapAt = 0;
+        await toggleLikeMessage(id);
+      } else {
+        lastTapId = id;
+        lastTapAt = now;
+      }
     }
   });
 
@@ -1186,6 +1424,7 @@ function renderStaffChatHtml(
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'same-origin',
       body: JSON.stringify({ text, handle: active.handle, replyTo }),
     });
     if (res.ok) {
@@ -1198,7 +1437,16 @@ function renderStaffChatHtml(
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
   }
 
-  syncMode();
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) loadMessages();
+  });
+  window.addEventListener('focus', loadMessages);
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', syncMode);
+  } else {
+    syncMode();
+  }
   setInterval(loadMessages, 3500);
 </script>
 </body>
@@ -1247,7 +1495,7 @@ function postForm(category: PostCategory) {
             {
                 name: 'title',
                 query: 'title',
-                required: false,
+                required: true,
                 type: 'text',
                 def: '',
                 placeholder: label.titlePlaceholder,
@@ -1257,11 +1505,11 @@ function postForm(category: PostCategory) {
             {
                 name: 'description',
                 query: 'description',
-                required: false,
+                required: true,
                 type: 'textArea',
                 def: '',
                 placeholder: label.bodyPlaceholder,
-                limit: 5000,
+                limit: 2000,
                 shortcuts: [],
             },
             {
@@ -1906,13 +2154,36 @@ self.addEventListener('fetch', (event) => {
 
             if (req.method === 'POST') {
                 if (body?.action === 'delete') {
-                    const targetId = typeof body?.id === 'string' ? body.id : undefined
+                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
+                    if (!targetId) {
+                        return message(400, 'Missing message id.')
+                    }
                     const messages = await lobby(env).listChatMessages().catch(() => [])
-                    const target = targetId ? messages.find((m) => m.id === targetId) : undefined
-                    if (target && !canDeleteChatMessage(resolved.user.handle, target.handle)) {
+                    const target = messages.find((m) => m.id === targetId)
+                    if (!target) {
+                        return message(404, 'Message not found.')
+                    }
+                    if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                         return message(403, 'Only 163292 can delete messages from other members.')
                     }
                     await lobby(env).deleteChatMessage(targetId)
+                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    return json({ ok: true, messages: updated, prefs: prefsMap })
+                }
+
+                if (body?.action === 'like') {
+                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
+                    if (!targetId) return message(400, 'Missing message id.')
+                    await lobby(env).toggleChatLike(targetId, resolved.user.handle)
+                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    return json({ ok: true, messages: updated, prefs: prefsMap })
+                }
+
+                if (body?.action === 'react') {
+                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
+                    const emoji = typeof body?.emoji === 'string' ? body.emoji.trim().slice(0, 16) : ''
+                    if (!targetId || !emoji) return message(400, 'Missing message id or emoji.')
+                    await lobby(env).toggleChatReaction(targetId, resolved.user.handle, emoji)
                     const updated = await lobby(env).listChatMessages().catch(() => [])
                     return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
@@ -1934,24 +2205,28 @@ self.addEventListener('fetch', (event) => {
                     author: resolved.user.name || resolved.user.handle,
                     text: text.slice(0, 500),
                     ...(replyTo ? { replyTo } : {}),
-                } as any)
+                })
 
                 const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({ ok: true, messages, prefs: prefsMap })
             }
 
             if (req.method === 'DELETE') {
-                const id = url.searchParams.get('id') ?? undefined
-                if (id) {
-                    const messages = await lobby(env).listChatMessages().catch(() => [])
-                    const target = messages.find((m) => m.id === id)
-                    if (target && !canDeleteChatMessage(resolved.user.handle, target.handle)) {
-                        return message(403, 'Only 163292 can delete messages from other members.')
-                    }
+                const id = (url.searchParams.get('id') ?? '').trim()
+                if (!id) {
+                    return message(400, 'Missing message id.')
+                }
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const target = messages.find((m) => m.id === id)
+                if (!target) {
+                    return message(404, 'Message not found.')
+                }
+                if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
+                    return message(403, 'Only 163292 can delete messages from other members.')
                 }
                 await lobby(env).deleteChatMessage(id)
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages, prefs: prefsMap })
+                const updated = await lobby(env).listChatMessages().catch(() => [])
+                return json({ ok: true, messages: updated, prefs: prefsMap })
             }
         }
 
@@ -1960,7 +2235,7 @@ self.addEventListener('fetch', (event) => {
         if (ws) {
             const token =
                 req.headers.get('Sonolus-Room-Session') ??
-                (env.DEV_SKIP_SIGNATURE
+                (isDevSkipSignature(env)
                     ? url.searchParams.get('session')
                     : null)
 
@@ -2084,7 +2359,7 @@ self.addEventListener('fetch', (event) => {
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
 
-            if (isChatCategory(url, req)) {
+            if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return json({ title: 'Chat', creates: [], searches: [], sections: [] })
                 }
@@ -2123,7 +2398,6 @@ self.addEventListener('fetch', (event) => {
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
-                        searchValues: new URLSearchParams({ category: kind }).toString(),
                         items: posts.map(buildPostItemWithBadges),
                     }
                 }),
@@ -2146,7 +2420,7 @@ self.addEventListener('fetch', (event) => {
             const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
             const pageSize = 10
 
-            if (isChatCategory(url, req)) {
+            if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return json({ title: 'Chat', pageCount: 1, items: [], searches: [] })
                 }
@@ -2165,7 +2439,7 @@ self.addEventListener('fetch', (event) => {
             }
 
             const kind = resolveCategory(url, req) ?? 'posts'
-            const keywords = resolveKeywords(url, req)
+            const keywords = resolveKeywords(url)
 
             const allCategoryPosts = sortPostsPinnedFirst(
                 (await lobby(env).listPosts(kind).catch(() => [])).filter(
@@ -2227,8 +2501,8 @@ self.addEventListener('fetch', (event) => {
                 return message(400, 'A title and content are required.')
             }
 
-            if (title.length > 100 || description.length > 5000) {
-                return message(400, 'Post is too long.')
+            if (title.length > 100 || description.length > 2000) {
+                return message(400, 'Post title or description exceeds maximum length.')
             }
 
             const name = randomId(12)
@@ -2600,6 +2874,11 @@ self.addEventListener('fetch', (event) => {
 
             if (!contentType) {
                 return message(400, 'Unsupported image format. Use PNG, JPEG, or WebP.')
+            }
+
+            const dims = getImageDimensions(image, contentType)
+            if (!dims || dims.width < 1 || dims.height < 1 || dims.width > 2048 || dims.height > 2048) {
+                return message(400, 'Image dimensions must be between 1×1 and 2048×2048 px.')
             }
 
             const digest = await crypto.subtle.digest('SHA-1', bytes)
