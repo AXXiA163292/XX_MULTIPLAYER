@@ -1,4 +1,3 @@
-
 import {
     SERVER_DESCRIPTION,
     SERVER_TITLE,
@@ -15,7 +14,7 @@ import {
 } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
-import type { AuthSession, ChatMessage, Env, JoinSession, UserProfile } from './types.ts'
+import type { AuthSession, Env, JoinSession, UserProfile } from './types.ts'
 
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
@@ -26,6 +25,15 @@ const json = (data: unknown, status = 200) =>
         headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'no-store',
+        },
+    })
+
+const html = (body: string, status = 200) =>
+    new Response(body, {
+        status,
+        headers: {
+            'Content-Type': 'text/html; charset=utf-8',
             'Cache-Control': 'no-store',
         },
     })
@@ -106,53 +114,143 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-function staffChatPostItem() {
+function buildStaffChatPostItem(latestMessage?: { text?: string } | null) {
+    const newestText = latestMessage?.text?.trim() || 'No messages yet.'
+
     return {
         name: 'staff-chat',
         version: 1 as const,
         title: 'Chat',
-        time: Date.now(),
+        subtitle: newestText,
+        time: 0,
         author: SERVER_TITLE,
-        tags: [{ title: 'Staff' }],
-    }
-}
-
-function commentItemOf(msg: ChatMessage) {
-    return {
-        name: `comment-${msg.id}`,
-        version: 1 as const,
-        title: msg.text,
-        time: msg.time,
-        author: `${msg.author} (${msg.handle})`,
         tags: [],
+        hasCommunity: true,
+        actions: [
+            {
+                type: 'chat',
+                title: 'Chat',
+                requireConfirmation: false,
+                options: [],
+            },
+        ],
     }
 }
 
-const chatCommentAction = {
-    type: 'comment',
-    title: 'Comment',
-    icon: 'comment',
-    requireConfirmation: false,
-    options: [
-        {
-            query: 'content',
-            name: 'Message',
-            required: true,
-            type: 'textArea',
-            def: '',
-            placeholder: 'Write a message...',
-            limit: 500,
-            shortcuts: [...STAFF_CHAT_SHORTCUTS],
-        },
-    ],
-}
+function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
+    const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
+        (tag) =>
+            `<button type="button" class="chip" onclick="insertShortcut(${JSON.stringify(tag)})">${tag}</button>`,
+    ).join('')
 
-const deleteCommentAction = {
-    type: 'deleteComment',
-    title: 'Delete',
-    icon: 'delete',
-    requireConfirmation: true,
-    options: [],
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<title>${SERVER_TITLE} · #chat</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
+  header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between}
+  .badge{font-size:12px;color:#9ca3af;font-weight:500}
+  #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+  .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;max-width:85%}
+  .msg.me{align-self:flex-end;background:#1d2b45;border-color:#3b82f6}
+  .meta{font-size:11px;color:#9ca3af;margin-bottom:3px}
+  .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+  .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
+  .shortcuts{display:flex;gap:8px;flex-wrap:wrap}
+  .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer}
+  .chip:active{background:#3b82f6;color:#fff;border-color:#3b82f6}
+  form{display:flex;gap:8px}
+  input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
+  input:focus{border-color:#3b82f6}
+  button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:0 16px;font-weight:700;font-size:14px;cursor:pointer}
+</style>
+</head>
+<body>
+  <header>
+    <span>💬 ${SERVER_TITLE} #chat</span>
+    <span class="badge">${user.name || user.handle} (${user.handle})</span>
+  </header>
+  <div id="messages"></div>
+  <div class="bottom-bar">
+    <div class="shortcuts">${shortcutsHtml}</div>
+    <form id="chatForm">
+      <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
+      <button type="submit">Send</button>
+    </form>
+  </div>
+<script>
+  const myHandle = ${JSON.stringify(user.handle)};
+  const sessionToken = ${JSON.stringify(sessionToken)};
+  const box = document.getElementById('messages');
+  const input = document.getElementById('chatInput');
+
+  function authHeaders(extra = {}) {
+    const headers = { ...extra };
+    if (sessionToken) headers['Sonolus-Session'] = sessionToken;
+    return headers;
+  }
+
+  function insertShortcut(tag) {
+    const current = input.value;
+    const spacer = current && !current.endsWith(' ') ? ' ' : '';
+    input.value = current + spacer + tag + ' ';
+    input.focus();
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[<>&"]/g, (ch) => ({
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;',
+      '"': '&quot;',
+    }[ch] ?? ch));
+  }
+
+  function render(messages) {
+    box.innerHTML = (messages || []).map((m) => {
+      const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const mine = m.handle === myHandle ? 'me' : '';
+      return '<div class="msg ' + mine + '">' +
+        '<div class="meta">' + escapeHtml(m.author) + ' (' + escapeHtml(m.handle) + ') · ' + escapeHtml(time) + '</div>' +
+        '<div class="text">' + escapeHtml(m.text) + '</div>' +
+      '</div>';
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function loadMessages() {
+    const res = await fetch('/api/chat', { headers: authHeaders() });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  }
+
+  document.getElementById('chatForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ text }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      render(data.messages || []);
+    }
+  });
+
+  loadMessages();
+  setInterval(loadMessages, 3500);
+</script>
+</body>
+</html>`
 }
 
 async function roomItems(env: Env, _session: AuthSession | null) {
@@ -626,6 +724,52 @@ export default {
             })
         }
 
+        if (path === '/chat' && req.method === 'GET') {
+            const token = url.searchParams.get('session') ?? ''
+            const session = token
+                ? await verifyToken<AuthSession>(env.SESSION_SECRET, token)
+                : null
+
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return html('<h1>403 Forbidden</h1><p>Chat is restricted.</p>', 403)
+            }
+
+            return html(renderStaffChatHtml(session.user, token))
+        }
+
+        if (path === '/api/chat') {
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Chat is restricted.')
+            }
+
+            if (req.method === 'GET') {
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json({ messages })
+            }
+
+            if (req.method === 'POST') {
+                let body: any
+                try {
+                    body = await req.json()
+                } catch {
+                    return message(400, 'Invalid JSON.')
+                }
+
+                const text = typeof body?.text === 'string' ? body.text.trim() : ''
+                if (!text) return message(400, 'Message cannot be empty.')
+
+                await lobby(env).addChatMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
+
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json({ ok: true, messages })
+            }
+        }
+
         const ws = path.match(/^\/ws\/([\w-]+)$/)
 
         if (ws) {
@@ -656,8 +800,14 @@ export default {
         }
 
         if (path === '/sonolus/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
+            const rawSession = req.headers.get('Sonolus-Session') ?? ''
+            const session = rawSession
+                ? await verifyToken<AuthSession>(env.SESSION_SECRET, rawSession)
+                : null
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
+            const chatUrl = canChat
+                ? `${addressOf(req, env)}/chat?session=${encodeURIComponent(rawSession)}`
+                : ''
 
             const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
             let banner: { hash: string; url: string } | undefined
@@ -678,7 +828,9 @@ export default {
 
             return json({
                 title: SERVER_TITLE,
-                description: SERVER_DESCRIPTION,
+                description: canChat
+                    ? `${SERVER_DESCRIPTION}\n\n#chat (${STAFF_CHAT_SHORTCUTS.join(' · ')}):\n${chatUrl}`
+                    : SERVER_DESCRIPTION,
                 ...(banner ? { banner } : {}),
                 buttons: [
                     { type: 'authentication' },
@@ -752,125 +904,28 @@ export default {
             })
         }
 
-        // --- Staff Chat Community Comment Section ---
-        if (path === '/sonolus/posts/staff-chat/community/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return message(403, 'Staff chat is restricted.')
-            }
-
-            const messages = [...(await lobby(env).listChatMessages())].reverse()
-            return json({
-                actions: [chatCommentAction],
-                topComments: messages.slice(0, 3).map(commentItemOf),
-            })
-        }
-
-        if (path === '/sonolus/posts/staff-chat/community/submit' && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return message(403, 'Staff chat is restricted.')
-            }
-
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid comment data.')
-            }
-
-            const values = new URLSearchParams(String(body.values ?? ''))
-            if (values.get('type') !== 'comment') {
-                return message(400, 'Unknown action.')
-            }
-
-            const text = (values.get('content') ?? '').trim()
-            if (!text) return message(400, 'Message cannot be empty.')
-            if (text.length > 500) return message(400, 'Message is too long.')
-
-            await lobby(env).addChatMessage({
-                handle: session.user.handle,
-                author: session.user.name || session.user.handle,
-                text,
-            })
-
-            return json({ shouldUpdateCommunity: true })
-        }
-
-        if (path === '/sonolus/posts/staff-chat/community/comments/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return message(403, 'Staff chat is restricted.')
-            }
-
-            const requestedPage = Number(url.searchParams.get('page') ?? '0')
-            const page = Number.isInteger(requestedPage) && requestedPage >= 0 ? requestedPage : 0
-            const messages = [...(await lobby(env).listChatMessages())].reverse()
-            const pageSize = 20
-            const pageCount = Math.max(1, Math.ceil(messages.length / pageSize))
-            const start = page * pageSize
-
-            return json({
-                pageCount,
-                items: page >= pageCount
-                    ? []
-                    : messages.slice(start, start + pageSize).map(commentItemOf),
-            })
-        }
-
-        const chatCommentSubmit = path.match(
-            /^\/sonolus\/posts\/staff-chat\/community\/comments\/comment-([\w-]+)\/submit$/,
-        )
-
-        if (chatCommentSubmit && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return message(403, 'Staff chat is restricted.')
-            }
-
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid action.')
-            }
-
-            const values = new URLSearchParams(String(body.values ?? ''))
-            if (values.get('type') !== 'deleteComment') {
-                return message(400, 'Unknown action.')
-            }
-
-            const messages = await lobby(env).listChatMessages()
-            const target = messages.find((m) => m.id === chatCommentSubmit[1])
-            if (!target) return new Response(null, { status: 404 })
-
-            if (
-                target.handle !== session.user.handle &&
-                session.user.handle !== TOURNAMENT_HOST_HANDLE
-            ) {
-                return message(403, 'You can only delete your own messages.')
-            }
-
-            await lobby(env).removeChatMessage(target.id)
-            return json({ shouldRemoveItem: true, shouldUpdateCommunity: true })
-        }
-
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
 
             if (rawPostCategory(url) === 'staff-chat') {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted.')
+                    return message(403, 'Chat is restricted.')
                 }
 
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const latest = messages[messages.length - 1] ?? null
+
                 return json({
+                    description: '',
                     creates: [],
                     searches: [],
+                    hasMore: false,
                     sections: [
                         {
-                            title: 'Staff Chat',
+                            title: 'Chat',
                             itemType: 'post',
-                            items: [staffChatPostItem()],
+                            hasMore: false,
+                            items: [buildStaffChatPostItem(latest)],
                         },
                     ],
                 })
@@ -898,16 +953,21 @@ export default {
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
 
             if (rawPostCategory(url) === 'staff-chat') {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted.')
+                    return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
                 }
 
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const latest = messages[messages.length - 1] ?? null
+
                 return json({
+                    description: '',
                     pageCount: 1,
-                    items: [staffChatPostItem()],
+                    hasMore: false,
+                    items: [buildStaffChatPostItem(latest)],
                     searches: [],
                 })
             }
@@ -922,7 +982,7 @@ export default {
         }
 
         if (path === '/sonolus/posts/create' && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -979,7 +1039,7 @@ export default {
         const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
 
         if (postSubmitPath && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -1009,7 +1069,7 @@ export default {
         }
 
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -1117,17 +1177,18 @@ export default {
         const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
 
         if (postPath && req.method === 'GET') {
-            const postName = postPath[1]!
-
-            if (postName === 'staff-chat') {
+            if (postPath[1] === 'staff-chat') {
                 const session = await sessionOf(req, env, url)
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted.')
+                    return message(403, 'Chat is restricted.')
                 }
 
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const latest = messages[messages.length - 1] ?? null
+
                 return json({
-                    item: staffChatPostItem(),
-                    description: `Staff chat room for handles ${STAFF_CHAT_HANDLES.join(', ')}.\nShortcuts: ${STAFF_CHAT_SHORTCUTS.join(' · ')}`,
+                    item: buildStaffChatPostItem(latest),
+                    description: '',
                     actions: [],
                     hasCommunity: true,
                     leaderboards: [],
@@ -1135,37 +1196,13 @@ export default {
                 })
             }
 
-            if (postName.startsWith('comment-')) {
-                const session = await sessionOf(req, env, url)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted.')
-                }
-
-                const id = postName.slice('comment-'.length)
-                const msg = (await lobby(env).listChatMessages()).find((m) => m.id === id)
-                if (!msg) return new Response(null, { status: 404 })
-
-                const canDelete =
-                    msg.handle === session.user.handle ||
-                    session.user.handle === TOURNAMENT_HOST_HANDLE
-
-                return json({
-                    item: commentItemOf(msg),
-                    description: msg.text,
-                    actions: canDelete ? [deleteCommentAction] : [],
-                    hasCommunity: false,
-                    leaderboards: [],
-                    sections: [],
-                })
-            }
-
-            const post = await lobby(env).getPost(postName)
+            const post = await lobby(env).getPost(postPath[1]!)
             if (!post) return new Response(null, { status: 404 })
 
             return json({
                 item: post.item,
                 description: post.description,
-                actions: canManagePosts(await sessionOf(req, env, url))
+                actions: canManagePosts(await sessionOf(req, env))
                     ? [deletePostForm]
                     : [],
                 hasCommunity: false,
@@ -1390,7 +1427,7 @@ export default {
         }
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
             const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
             return json({
@@ -1407,7 +1444,7 @@ export default {
         }
 
         if (path === '/sonolus/rooms/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
 
             return json({
                 pageCount: 1,
@@ -1417,7 +1454,7 @@ export default {
         }
 
         if (path === '/sonolus/rooms/create' && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
+            const session = await sessionOf(req, env)
             if (!session) return new Response(null, { status: 401 })
 
             const name = randomId(8)
