@@ -205,7 +205,6 @@ function sanitizeWireResult(result: GameplayResult): GameplayResult {
 
     return {
         grade: wireGrade,
-        ...(result.disqualified ? { disqualified: true } : {}),
         arcadeScore: Number(result.arcadeScore) || 0,
         accuracyScore: Number(result.accuracyScore) || 0,
         combo: Number(result.combo) || 0,
@@ -1442,23 +1441,9 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                const expectedCount = state.levelInfo?.noteCount ?? null
-                const judgedCount =
-                    (Number(cmd.result.perfect) || 0) +
-                    (Number(cmd.result.great) || 0) +
-                    (Number(cmd.result.good) || 0) +
-                    (Number(cmd.result.miss) || 0)
-
-                const incomplete =
-                    expectedCount !== null && judgedCount < expectedCount
-
                 const result: GameplayResult = {
                     ...cmd.result,
                     grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
-                    disqualified:
-                        incomplete ||
-                        cmd.result.disqualified === true ||
-                        cmd.result.grade === 'X',
                 }
 
                 state.results[uid] = result
@@ -1477,7 +1462,6 @@ export class Room extends DurableObject<Env> {
                 this.diag('finishGameplay-accepted', {
                     userId: uid,
                     grade: result.grade,
-                    disqualified: result.disqualified === true,
                 })
 
                 await this.maybeFinishRound(true)
@@ -2127,7 +2111,6 @@ export class Room extends DurableObject<Env> {
             ) {
                 const result: GameplayResult = {
                     grade: 'fail',
-                    disqualified: true,
                     arcadeScore: 0,
                     accuracyScore: 0,
                     combo: 0,
