@@ -213,16 +213,11 @@ const deletePostForm = {
     options: [],
 }
 
-function rawPostCategory(url: URL): string | null {
-    return (
+function postCategory(url: URL): PostKind {
+    const type =
         url.searchParams.get('type') ??
         url.searchParams.get('infoType') ??
         url.searchParams.get('category')
-    )
-}
-
-function postCategory(url: URL): PostKind {
-    const type = rawPostCategory(url)
     return type === 'announcements' || type === 'results' ? type : 'posts'
 }
 
@@ -572,6 +567,33 @@ export default {
             })
         }
 
+        if (path === '/api/staff-chat' && req.method === 'POST') {
+            if (env.CHAT_WEBHOOK_SECRET) {
+                const auth = req.headers.get('Authorization')
+                if (auth !== `Bearer ${env.CHAT_WEBHOOK_SECRET}`) {
+                    return message(401, 'Unauthorized')
+                }
+            }
+
+            let body: any
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid JSON')
+            }
+
+            const text = typeof body?.text === 'string' ? body.text.trim() : ''
+            if (!text) return message(400, 'Missing text')
+
+            const msg = await lobby(env).addChatMessage({
+                handle: String(body?.handle ?? 'external'),
+                author: String(body?.author ?? body?.handle ?? 'External'),
+                text: text.slice(0, 500),
+            })
+
+            return json({ ok: true, message: msg })
+        }
+
         const ws = path.match(/^\/ws\/([\w-]+)$/)
 
         if (ws) {
@@ -700,15 +722,11 @@ export default {
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env)
-            const rawType = rawPostCategory(url)
 
-            if (rawType === 'staff-chat') {
+            if ((url.searchParams.get('type') ?? url.searchParams.get('infoType')) === 'staff-chat') {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return message(403, 'Staff chat is restricted.')
                 }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const recent = [...messages].reverse().slice(0, 25)
 
                 return json({
                     creates: [],
@@ -721,19 +739,11 @@ export default {
                                 {
                                     name: 'open-external-chat',
                                     version: 1 as const,
-                                    title: `Open Chat (${STAFF_CHAT_URL})`,
+                                    title: STAFF_CHAT_URL,
                                     time: Date.now(),
-                                    author: 'External Chat Link',
+                                    author: 'Chat Link',
                                     tags: [],
                                 },
-                                ...recent.map((m) => ({
-                                    name: `msg-${m.id}`,
-                                    version: 1 as const,
-                                    title: `${m.author} (${m.handle})`,
-                                    time: m.time,
-                                    author: m.text,
-                                    tags: [{ title: m.handle }],
-                                })),
                             ],
                         },
                     ],
@@ -763,22 +773,23 @@ export default {
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
             const session = await sessionOf(req, env)
-            if (rawPostCategory(url) === 'staff-chat') {
+            if ((url.searchParams.get('type') ?? url.searchParams.get('infoType')) === 'staff-chat') {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return json({ pageCount: 1, items: [], searches: [] })
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({
                     pageCount: 1,
-                    items: [...messages].reverse().slice(0, 25).map((m) => ({
-                        name: `msg-${m.id}`,
-                        version: 1 as const,
-                        title: `${m.author} (${m.handle})`,
-                        time: m.time,
-                        author: m.text,
-                        tags: [{ title: m.handle }],
-                    })),
+                    items: [
+                        {
+                            name: 'open-external-chat',
+                            version: 1 as const,
+                            title: STAFF_CHAT_URL,
+                            time: Date.now(),
+                            author: 'Chat Link',
+                            tags: [],
+                        },
+                    ],
                     searches: [],
                 })
             }
@@ -1003,34 +1014,7 @@ export default {
                         author: 'XX!',
                         tags: [],
                     },
-                    description: `Open external chat:\n${STAFF_CHAT_URL}`,
-                    actions: [],
-                    hasCommunity: false,
-                    leaderboards: [],
-                    sections: [],
-                })
-            }
-
-            if (postPath[1]!.startsWith('msg-')) {
-                const session = await sessionOf(req, env)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return new Response(null, { status: 404 })
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const target = messages.find((m) => `msg-${m.id}` === postPath[1])
-                if (!target) return new Response(null, { status: 404 })
-
-                return json({
-                    item: {
-                        name: `msg-${target.id}`,
-                        version: 1 as const,
-                        title: `${target.author} (${target.handle})`,
-                        time: target.time,
-                        author: target.author,
-                        tags: [{ title: target.handle }],
-                    },
-                    description: target.text,
+                    description: STAFF_CHAT_URL,
                     actions: [],
                     hasCommunity: false,
                     leaderboards: [],
