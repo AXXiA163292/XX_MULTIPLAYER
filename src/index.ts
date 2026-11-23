@@ -96,15 +96,20 @@ const profileOf = (p: any): UserProfile => ({
     name: String(p.name ?? ''),
 })
 
+function extractSessionToken(req: Request, url?: URL): string | null {
+    return (
+        req.headers.get('Sonolus-Session') ??
+        url?.searchParams.get('session') ??
+        null
+    )
+}
+
 async function sessionOf(
     req: Request,
     env: Env,
     url?: URL,
 ): Promise<AuthSession | null> {
-    const token =
-        req.headers.get('Sonolus-Session') ??
-        url?.searchParams.get('session') ??
-        null
+    const token = extractSessionToken(req, url)
     return token ? verifyToken<AuthSession>(env.SESSION_SECRET, token) : null
 }
 
@@ -146,6 +151,12 @@ function buildChatPostItem(latestMessage?: { text?: string } | null) {
         tags: [],
         actions: [chatCommentForm],
     }
+}
+
+function externalChatUrl(req: Request, env: Env, url: URL): string | null {
+    const token = extractSessionToken(req, url)
+    if (!token) return null
+    return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
 }
 
 const isChatCategory = (url: URL) => {
@@ -910,7 +921,7 @@ export default {
             return new Response(object.body, {
                 headers: {
                     'Content-Type': object.httpMetadata?.contentType ?? 'image/png',
-                    'Cache-Control': 'public, max-age=3600',
+                    'Cache-Control': 'public, max-age=31536000, immutable',
                 },
             })
         }
@@ -1085,7 +1096,7 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                return json({ shouldUpdateItem: true })
+                return json({ shouldUpdatePosts: true })
             }
 
             if (!canManagePosts(session)) {
@@ -1222,10 +1233,11 @@ export default {
 
                 const messages = await lobby(env).listChatMessages().catch(() => [])
                 const latest = messages[messages.length - 1] ?? null
+                const extUrl = externalChatUrl(req, env, url)
 
                 return json({
                     item: buildChatPostItem(latest),
-                    description: '',
+                    description: extUrl ? `External chat:\n${extUrl}` : '',
                     actions: [chatCommentForm],
                     hasCommunity: false,
                     leaderboards: [],
