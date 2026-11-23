@@ -113,7 +113,7 @@ function buildStaffChatPostItem(unread: number) {
         name: 'staff-chat',
         version: 1,
         title: unread > 0 ? `🔴 Chat (${unread})` : 'Chat',
-        subtitle: '@Bell · @Noct · @Ʌstra',
+        time: Date.now(),
         author: SERVER_TITLE,
         tags: [{ title: 'Chat' }],
     }
