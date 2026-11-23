@@ -37,7 +37,6 @@ export type StoredPost = {
     likes?: string[]
     comments?: PostComment[]
     pinned?: boolean
-    pinnedCommentId?: string | null
 }
 
 type LobbyState = {
@@ -76,7 +75,6 @@ function normalizePost(post: StoredPost): StoredPost {
         likes,
         comments,
         pinned,
-        pinnedCommentId: typeof post.pinnedCommentId === 'string' ? post.pinnedCommentId : null,
         item: {
             ...post.item,
             subtitle: parts.join(' · '),
@@ -225,24 +223,11 @@ export class Lobby extends DurableObject<Env> {
         return this.st.posts[name]!
     }
 
-    async pinPostComment(name: string, commentId: string): Promise<StoredPost | null> {
-        const post = this.st.posts[name]
-        if (!post) return null
-
-        post.pinnedCommentId = post.pinnedCommentId === commentId ? null : commentId
-        this.st.posts[name] = normalizePost(post)
-        await this.persist()
-        return this.st.posts[name]!
-    }
-
     async deletePostComment(name: string, commentId: string): Promise<StoredPost | null> {
         const post = this.st.posts[name]
         if (!post) return null
 
         post.comments = (post.comments ?? []).filter((c) => c.id !== commentId)
-        if (post.pinnedCommentId === commentId) {
-            post.pinnedCommentId = null
-        }
         this.st.posts[name] = normalizePost(post)
         await this.persist()
         return this.st.posts[name]!
