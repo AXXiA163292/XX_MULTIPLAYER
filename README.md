@@ -39,7 +39,6 @@ Sign in and open **Rooms** or **Levels**.
   - **Group Stage (`groupStage`) & Final (`final`):** Tournament modes for host `163292`, pre-selecting `G1` / `F1` on creation and supporting `Round N`, `Warmup - Round N`, `Round N - Rewind`, and `Freeplay • Round N` round types.
 - **Room Lifespan & Stability:** Empty or unjoined rooms close after 3 minutes (`EMPTY_ROOM_TTL_MS`), while active rooms stay open up to 4 hours (`MAX_ROOM_LIFESPAN_MS`) with WebSocket auto-ping/pong so AFK players are not disconnected.
 - **Rounds & Scoring:** Warmup rounds do not count toward score, and replay/rewind/freeplay songs only add score on the first valid result unless that first result was `0` due to `X` / disqualification. Wire results strip non-standard fields while internal scoring tracks `X` as `0` score.
-- **Staff Chat:** Private chat button (`infoType: 'staff-chat'`) shown dynamically on `/sonolus/info` only when signed in as `163292`, `283420`, or `3227470`, featuring unread indicators (`🔴`), bottom-bar input, and shortcuts `@Bell`, `@Noct`, and `@Ʌstra`.
 
 ## Project Layout
 
