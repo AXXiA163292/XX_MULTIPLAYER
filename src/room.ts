@@ -172,7 +172,6 @@ function buildRoundLabel(
         return `Round ${tournamentRounds.length + 1}`
     }
 
-    // Rewind: find the original Round number for this song and count prior Rewinds of it
     let baseRoundIndex = -1
     for (let i = 0; i < priorHistory.length; i++) {
         const rec = priorHistory[i]!
