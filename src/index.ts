@@ -375,8 +375,6 @@ function resolveCategory(
     const bodyValueParams = parseEncodedParams(body?.values)
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
-    // Sonolus sends the button's infoType directly as `type` on /sonolus/posts/info,
-    // and sends the form's `type` inside `values` on /sonolus/posts/create.
     const candidates: (string | null | undefined)[] = [
         values?.get('type'),
         bodyValueParams?.get('type'),
@@ -705,17 +703,18 @@ function renderStaffChatHtml(
 <link rel="manifest" href="/manifest.webmanifest"/>
 <link rel="icon" type="image/png" href="/app-icon.png"/>
 <link rel="apple-touch-icon" href="/app-icon.png"/>
-<title>XX!</title>
+<title>XX! • chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
-  header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-  .header-brand{display:flex;align-items:center;gap:8px}
+  header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .header-brand{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .app-logo{width:24px;height:24px;border-radius:6px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
   .header-right{display:flex;align-items:center;gap:8px}
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
   .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}
   .btn-sm:hover{border-color:#3b82f6}
+  .btn-danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
   #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
   #picker.open{display:flex}
   .picker-title{font-size:18px;font-weight:700;text-align:center}
@@ -769,14 +768,16 @@ function renderStaffChatHtml(
   .emoji-opt:hover{border-color:#3b82f6}
   .crop-box{position:relative;width:180px;height:180px;margin:6px auto;border-radius:12px;overflow:hidden;border:2px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
   .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
-  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}
+  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap}
+  .modal-actions-right{display:flex;gap:8px}
 </style>
 </head>
 <body>
   <header>
     <div class="header-brand">
       <img class="app-logo" src="/app-icon.png" alt="XX!"/>
-      <span>XX!</span>
+      <span>XX! • chat</span>
+      <button id="loadChatsBtn" type="button" class="btn-sm">Load chats</button>
     </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
@@ -817,8 +818,11 @@ function renderStaffChatHtml(
         <input id="customEmojiInput" type="text" maxlength="16" placeholder="Any emoji..."/>
       </div>
       <div class="modal-actions">
-        <button id="closeReactBtn" type="button" class="btn-sm">Cancel</button>
-        <button id="applyReactBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Apply</button>
+        <div></div>
+        <div class="modal-actions-right">
+          <button id="closeReactBtn" type="button" class="btn-sm">Cancel</button>
+          <button id="applyReactBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Apply</button>
+        </div>
       </div>
     </div>
   </div>
@@ -841,8 +845,11 @@ function renderStaffChatHtml(
         </div>
       </div>
       <div class="modal-actions">
-        <button id="closeSettingsBtn" type="button" class="btn-sm">Close</button>
-        <button id="saveSettingsBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Save</button>
+        <button id="logoutBtn" type="button" class="btn-sm btn-danger">Log out</button>
+        <div class="modal-actions-right">
+          <button id="closeSettingsBtn" type="button" class="btn-sm">Close</button>
+          <button id="saveSettingsBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Save</button>
+        </div>
       </div>
     </div>
   </div>
@@ -861,6 +868,8 @@ function renderStaffChatHtml(
   const chatViewEl = document.getElementById('chatView');
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
+  const loadChatsBtn = document.getElementById('loadChatsBtn');
+  const logoutBtn = document.getElementById('logoutBtn');
   const box = document.getElementById('messages');
   const shortcutsBar = document.getElementById('shortcutsBar');
   const input = document.getElementById('chatInput');
@@ -937,7 +946,7 @@ function renderStaffChatHtml(
   }
 
   function getActiveUser() {
-    if (sonolusUser) {
+    if (sonolusUser && sonolusUser.handle) {
       return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
     }
     const saved = readSavedHandle();
@@ -1087,7 +1096,8 @@ function renderStaffChatHtml(
     const active = getActiveUser();
     if (!active) return;
     try {
-      const res = await fetch('/api/chat?handle=' + encodeURIComponent(active.handle), {
+      const qs = 'handle=' + encodeURIComponent(active.handle) + '&t=' + Date.now();
+      const res = await fetch('/api/chat?' + qs, {
         headers: authHeaders(),
         credentials: 'same-origin',
         cache: 'no-store',
@@ -1098,15 +1108,19 @@ function renderStaffChatHtml(
           Object.assign(prefsMap, data.prefs);
           renderKnownUserChips();
         }
-        render(data.messages || []);
+        render(Array.isArray(data.messages) ? data.messages : []);
       }
     } catch {}
   }
 
+  loadChatsBtn.addEventListener('click', () => {
+    void loadMessages();
+  });
+
   function syncMode() {
     const active = getActiveUser();
     if (!active) {
-      badgeEl.textContent = 'Select handle';
+      badgeEl.textContent = 'Pick profile';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
       chatViewEl.classList.remove('open');
@@ -1118,8 +1132,15 @@ function renderStaffChatHtml(
     pickerEl.classList.remove('open');
     chatViewEl.classList.add('open');
     renderKnownUserChips();
-    loadMessages();
+    void loadMessages();
   }
+
+  logoutBtn.addEventListener('click', () => {
+    persistHandle('');
+    setReplyTarget(null);
+    settingsModal.classList.remove('open');
+    syncMode();
+  });
 
   async function toggleLikeMessage(id) {
     const active = getActiveUser();
@@ -1313,7 +1334,6 @@ function renderStaffChatHtml(
     });
   });
 
-  // Swipe right to reply + double-tap to like
   let swipeRow = null;
   let swipeStartX = 0;
   let swipeDeltaX = 0;
@@ -1438,16 +1458,19 @@ function renderStaffChatHtml(
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) loadMessages();
+    if (!document.hidden) void loadMessages();
   });
-  window.addEventListener('focus', loadMessages);
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', syncMode);
-  } else {
+  window.addEventListener('focus', () => {
+    void loadMessages();
+  });
+  window.addEventListener('pageshow', () => {
     syncMode();
-  }
-  setInterval(loadMessages, 3500);
+  });
+
+  syncMode();
+  setInterval(() => {
+    void loadMessages();
+  }, 2500);
 </script>
 </body>
 </html>`
@@ -1487,7 +1510,7 @@ function postForm(category: PostCategory) {
     const label = POST_LABELS[category]
 
     return {
-        name: label.create,
+        name: category,
         type: category,
         title: label.create,
         requireConfirmation: false,
@@ -1495,7 +1518,7 @@ function postForm(category: PostCategory) {
             {
                 name: 'title',
                 query: 'title',
-                required: true,
+                required: false,
                 type: 'text',
                 def: '',
                 placeholder: label.titlePlaceholder,
@@ -1505,7 +1528,7 @@ function postForm(category: PostCategory) {
             {
                 name: 'description',
                 query: 'description',
-                required: true,
+                required: false,
                 type: 'textArea',
                 def: '',
                 placeholder: label.bodyPlaceholder,
