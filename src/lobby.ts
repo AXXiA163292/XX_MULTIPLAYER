@@ -32,12 +32,14 @@ type LobbyState = {
     rooms: Record<string, LobbyRoom>
     posts: Record<string, StoredPost>
     chat: ChatMessage[]
+    pinnedChatId: string | null
 }
 
 const freshLobby = (): LobbyState => ({
     rooms: {},
     posts: {},
     chat: [],
+    pinnedChatId: null,
 })
 
 export class Lobby extends DurableObject<Env> {
@@ -56,6 +58,7 @@ export class Lobby extends DurableObject<Env> {
                 rooms: saved?.rooms && typeof saved.rooms === 'object' ? saved.rooms : {},
                 posts: saved?.posts && typeof saved.posts === 'object' ? saved.posts : {},
                 chat: Array.isArray(saved?.chat) ? saved.chat.slice(-200) : [],
+                pinnedChatId: typeof saved?.pinnedChatId === 'string' ? saved.pinnedChatId : null,
             }
         })
     }
@@ -119,6 +122,23 @@ export class Lobby extends DurableObject<Env> {
         return this.st.chat
     }
 
+    async getPinnedChatId(): Promise<string | null> {
+        return this.st.pinnedChatId
+    }
+
+    async pinChatMessage(id?: string): Promise<string | null> {
+        const targetId = id ?? this.st.chat[this.st.chat.length - 1]?.id ?? null
+        if (!targetId) {
+            this.st.pinnedChatId = null
+            await this.persist()
+            return null
+        }
+
+        this.st.pinnedChatId = this.st.pinnedChatId === targetId ? null : targetId
+        await this.persist()
+        return this.st.pinnedChatId
+    }
+
     async addChatMessage(input: {
         handle: string
         author: string
@@ -145,9 +165,14 @@ export class Lobby extends DurableObject<Env> {
         if (id) {
             const before = this.st.chat.length
             this.st.chat = this.st.chat.filter((m) => m.id !== id)
+            if (this.st.pinnedChatId === id) this.st.pinnedChatId = null
             if (this.st.chat.length === before) return false
         } else {
+            const removed = this.st.chat[this.st.chat.length - 1]
             this.st.chat = this.st.chat.slice(0, -1)
+            if (removed && this.st.pinnedChatId === removed.id) {
+                this.st.pinnedChatId = null
+            }
         }
 
         await this.persist()
