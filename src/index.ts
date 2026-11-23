@@ -170,10 +170,9 @@ function resolveCategory(
     body?: any,
     values?: URLSearchParams,
 ): PostCategory | null {
-    const bodySearchParams = parseEncodedParams(body?.searchValues ?? body?.values)
-    const urlSearchParams = parseEncodedParams(
-        url.searchParams.get('searchValues') ?? url.searchParams.get('values'),
-    )
+    const bodySearchParams = parseEncodedParams(body?.searchValues)
+    const bodyValueParams = parseEncodedParams(body?.values)
+    const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
     const candidates: (string | null | undefined)[] = [
         url.searchParams.get('category'),
@@ -183,12 +182,15 @@ function resolveCategory(
         urlSearchParams?.get('category'),
         urlSearchParams?.get('type'),
         urlSearchParams?.get('infoType'),
-        values?.get('category'),
-        values?.get('type'),
-        values?.get('infoType'),
         bodySearchParams?.get('category'),
         bodySearchParams?.get('type'),
         bodySearchParams?.get('infoType'),
+        values?.get('category'),
+        values?.get('type'),
+        values?.get('infoType'),
+        bodyValueParams?.get('category'),
+        bodyValueParams?.get('type'),
+        bodyValueParams?.get('infoType'),
         body?.category,
         body?.type,
         body?.infoType,
@@ -204,9 +206,7 @@ function resolveCategory(
     if (referer) {
         try {
             const refUrl = new URL(referer)
-            const refSearchParams = parseEncodedParams(
-                refUrl.searchParams.get('searchValues') ?? refUrl.searchParams.get('values'),
-            )
+            const refSearchParams = parseEncodedParams(refUrl.searchParams.get('searchValues'))
             const refCandidates: (string | null | undefined)[] = [
                 refUrl.searchParams.get('category'),
                 refUrl.searchParams.get('type'),
@@ -226,15 +226,6 @@ function resolveCategory(
     }
 
     return null
-}
-
-function postCategory(
-    url: URL,
-    req?: Request,
-    body?: any,
-    values?: URLSearchParams,
-): PostCategory {
-    return resolveCategory(url, req, body, values) ?? 'posts'
 }
 
 function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
@@ -590,7 +581,7 @@ function postForm(category: PostCategory) {
 
     return {
         name: label.create,
-        type: 'post',
+        type: category,
         title: label.create,
         requireConfirmation: false,
         options: [
@@ -1251,7 +1242,6 @@ export default {
                         {
                             title: 'Chat',
                             itemType: 'post',
-                            hasMore: false,
                             items: [buildChatPostItem(messages, pinnedId)],
                         },
                     ],
@@ -1273,7 +1263,6 @@ export default {
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
-                        hasMore: posts.length > 0,
                         searchValues: new URLSearchParams({ category: kind }).toString(),
                         items: posts.map(buildPostItemWithBadges),
                     }
@@ -1318,7 +1307,11 @@ export default {
                 })
             }
 
-            const kind = postCategory(url, req)
+            const kind = resolveCategory(url, req)
+            if (!kind) {
+                return message(400, 'Missing category.')
+            }
+
             const posts = sortPostsPinnedFirst(
                 (await lobby(env).listPosts(kind).catch(() => [])).filter(
                     (p) => p.category === kind,
@@ -1351,7 +1344,11 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            const category = postCategory(url, req, body, values)
+            const category = resolveCategory(url, req, body, values)
+            if (!category) {
+                return message(400, 'Invalid or missing post category.')
+            }
+
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
             const thumbnailHash = (values.get('thumbnail') ?? '').trim()
@@ -1650,8 +1647,8 @@ export default {
             }
 
             await Promise.all([
-                env.COMMUNITY_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
                 env.POSTS_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
+                env.COMMUNITY_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
                 lobby(env).removePost(postName),
             ])
 
@@ -1739,8 +1736,8 @@ export default {
                 return message(400, 'Image hash does not match.')
             }
 
-            await (env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET).put(
-                `${post.category}/${post.item.name}/thumbnail`,
+            await env.POSTS_BUCKET.put(
+                `posts/${post.item.name}/thumbnail`,
                 bytes,
                 { httpMetadata: { contentType } },
             )
@@ -1761,13 +1758,10 @@ export default {
             const post = await lobby(env).getPost(name).catch(() => null)
 
             const object =
+                (await env.POSTS_BUCKET?.get(`posts/${name}/thumbnail`).catch(() => null)) ??
                 (post && env.COMMUNITY_BUCKET
                     ? await env.COMMUNITY_BUCKET.get(`${post.category}/${name}/thumbnail`).catch(() => null)
-                    : null) ??
-                (env.COMMUNITY_BUCKET
-                    ? await env.COMMUNITY_BUCKET.get(`posts/${name}/thumbnail`).catch(() => null)
-                    : null) ??
-                (await env.POSTS_BUCKET?.get(`posts/${name}/thumbnail`).catch(() => null))
+                    : null)
 
             if (!object) return new Response(null, { status: 404 })
 
