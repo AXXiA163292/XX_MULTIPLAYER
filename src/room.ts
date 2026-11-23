@@ -8,7 +8,6 @@ import {
 } from './config.ts'
 import {
     closeRoomForm,
-    defaultCustomRoomTitle,
     normalizeCustomSongsMode,
     parseSettings,
     roomFormsForType,
@@ -21,7 +20,6 @@ import {
     fmtDetail,
     fmtScore,
     totals,
-    type RoundKind,
     type RoundRecord,
 } from './scoring.ts'
 import {
@@ -64,22 +62,11 @@ type LevelInfo = {
     difficulty: string
 }
 
-type ConstantEntry = {
-    constant: number
-    difficulty?: string
-}
-
 type RoomState = {
     name: string
     createdAt: number
     edition: string
     divisions: Record<string, string>
-    poolSongKeys: string[]
-    primarySongKey: string
-    playedSongCounts: Record<string, number>
-    playedTournamentSong: boolean
-    warmupCount: number
-    freeplayCount: number
     reserved: Reservation | null
     configured: boolean
     hostId: string
@@ -102,12 +89,6 @@ const fresh = (): RoomState => ({
     createdAt: 0,
     edition: '',
     divisions: {},
-    poolSongKeys: [],
-    primarySongKey: '',
-    playedSongCounts: {},
-    playedTournamentSong: false,
-    warmupCount: 0,
-    freeplayCount: 0,
     reserved: null,
     configured: false,
     hostId: '',
@@ -137,14 +118,7 @@ const fresh = (): RoomState => ({
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-const stripTrailingSlash = (value: string) => value.trim().replace(/\/+$/, '')
-
-const songKeyOf = (level: Sil | null | undefined): string => {
-    if (!level) return ''
-    return `${stripTrailingSlash(level.address)}::${level.name.trim()}`
-}
-
-const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
+const getRoomTitle = (settings: RoomSettings, edition = '') => {
     if (settings.type === 'rankedRoom') {
         return String(settings.tier || 'master').toUpperCase()
     }
@@ -154,7 +128,7 @@ const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
     }
 
     if (settings.type === 'casualRoom') {
-        return settings.title || defaultCustomRoomTitle(hostName)
+        return settings.title || 'Custom Room'
     }
 
     return `${edition || 'Final'} Final`
@@ -249,6 +223,20 @@ function descriptionText(value: any): string {
     return ''
 }
 
+function extractDescriptionNumber(
+    description: string,
+    label: string,
+): number | null {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const match = description.match(
+        new RegExp(`${escaped}\\s*(?:•|:)\\s*(\\d+(?:\\.\\d+)?)`, 'i'),
+    )
+
+    if (!match) return null
+    const value = Number(match[1])
+    return Number.isFinite(value) ? value : null
+}
+
 function extractDifficulty(description: string): string {
     const match = description.match(
         /(?:^|\n)\s*Difficulty\s*(?:•|:)\s*(EASY|NORMAL|HARD|EXPERT|MASTER|APPEND)\b/i,
@@ -266,75 +254,7 @@ function extractComboCount(description: string): number | null {
     return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
-async function lookupConstantFromR2(
-    env: Env,
-    level: Sil,
-): Promise<ConstantEntry | null> {
-    const bucket = env.POSTS_BUCKET
-    if (!bucket) return null
-
-    const normalizedAddress = stripTrailingSlash(level.address)
-    const candidates = [
-        normalizedAddress,
-        `${normalizedAddress}/levels/${level.name}`,
-        `${normalizedAddress}/sonolus/levels/${level.name}`,
-    ]
-
-    for (const key of ['server/constants/index.json', 'constants.json', 'custom-songs.json']) {
-        try {
-            const obj = await bucket.get(key)
-            if (!obj) continue
-            const parsed = await obj.json<any>()
-            const raw = parsed && typeof parsed === 'object' && 'data' in parsed ? parsed.data : parsed
-
-            if (Array.isArray(raw)) {
-                for (const row of raw) {
-                    const rowInput = stripTrailingSlash(String(row?.input ?? row?.url ?? ''))
-                    if (!rowInput) continue
-                    if (candidates.includes(rowInput)) {
-                        const c = Number(row?.Constant ?? row?.constant)
-                        if (Number.isFinite(c) && c > 0) {
-                            return {
-                                constant: Math.round(c * 10) / 10,
-                                difficulty: typeof row?.Difficulty === 'string'
-                                    ? row.Difficulty.toUpperCase()
-                                    : typeof row?.difficulty === 'string'
-                                        ? row.difficulty.toUpperCase()
-                                        : undefined,
-                            }
-                        }
-                    }
-                }
-            } else if (raw && typeof raw === 'object') {
-                for (const cand of candidates) {
-                    const entry = raw[cand]
-                    if (typeof entry === 'number' && Number.isFinite(entry) && entry > 0) {
-                        return { constant: Math.round(entry * 10) / 10 }
-                    }
-                    if (entry && typeof entry === 'object') {
-                        const c = Number(entry.Constant ?? entry.constant)
-                        if (Number.isFinite(c) && c > 0) {
-                            return {
-                                constant: Math.round(c * 10) / 10,
-                                difficulty: typeof entry.difficulty === 'string'
-                                    ? entry.difficulty.toUpperCase()
-                                    : undefined,
-                            }
-                        }
-                    }
-                }
-            }
-        } catch {
-            // Ignore malformed constant table in R2.
-        }
-    }
-
-    return null
-}
-
-async function fetchLevelInfo(level: Sil, env: Env): Promise<LevelInfo | null> {
-    const r2Constant = await lookupConstantFromR2(env, level)
-
+async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
     try {
         const base = new URL(level.address)
 
@@ -343,16 +263,7 @@ async function fetchLevelInfo(level: Sil, env: Env): Promise<LevelInfo | null> {
             base.username ||
             base.password
         ) {
-            return r2Constant
-                ? {
-                    title: level.name,
-                    firstTag: r2Constant.difficulty ?? '',
-                    rating: r2Constant.constant,
-                    constant: r2Constant.constant,
-                    noteCount: null,
-                    difficulty: r2Constant.difficulty ?? '',
-                }
-                : null
+            return null
         }
 
         const encodedName = encodeURIComponent(level.name)
@@ -401,7 +312,6 @@ async function fetchLevelInfo(level: Sil, env: Env): Promise<LevelInfo | null> {
                     taggedDifficulty.toUpperCase().match(
                         /EASY|NORMAL|HARD|EXPERT|MASTER|APPEND/,
                     )?.[0] ||
-                    r2Constant?.difficulty ||
                     ''
 
                 const firstTag = difficulty || taggedDifficulty
@@ -418,7 +328,8 @@ async function fetchLevelInfo(level: Sil, env: Env): Promise<LevelInfo | null> {
                     ? Math.round(parsedRating * 10) / 10
                     : null
 
-                const constant = r2Constant?.constant ?? rating
+                const descriptionConstant = extractDescriptionNumber(description, 'Constant')
+                const constant = descriptionConstant ?? rating
 
                 return {
                     title: localize(item.title) || level.name,
@@ -434,17 +345,6 @@ async function fetchLevelInfo(level: Sil, env: Env): Promise<LevelInfo | null> {
         }
     } catch (error) {
         console.warn('Invalid level address:', level.address, error)
-    }
-
-    if (r2Constant) {
-        return {
-            title: level.name,
-            firstTag: r2Constant.difficulty ?? '',
-            rating: r2Constant.constant,
-            constant: r2Constant.constant,
-            noteCount: null,
-            difficulty: r2Constant.difficulty ?? '',
-        }
     }
 
     return null
@@ -527,18 +427,6 @@ export class Room extends DurableObject<Env> {
                 },
                 edition: typeof saved?.edition === 'string' ? saved.edition : '',
                 divisions: cleanDivisions(saved?.divisions),
-                poolSongKeys: Array.isArray(saved?.poolSongKeys)
-                    ? saved.poolSongKeys.filter((k): k is string => typeof k === 'string')
-                    : [],
-                primarySongKey: typeof saved?.primarySongKey === 'string'
-                    ? saved.primarySongKey
-                    : '',
-                playedSongCounts: saved?.playedSongCounts && typeof saved.playedSongCounts === 'object'
-                    ? saved.playedSongCounts as Record<string, number>
-                    : {},
-                playedTournamentSong: saved?.playedTournamentSong === true,
-                warmupCount: typeof saved?.warmupCount === 'number' ? saved.warmupCount : 0,
-                freeplayCount: typeof saved?.freeplayCount === 'number' ? saved.freeplayCount : 0,
                 reserved: saved?.reserved ?? null,
                 configured: saved?.configured === true,
                 hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
@@ -622,665 +510,1517 @@ export class Room extends DurableObject<Env> {
                 this.st.settings.random = false
             }
 
-            if (!this.st.hostName && this.st.hostId) {
-                const hostMember = this.st.members.find((m) => m.id === this.st.hostId)
-                if (hostMember?.name) this.st.hostName = hostMember.name
+            if (!['pp', 'rankedMatch'].includes(this.st.settings.scoring)) {
+                this.st.settings.scoring = 'pp'
             }
 
-            if (this.st.status === 'selecting' && this.st.suggestions.length === 0 && this.st.hostId) {
-                this.st.suggestions = await songPoolSuggestions(this.st.settings.type, this.st.hostId)
-                this.st.poolSongKeys = this.st.suggestions.map((s) => songKeyOf(s.level)).filter(Boolean)
-                if (!this.st.primarySongKey && this.st.poolSongKeys.length > 0) {
-                    this.st.primarySongKey = this.st.poolSongKeys[0]!
-                }
-                if (!this.st.level && this.st.suggestions.length > 0) {
-                    this.st.level = this.st.suggestions[0]!.level
+            const uniqueMembers = new Map<string, Member>()
+            for (const member of this.st.members) {
+                uniqueMembers.set(member.id, member)
+            }
+            this.st.members = [...uniqueMembers.values()]
+
+            for (const member of this.st.members) {
+                this.st.statuses[member.id] ??= 'waiting'
+            }
+
+            const memberIds = new Set(this.st.members.map((member) => member.id))
+            for (const id of Object.keys(this.st.statuses)) {
+                if (!memberIds.has(id)) delete this.st.statuses[id]
+            }
+            for (const id of Object.keys(this.st.results)) {
+                if (!memberIds.has(id)) delete this.st.results[id]
+            }
+
+            if (this.st.status === 'playing' && !this.st.round) {
+                this.st.status = 'selecting'
+                this.st.results = {}
+                for (const member of this.st.members) {
+                    this.st.statuses[member.id] = 'waiting'
                 }
             }
 
-            this.syncRoomAlarm()
+            if (this.st.status === 'playing') {
+                for (const member of this.st.members) {
+                    if (this.st.statuses[member.id] === 'skipped') {
+                        this.st.statuses[member.id] = 'waiting'
+                    }
+                }
+            }
+
+            await ctx.storage.put('st', this.st)
         })
     }
 
-    private syncRoomAlarm(): void {
-        if (!this.st.name || !this.st.createdAt) return
-        const deadline = this.st.createdAt + MAX_ROOM_LIFESPAN_MS
-        void this.ctx.storage.setAlarm(deadline)
+    private remainingLifespanMs(now = Date.now()): number {
+        if (!this.st.createdAt) return MAX_ROOM_LIFESPAN_MS
+        return Math.max(0, this.st.createdAt + MAX_ROOM_LIFESPAN_MS - now)
     }
 
-    async alarm(): Promise<void> {
-        if (this.st.round && this.st.status === 'playing') {
-            this.syncRoomAlarm()
+    private isExpired(now = Date.now()): boolean {
+        return this.st.createdAt > 0 && now >= this.st.createdAt + MAX_ROOM_LIFESPAN_MS
+    }
+
+    private async scheduleNextAlarm(delayMs?: number): Promise<void> {
+        const now = Date.now()
+        const maxRemaining = this.remainingLifespanMs(now)
+
+        if (maxRemaining <= 0) {
+            await this.expireAndDestroy()
             return
         }
 
-        if (Date.now() - this.st.createdAt < MAX_ROOM_LIFESPAN_MS) {
-            this.syncRoomAlarm()
-            return
-        }
+        const targetDelay = delayMs === undefined
+            ? maxRemaining
+            : Math.min(Math.max(1000, delayMs), maxRemaining)
 
-        this.st.members = []
-        this.st.statuses = {}
-        this.st.round = null
+        await this.ctx.storage.setAlarm(now + targetDelay)
+    }
+
+    private async expireAndDestroy(): Promise<void> {
+        const roomName = this.st.name
+        const sockets = this.ctx.getWebSockets()
+
+        this.st = fresh()
         await this.ctx.storage.deleteAll()
-        await this.env.LOBBY.get(this.env.LOBBY.idFromName('main')).remove(this.st.name).catch(() => {})
+
+        if (roomName) {
+            await this.env.LOBBY
+                .get(this.env.LOBBY.idFromName('main'))
+                .remove(roomName)
+                .catch(() => {})
+        }
+
+        for (const socket of sockets) {
+            try {
+                socket.close(4002, 'room expired (3m max)')
+            } catch {
+                // Socket may already be closed.
+            }
+        }
     }
 
-    private save() {
-        this.syncRoomAlarm()
-        void this.ctx.storage.put('st', this.st)
-        void this.env.LOBBY.get(this.env.LOBBY.idFromName('main')).upsert({
-            name: this.st.name,
-            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
-            subtitle: `${this.st.members.length} players • ${SCORING_MODES[this.st.settings.scoring]}`,
-            master: this.st.hostId,
-            hostId: this.st.hostId,
-            visibility: this.st.settings.visibility,
+    private diag(event: string, extra?: Record<string, unknown>) {
+        const connectedIds = this.st.members
+            .filter((m) => this.socketsOf(m.id).length > 0)
+            .map((m) => m.id)
+
+        console.log(`[Room:${this.st.name || 'init'}] ${event}`, {
+            type: this.st.settings.type,
+            scoring: this.st.settings.scoring,
+            status: this.st.status,
+            round: this.st.round?.state ?? null,
+            historyLen: this.st.history.length,
+            resultsKeys: Object.keys(this.st.results),
+            connectedIds,
+            statuses: this.st.statuses,
+            ...extra,
         })
     }
 
-    async reserve(name: string, r: Reservation) {
-        if (!this.st.createdAt) {
-            this.st.createdAt = Date.now()
+    async reserve(name: string, reservation: Reservation): Promise<void> {
+        this.st = {
+            ...fresh(),
+            name,
+            createdAt: Date.now(),
+            reserved: reservation,
         }
-        this.st.name = name
-        this.st.reserved = r
-        this.st.hostId = r.hostId
-        this.st.hostName = r.hostName
-        this.save()
+
+        await this.save()
+        await this.scheduleNextAlarm(RESERVED_ROOM_TTL_MS)
     }
 
     async configure(
         key: string,
         settings: RoomSettings,
-        host?: { id: string; name?: string; handle?: string },
+        host: { id: string; name: string; handle: string },
     ): Promise<boolean> {
-        if (!this.st.reserved || this.st.reserved.key !== key) return false
-        if (!isOpenType(settings.type) && host?.handle !== TOURNAMENT_HOST_HANDLE) {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
             return false
         }
 
-        const effectiveHostName = host?.name || this.st.reserved.hostName || this.st.hostName
-        this.st.configured = true
-        this.st.hostId = host?.id || this.st.reserved.hostId
-        this.st.hostName = effectiveHostName
-        this.st.settings = {
-            ...settings,
-            title: settings.type === 'casualRoom'
-                ? (settings.title || defaultCustomRoomTitle(effectiveHostName))
-                : settings.title,
+        const reservation = this.st.reserved
+
+        if (
+            !reservation ||
+            reservation.key !== key ||
+            reservation.hostId !== host.id ||
+            reservation.hostHandle !== host.handle
+        ) {
+            return false
         }
 
-        if (!isOpenType(settings.type)) {
-            try {
-                const edition = await getEditionData()
-                this.st.edition = edition.edition
-                this.st.divisions = cleanDivisions(edition.divisions)
-                const charts = chartsForType(edition, settings.type)
-                this.st.suggestions = suggestionsFromCharts(charts, this.st.hostId)
-                this.st.poolSongKeys = this.st.suggestions.map((s) => songKeyOf(s.level)).filter(Boolean)
-                this.st.primarySongKey = this.st.poolSongKeys[0] ?? ''
-                this.st.level = this.st.suggestions[0]?.level ?? null
-            } catch (error) {
-                console.error('Could not load tournament edition:', error)
-            }
-        } else if (settings.type === 'rankedRoom') {
-            const picked = await pickRankedLevel(
-                settings.tier as RankedTier,
-                settings.customSongs,
-                this.env,
+        if (
+            host.handle !== TOURNAMENT_HOST_HANDLE &&
+            !isOpenType(settings.type)
+        ) {
+            return false
+        }
+
+        if (settings.type === 'casualRoom' && !settings.title) {
+            settings.title = 'Custom Room'
+        }
+
+        let editionData: EditionData | null = null
+
+        try {
+            editionData = await getEditionData()
+        } catch (error) {
+            console.error('Could not load edition sheet while configuring room:', error)
+        }
+
+        if (editionData) {
+            this.st.edition = editionData.edition
+            this.st.divisions = cleanDivisions(editionData.divisions)
+            this.st.suggestions = suggestionsFromCharts(
+                chartsForType(editionData, settings.type),
+                host.id,
             )
-            this.st.level = picked
-                ? { address: picked.address, name: picked.name }
-                : null
+        } else {
+            this.st.edition ||= 'Final'
+            this.st.divisions = {}
+            this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
         }
 
+        this.st.createdAt = Date.now()
+        this.st.configured = true
+        this.st.hostId = host.id
+        this.st.hostName = host.name
+        this.st.settings = { ...settings }
         this.st.reserved = null
-        this.save()
+        this.st.status = 'selecting'
+        this.st.level = null
+        this.st.levelInfo = null
+        this.st.levelOptions = []
+        this.st.round = null
+        this.st.results = {}
+        this.st.history = []
+
+        await this.save()
+        await this.syncLobby()
+        await this.scheduleNextAlarm(MAX_ROOM_LIFESPAN_MS)
+        this.diag('configured')
+
         return true
     }
 
-    async canJoin(user: { id: string; handle?: string }): Promise<string | null> {
-        if (!this.st.configured) return 'Room is not ready.'
-        if (Date.now() - this.st.createdAt >= MAX_ROOM_LIFESPAN_MS) {
-            return 'Room has expired.'
+    async isOpen(): Promise<boolean> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return false
         }
-        if (
-            this.st.settings.visibility === 'locked' &&
-            user.id !== this.st.hostId &&
-            user.handle !== TOURNAMENT_HOST_HANDLE
-        ) {
-            return 'Room is locked.'
-        }
-        return null
+        return this.st.configured
     }
 
     async summary() {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return null
+        }
+
+        if (!this.st.configured) return null
+
         return {
             name: this.st.name,
-            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
-            subtitle: `${this.st.members.length} players • ${SCORING_MODES[this.st.settings.scoring]}`,
-            master: this.st.hostId,
+            title: getRoomTitle(this.st.settings, this.st.edition),
+            subtitle: this.subtitle(),
+            master: this.st.hostName,
+            hostId: this.st.hostId,
+            visibility: this.st.settings.visibility,
         }
     }
 
-    private member(userId: string) {
-        return this.st.members.find((m) => m.id === userId)
-    }
-
-    private isHost(userId: string) {
-        return Boolean(userId && userId === this.st.hostId)
-    }
-
-    private sockets = new Map<WebSocket, string>()
-
-    private send(ws: WebSocket, ev: Ev) {
-        try {
-            ws.send(JSON.stringify(ev))
-        } catch {
-            // Ignore closed socket.
-        }
-    }
-
-    private broadcast(ev: Ev) {
-        const msg = JSON.stringify(ev)
-        for (const ws of this.sockets.keys()) {
-            try {
-                ws.send(msg)
-            } catch {
-                // Ignore closed socket.
-            }
-        }
-    }
-
-    private syncRoom() {
-        this.broadcast({
-            type: 'roomState',
-            state: this.roomState(),
-        })
-    }
-
-    private syncUsers() {
-        this.broadcast({
-            type: 'roomUsers',
-            users: this.st.members.map((m) => ({
-                user: m.roomUser,
-                status: this.st.statuses[m.id] ?? 'waiting',
-            })),
-        })
-    }
-
-    private roomState() {
-        return {
-            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
-            master: this.st.hostId,
-            lead: this.st.hostId,
-            status: this.st.status,
-            options: serializeSettings(this.st.settings, this.st.hostName),
-            level: this.st.level ?? { address: '', name: '' },
-            levelOptions: this.st.levelOptions,
-            suggestions: this.st.suggestions,
-        }
-    }
-
-    private userDivisionLabel(handle: string): string | null {
-        const division = this.st.divisions[handle]
-        if (!division) return null
-
-        if (this.st.settings.type === 'groupStage') {
-            return division.startsWith('Group ') ? division : null
+    async canJoin(user: { id: string; handle: string }): Promise<string | null> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return 'This room has expired.'
         }
 
-        if (this.st.settings.type === 'final') {
-            return division === 'Upper Bracket' || division === 'Lower Bracket'
-                ? division
-                : null
-        }
+        if (!this.st.configured) return 'This room does not exist.'
+
+        const s = this.st.settings
+        if (user.id === this.st.hostId || user.handle === TOURNAMENT_HOST_HANDLE) return null
+        if (s.visibility === 'locked') return 'This room is locked.'
 
         return null
     }
 
-    private formatPlayerName(member: Member): string {
-        const division = this.userDivisionLabel(member.handle)
-        return division ? `${member.name} [${division}]` : member.name
-    }
-
-    private classifyNextRound(level: Sil | null): {
-        roundKind: RoundKind
-        roundLabel: string
-        countsTowardScore: boolean
-        isReplay: boolean
-    } {
-        const key = songKeyOf(level)
-        const priorCount = key ? (this.st.playedSongCounts[key] ?? 0) : 0
-        const isReplay = priorCount > 0
-
-        if (this.st.settings.type === 'casualRoom') {
-            if (this.st.settings.random) {
-                const idx = ++this.st.warmupCount
-                return {
-                    roundKind: 'warmup',
-                    roundLabel: `Warmup - Round ${idx}`,
-                    countsTowardScore: false,
-                    isReplay,
-                }
-            }
-
-            if (this.st.settings.scoring === 'pp') {
-                const idx = ++this.st.freeplayCount
-                return {
-                    roundKind: 'freeplay',
-                    roundLabel: `Freeplay • Round ${idx}`,
-                    countsTowardScore: true,
-                    isReplay,
-                }
-            }
-        }
-
-        const tournamentNumber = this.st.history.filter(
-            (r) => r.roundKind === 'tournament' || r.roundKind === 'rewind',
-        ).length + 1
-
-        if (isReplay) {
-            return {
-                roundKind: 'rewind',
-                roundLabel: `Round ${tournamentNumber} - Rewind`,
-                countsTowardScore: true,
-                isReplay: true,
-            }
-        }
-
-        return {
-            roundKind: 'tournament',
-            roundLabel: `Round ${tournamentNumber}`,
-            countsTowardScore: true,
-            isReplay: false,
-        }
-    }
-
-    private scoreboardRows(mode: RoomSettings['scoring'], round?: RoundRecord) {
-        if (!round) {
-            return totals(this.st.history, mode).map((t) => {
-                const m = this.member(t.userId)
-                return {
-                    user: m?.roomUser ?? { authentication: '', signature: '' },
-                    title: m ? this.formatPlayerName(m) : t.userId,
-                    score: fmtScore(t.score, mode),
-                }
-            })
-        }
-
-        return Object.entries(round.results)
-            .sort(([, a], [, b]) => compareResults(a, b, mode, round))
-            .map(([userId, r]) => {
-                const m = this.member(userId)
-                return {
-                    user: m?.roomUser ?? { authentication: '', signature: '' },
-                    title: m ? this.formatPlayerName(m) : userId,
-                    score: fmtDetail(r, mode, round),
-                }
-            })
-    }
-
-    private scoreboard(mode: RoomSettings['scoring'], round?: RoundRecord) {
-        const rows = this.scoreboardRows(mode, round)
-        const sectionTitle = round?.roundLabel
-            ? `              ${round.roundLabel}              `
-            : '              Standings              '
-
-        return [
-            {
-                title: sectionTitle,
-                description: '',
-                hasInfluence: false,
-                users: rows.map((row) => ({
-                    user: row.user,
-                    score: row.score,
-                })),
-            },
-        ]
-    }
-
-    private async handleCommand(userId: string, cmd: Cmd) {
-        if (!cmd || typeof cmd.type !== 'string') return
-
-        if (cmd.type === 'selectLevel') {
-            if (!this.isHost(userId) || this.st.status !== 'selecting') return
-            if (!isSil(cmd.level)) return
-
-            if (this.st.settings.type === 'casualRoom' && this.st.settings.random) {
-                return
-            }
-
-            this.st.level = { address: cmd.level.address, name: cmd.level.name }
-            this.st.levelInfo = await fetchLevelInfo(this.st.level, this.env)
-            this.save()
-            this.syncRoom()
-            return
-        }
-
-        if (cmd.type === 'suggestLevel') {
-            if (!isSil(cmd.level)) return
-            if (this.st.settings.type !== 'casualRoom') return
-            if (this.st.settings.random) return
-
-            this.st.suggestions = [
-                ...this.st.suggestions.filter((s) => !(s.userId === userId && songKeyOf(s.level) === songKeyOf(cmd.level))),
-                { userId, level: { address: cmd.level.address, name: cmd.level.name } },
-            ]
-            this.save()
-            this.syncRoom()
-            return
-        }
-
-        if (cmd.type === 'updateOptions') {
-            if (!this.isHost(userId) || this.st.status !== 'selecting') return
-            const hostMember = this.member(userId)
-            const next = parseSettings(
-                String(cmd.options ?? ''),
-                this.st.settings,
-                hostMember?.name || this.st.hostName,
-            )
-            if (!next) return
-
-            // Type is locked after room creation.
-            next.type = this.st.settings.type
-            if (next.type === 'rankedRoom') {
-                next.scoring = 'rankedMatch'
-                next.visibility = 'public'
-                next.random = false
-            }
-
-            this.st.settings = next
-            if (next.type === 'rankedRoom') {
-                const picked = await pickRankedLevel(
-                    next.tier as RankedTier,
-                    next.customSongs,
-                    this.env,
-                )
-                this.st.level = picked ? { address: picked.address, name: picked.name } : null
-            }
-
-            this.save()
-            this.syncRoom()
-            return
-        }
-
-        if (cmd.type === 'ready') {
-            if (this.st.status !== 'selecting') return
-            this.st.statuses[userId] = 'ready'
-            this.save()
-            this.syncUsers()
-            return
-        }
-
-        if (cmd.type === 'cancelReady') {
-            if (this.st.status !== 'selecting') return
-            this.st.statuses[userId] = 'waiting'
-            this.save()
-            this.syncUsers()
-            return
-        }
-
-        if (cmd.type === 'startRound') {
-            if (!this.isHost(userId) || this.st.status !== 'selecting') return
-
-            if (this.st.settings.type === 'rankedRoom') {
-                const picked = await pickRankedLevel(
-                    this.st.settings.tier as RankedTier,
-                    this.st.settings.customSongs,
-                    this.env,
-                )
-                if (picked) {
-                    this.st.level = { address: picked.address, name: picked.name }
-                }
-            }
-
-            if (!this.st.level) return
-
-            this.st.levelInfo = await fetchLevelInfo(this.st.level, this.env)
-            this.st.status = 'preparing'
-            this.st.results = {}
-            this.st.round = {
-                state: 'preparing',
-                seed: Math.floor(Math.random() * 1_000_000_000),
-            }
-
-            for (const m of this.st.members) {
-                this.st.statuses[m.id] = 'playing'
-            }
-
-            this.save()
-            this.syncUsers()
-            this.broadcast({
-                type: 'startRound',
-                level: this.st.level,
-                seed: this.st.round.seed,
-            })
-            return
-        }
-
-        if (cmd.type === 'finishResult') {
-            if (!isResult(cmd.result)) return
-            const isDisqualified =
-                cmd.result.grade === 'X' || cmd.result.disqualified === true
-            const storedResult: GameplayResult = {
-                ...sanitizeWireResult(cmd.result),
-                grade: isDisqualified ? 'X' : sanitizeWireResult(cmd.result).grade,
-                disqualified: isDisqualified,
-                arcadeScore: isDisqualified ? 0 : sanitizeWireResult(cmd.result).arcadeScore,
-                accuracyScore: isDisqualified ? 0 : sanitizeWireResult(cmd.result).accuracyScore,
-            }
-
-            this.st.results[userId] = storedResult
-            this.st.statuses[userId] = 'waiting'
-            this.save()
-            this.syncUsers()
-
-            const activePlayers = this.st.members.map((m) => m.id)
-            const allFinished = activePlayers.every((id) => Boolean(this.st.results[id]))
-
-            if (allFinished && this.st.status !== 'selecting') {
-                const classification = this.classifyNextRound(this.st.level)
-                const key = songKeyOf(this.st.level)
-                if (key) {
-                    this.st.playedSongCounts[key] = (this.st.playedSongCounts[key] ?? 0) + 1
-                }
-
-                const record: RoundRecord = {
-                    level: this.st.level ? { ...this.st.level } : null,
-                    levelTitle: this.st.levelInfo?.title,
-                    levelTag: this.st.levelInfo?.firstTag,
-                    levelRating: this.st.levelInfo?.rating ?? undefined,
-                    levelConstant: this.st.levelInfo?.constant ?? undefined,
-                    noteCount: this.st.levelInfo?.noteCount ?? undefined,
-                    difficulty: this.st.levelInfo?.difficulty,
-                    roundKind: classification.roundKind,
-                    roundLabel: classification.roundLabel,
-                    countsTowardScore: classification.countsTowardScore,
-                    isReplay: classification.isReplay,
-                    results: { ...this.st.results },
-                }
-
-                this.st.history.push(record)
-                this.st.status = 'selecting'
-                this.st.round = null
-
-                for (const m of this.st.members) {
-                    this.st.statuses[m.id] = 'waiting'
-                }
-
-                if (this.st.settings.type === 'rankedRoom') {
-                    const nextPicked = await pickRankedLevel(
-                        this.st.settings.tier as RankedTier,
-                        this.st.settings.customSongs,
-                        this.env,
-                    )
-                    this.st.level = nextPicked ? { address: nextPicked.address, name: nextPicked.name } : null
-                }
-
-                this.save()
-                this.syncRoom()
-                this.syncUsers()
-                this.broadcast({
-                    type: 'finishRound',
-                    results: Object.fromEntries(
-                        Object.entries(record.results).map(([uid, res]) => [
-                            uid,
-                            sanitizeWireResult(res),
-                        ]),
-                    ),
-                    scoreboard: this.scoreboard(this.st.settings.scoring, record),
-                })
-            }
-            return
-        }
-
-        if (cmd.type === 'kick') {
-            if (!this.isHost(userId)) return
-            const targetId = String(cmd.userId ?? '')
-            if (!targetId || targetId === this.st.hostId) return
-
-            this.st.members = this.st.members.filter((m) => m.id !== targetId)
-            delete this.st.statuses[targetId]
-            delete this.st.results[targetId]
-
-            for (const [sock, uid] of this.sockets.entries()) {
-                if (uid === targetId) {
-                    try {
-                        sock.close(4001, 'Kicked by host')
-                    } catch {
-                        // Ignore
-                    }
-                    this.sockets.delete(sock)
-                }
-            }
-
-            this.save()
-            this.syncUsers()
-            return
-        }
-
-        if (cmd.type === 'closeRoom') {
-            if (!this.isHost(userId)) return
-            this.st.members = []
-            this.st.statuses = {}
-            this.st.round = null
-            await this.ctx.storage.deleteAll()
-            await this.env.LOBBY.get(this.env.LOBBY.idFromName('main')).remove(this.st.name).catch(() => {})
-            for (const sock of this.sockets.keys()) {
-                try {
-                    sock.close(1000, 'Room closed')
-                } catch {
-                    // Ignore
-                }
-            }
-            this.sockets.clear()
-        }
+    private subtitle(): string {
+        const s = this.st.settings
+        const access = s.visibility === 'locked' ? 'Locked' : s.visibility === 'private' ? 'Private' : 'Public'
+        return `${SCORING_MODES[s.scoring]} · ${access}${s.random ? ' · Random' : ''}`
     }
 
     async fetch(request: Request): Promise<Response> {
-        const rawJoin = request.headers.get('x-join')
-        if (!rawJoin) {
-            return new Response('Missing join payload', { status: 400 })
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return new Response('Room expired', { status: 404 })
         }
 
-        let session: JoinSession
+        if (request.headers.get('Upgrade') !== 'websocket') {
+            return new Response('Expected WebSocket', { status: 426 })
+        }
+
+        let join: JoinSession | null
         try {
-            session = JSON.parse(decodeURIComponent(rawJoin)) as JoinSession
+            join = JSON.parse(
+                decodeURIComponent(request.headers.get('x-join') ?? 'null'),
+            ) as JoinSession | null
         } catch {
-            return new Response('Invalid join payload', { status: 400 })
+            return new Response('Invalid join session', { status: 400 })
         }
 
-        const upgrade = request.headers.get('Upgrade')
-        if (upgrade?.toLowerCase() !== 'websocket') {
-            return new Response('Expected WebSocket upgrade', { status: 426 })
+        if (
+            !join ||
+            !this.st.configured ||
+            join.room !== this.st.name ||
+            !join.user ||
+            typeof join.user.id !== 'string' ||
+            !join.roomUser ||
+            typeof join.roomUser.authentication !== 'string' ||
+            typeof join.roomUser.signature !== 'string'
+        ) {
+            return new Response('No such room', { status: 404 })
         }
 
-        const pair = new WebSocketPair()
-        const [client, server] = Object.values(pair)
-        server.accept()
+        const { 0: client, 1: server } = new WebSocketPair()
+        const user = join.user
 
-        const uid = session.user.id
-        const handle = session.user.handle
-        const name = session.user.name || handle
+        const oldSockets = this.socketsOf(user.id)
+        const wasConnected = oldSockets.length > 0
 
-        if (!this.st.createdAt) {
-            this.st.createdAt = Date.now()
-        }
-        if (!this.st.name) {
-            this.st.name = session.room
-        }
-        if (!this.st.hostId) {
-            this.st.hostId = uid
-            this.st.hostName = name
+        const existingMember = this.st.members.find((member) => member.id === user.id)
+        const member: Member = existingMember ?? {
+            id: user.id,
+            name: user.name,
+            handle: user.handle,
+            roomUser: join.roomUser,
         }
 
-        const existing = this.member(uid)
-        const roomUser: RoomUser = {
-            id: uid,
-            name,
-            handle,
-            authentication: session.roomUser?.authentication ?? '',
-            signature: session.roomUser?.signature ?? '',
+        member.name = user.name
+        member.handle = user.handle
+        member.roomUser = join.roomUser
+
+        this.st.members = this.st.members.filter((entry) => entry.id !== user.id)
+        this.st.members.push(member)
+        this.st.statuses[user.id] = 'waiting'
+
+        this.ctx.acceptWebSocket(server)
+        server.serializeAttachment({ userId: user.id })
+
+        for (const oldSocket of oldSockets) {
+            this.closing.add(oldSocket)
+            try {
+                oldSocket.close(4000, 'replaced')
+            } catch {
+                // Previous socket may already be closed.
+            }
         }
 
-        if (existing) {
-            existing.name = name
-            existing.handle = handle
-            existing.roomUser = roomUser
-        } else {
-            this.st.members.push({
-                id: uid,
-                name,
-                handle,
-                roomUser,
+        await this.save()
+
+        this.send(server, this.view(user.id))
+
+        if (!wasConnected) {
+            this.sendExcept(user.id, {
+                type: 'addUser',
+                user: member.roomUser,
             })
         }
 
-        if (!this.st.statuses[uid]) {
-            this.st.statuses[uid] = 'waiting'
+        if (user.id === this.st.hostId) {
+            this.sendExcept(user.id, {
+                type: 'updateMaster',
+                master: this.st.hostId,
+            })
+
+            this.sendExcept(user.id, {
+                type: 'updateLead',
+                lead: this.st.hostId,
+            })
         }
 
-        if (!isOpenType(this.st.settings.type) && this.st.suggestions.length === 0 && this.st.hostId) {
-            this.st.suggestions = await songPoolSuggestions(this.st.settings.type, this.st.hostId)
-            this.st.poolSongKeys = this.st.suggestions.map((s) => songKeyOf(s.level)).filter(Boolean)
-            if (!this.st.primarySongKey && this.st.poolSongKeys.length > 0) {
-                this.st.primarySongKey = this.st.poolSongKeys[0]!
-            }
-            if (!this.st.level && this.st.suggestions.length > 0) {
-                this.st.level = this.st.suggestions[0]!.level
-            }
-        }
-
-        this.sockets.set(server, uid)
-        this.save()
+        this.pushScoreboard()
 
         this.send(server, {
-            type: 'roomState',
-            state: this.roomState(),
+            type: 'updateTitle',
+            title: getRoomTitle(this.st.settings, this.st.edition),
         })
-        this.syncUsers()
 
-        server.addEventListener('message', (event) => {
-            void (async () => {
-                try {
-                    const data = JSON.parse(String(event.data))
-                    await this.handleCommand(uid, data)
-                } catch {
-                    // Ignore malformed client message.
+        this.diag('ws-join', { userId: user.id, wasConnected })
+        await this.maybeFinishRound(true)
+        await this.save()
+        await this.scheduleNextAlarm()
+
+        return new Response(null, {
+            status: 101,
+            webSocket: client,
+        })
+    }
+
+    async webSocketMessage(
+        ws: WebSocket,
+        raw: string | ArrayBuffer,
+    ): Promise<void> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return
+        }
+
+        const attachment = ws.deserializeAttachment() as { userId: string } | null
+        if (!attachment || typeof raw !== 'string') return
+
+        let command: Cmd
+        try {
+            command = JSON.parse(raw)
+        } catch {
+            return
+        }
+
+        if (!this.st.members.some((member) => member.id === attachment.userId)) {
+            return
+        }
+
+        try {
+            await this.handle(attachment.userId, command)
+        } catch (error) {
+            console.error('Room command failed:', command?.type, error)
+            this.diag('command-error', {
+                userId: attachment.userId,
+                cmdType: command?.type,
+                error: error instanceof Error ? error.message : String(error),
+            })
+            this.resync(attachment.userId)
+        }
+
+        await this.save()
+        await this.scheduleNextAlarm()
+    }
+
+    async webSocketClose(ws: WebSocket): Promise<void> {
+        const attachment = ws.deserializeAttachment() as { userId: string } | null
+        if (!attachment) return
+
+        this.closing.add(ws)
+
+        if (this.socketsOf(attachment.userId).some((socket) => socket !== ws)) {
+            return
+        }
+
+        this.diag('ws-close', { userId: attachment.userId })
+        await this.dropMember(attachment.userId, true, true)
+    }
+
+    async webSocketError(ws: WebSocket): Promise<void> {
+        this.diag('ws-error')
+        await this.webSocketClose(ws)
+    }
+
+    async alarm(): Promise<void> {
+        this.diag('alarm-fired')
+
+        if (this.isExpired()) {
+            await this.expireAndDestroy()
+            return
+        }
+
+        await this.maybeFinishRound(true)
+        await this.save()
+
+        if (this.ctx.getWebSockets().length === 0) {
+            await this.expireAndDestroy()
+            return
+        }
+
+        await this.scheduleNextAlarm()
+    }
+
+    private async closeRoom(uid: string): Promise<void> {
+        if (uid !== this.st.hostId) {
+            return this.resync(uid)
+        }
+
+        await this.expireAndDestroy()
+    }
+
+    private async handle(uid: string, cmd: Cmd): Promise<void> {
+        const state = this.st
+        const isHost = uid === state.hostId
+
+        switch (cmd.type) {
+            case 'updateLevel': {
+                if (
+                    !isHost ||
+                    state.status !== 'selecting' ||
+                    !isSil(cmd.level)
+                ) {
+                    return this.resync(uid)
                 }
-            })()
-        })
 
-        server.addEventListener('close', () => {
-            this.sockets.delete(server)
-            this.st.members = this.st.members.filter((m) => m.id !== uid)
-            delete this.st.statuses[uid]
-            this.save()
-            this.syncUsers()
-        })
+                if (
+                    state.settings.type === 'rankedRoom' ||
+                    (state.settings.type === 'casualRoom' && state.settings.random)
+                ) {
+                    return this.resync(uid)
+                }
 
-        return new Response(null, { status: 101, webSocket: client })
+                if (state.levelOptions.length > 0) {
+                    state.levelOptions = []
+                    this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+                }
+
+                state.level = {
+                    address: cmd.level.address,
+                    name: cmd.level.name,
+                }
+                state.levelInfo = null
+
+                this.sendLevel()
+                this.pushScoreboard()
+
+                state.levelInfo = await fetchLevelInfo(state.level)
+                this.pushScoreboard()
+                return
+            }
+
+            case 'updateOptionValues': {
+                if (
+                    typeof cmd.optionValues === 'string' &&
+                    new URLSearchParams(cmd.optionValues).get('type') === 'closeRoom'
+                ) {
+                    return this.closeRoom(uid)
+                }
+
+                const next =
+                    typeof cmd.optionValues === 'string'
+                        ? parseSettings(cmd.optionValues, state.settings)
+                        : null
+
+                const member = state.members.find((entry) => entry.id === uid)
+                const tournamentHost = member?.handle === TOURNAMENT_HOST_HANDLE
+
+                if (
+                    !isHost ||
+                    !next ||
+                    next.type !== state.settings.type ||
+                    (!tournamentHost && !isOpenType(next.type)) ||
+                    state.status !== 'selecting'
+                ) {
+                    return this.resync(uid)
+                }
+
+                const randomChanged = next.random !== state.settings.random
+                const modeChanged = next.scoring !== state.settings.scoring
+                const titleChanged =
+                    next.group !== state.settings.group ||
+                    next.title !== state.settings.title ||
+                    next.tier !== state.settings.tier
+
+                if (next.type === 'casualRoom' && !next.title) {
+                    next.title = 'Custom Room'
+                }
+
+                state.settings = next
+
+                this.sendAll({
+                    type: 'updateOptionValues',
+                    optionValues: serializeSettings(next),
+                })
+
+                if (titleChanged) {
+                    this.sendAll({
+                        type: 'updateTitle',
+                        title: getRoomTitle(next, state.edition),
+                    })
+                }
+
+                if (modeChanged) {
+                    this.sendAll({
+                        type: 'updateScoreboardDescription',
+                        scoreboardDescription: this.description(),
+                    })
+
+                    this.pushScoreboard()
+                }
+
+                if (randomChanged) await this.applyRandomLevel(true)
+
+                await this.syncLobby()
+                return
+            }
+
+            case 'updateStatus':
+                return isHost
+                    ? this.changeStatus(uid, cmd.status)
+                    : this.resync(uid)
+
+            case 'removeUser': {
+                if (
+                    !isHost ||
+                    cmd.userId === uid ||
+                    !state.members.some((member) => member.id === cmd.userId)
+                ) {
+                    return this.resync(uid)
+                }
+
+                const target = cmd.userId as string
+
+                for (const socket of this.socketsOf(target)) {
+                    this.closing.add(socket)
+                    try {
+                        socket.close(4001, 'kicked')
+                    } catch {
+                        // Socket may already be closed.
+                    }
+                }
+
+                await this.dropMember(target, true, true)
+                return
+            }
+
+            case 'resetScoreboard': {
+                if (!isHost) return this.resync(uid)
+
+                state.history = []
+                state.results = {}
+                this.pushScoreboard()
+                return
+            }
+
+            case 'addSuggestion': {
+                if (
+                    state.settings.type === 'rankedRoom' ||
+                    (!isHost && state.settings.type !== 'casualRoom') ||
+                    !isSil(cmd.level)
+                ) {
+                    return this.resync(uid)
+                }
+
+                const alreadyExists = state.suggestions.some(
+                    (entry) =>
+                        entry.level.address === cmd.level.address &&
+                        entry.level.name === cmd.level.name,
+                )
+
+                if (!alreadyExists) {
+                    const suggestion = {
+                        userId: uid,
+                        level: {
+                            address: cmd.level.address,
+                            name: cmd.level.name,
+                        },
+                    }
+
+                    state.suggestions.push(suggestion)
+
+                    const event = {
+                        type: 'addSuggestion',
+                        suggestion,
+                    }
+
+                    if (state.settings.type === 'casualRoom') {
+                        this.sendAll(event)
+                    } else {
+                        this.sendHost(event)
+                    }
+                }
+
+                await this.applyRandomLevel(false)
+                return
+            }
+
+            case 'removeSuggestion': {
+                const index = state.suggestions.findIndex(
+                    (entry) =>
+                        entry.userId === cmd.suggestion?.userId &&
+                        entry.level.address === cmd.suggestion?.level?.address &&
+                        entry.level.name === cmd.suggestion?.level?.name,
+                )
+
+                if (!isHost || index < 0) {
+                    return this.resync(uid)
+                }
+
+                const [removed] = state.suggestions.splice(index, 1)
+
+                this.sendHost({
+                    type: 'removeSuggestion',
+                    suggestion: removed,
+                })
+
+                return
+            }
+
+            case 'clearSuggestions': {
+                if (!isHost) return this.resync(uid)
+
+                state.suggestions = []
+                this.sendHost({ type: 'clearSuggestions' })
+                return
+            }
+
+            case 'swapSuggestions': {
+                const find = (suggestion: any) =>
+                    state.suggestions.findIndex(
+                        (entry) =>
+                            entry.userId === suggestion?.userId &&
+                            entry.level.address === suggestion?.level?.address &&
+                            entry.level.name === suggestion?.level?.name,
+                    )
+
+                const a = find(cmd.suggestionA)
+                const b = find(cmd.suggestionB)
+
+                if (!isHost || a < 0 || b < 0 || a === b) {
+                    return this.resync(uid)
+                }
+
+                ;[state.suggestions[a], state.suggestions[b]] = [
+                    state.suggestions[b]!,
+                    state.suggestions[a]!,
+                ]
+
+                this.sendHost({
+                    type: 'swapSuggestions',
+                    suggestionA: cmd.suggestionA,
+                    suggestionB: cmd.suggestionB,
+                })
+
+                return
+            }
+
+            case 'updateLead':
+            case 'updateMaster':
+            case 'updateAutoExit':
+            case 'updateIsSuggestionsLocked':
+                return this.resync(uid)
+
+            case 'updateLevelOption': {
+                const entry = cmd.levelOption
+
+                if (
+                    !isHost ||
+                    state.settings.type !== 'casualRoom' ||
+                    state.status !== 'selecting' ||
+                    !entry ||
+                    typeof entry.name !== 'string' ||
+                    typeof entry.value !== 'number' ||
+                    !Number.isFinite(entry.value)
+                ) {
+                    return this.resync(uid)
+                }
+
+                const next = { name: entry.name, value: entry.value }
+                const at = state.levelOptions.findIndex((x) => x.name === next.name)
+
+                if (at >= 0) state.levelOptions[at] = next
+                else state.levelOptions.push(next)
+
+                this.sendAll({ type: 'updateLevelOption', levelOption: next })
+                return
+            }
+
+            case 'updateUserStatus': {
+                const wanted = cmd.status as UserStatus
+                const allowed: UserStatus[] = isHost
+                    ? ['waiting', 'ready', 'skipped']
+                    : ['waiting', 'ready']
+
+                if (
+                    state.status !== 'preparing' ||
+                    !allowed.includes(wanted)
+                ) {
+                    return this.resync(uid)
+                }
+
+                state.statuses[uid] = wanted
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: wanted,
+                    },
+                })
+
+                return
+            }
+
+            case 'startGameplay': {
+                if (
+                    state.status !== 'playing' ||
+                    !state.round ||
+                    cmd.state !== state.round.state ||
+                    state.statuses[uid] !== 'ready'
+                ) {
+                    return this.resync(uid)
+                }
+
+                state.statuses[uid] = 'playing'
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: 'playing',
+                    },
+                })
+
+                return
+            }
+
+            case 'finishGameplay': {
+                const valid =
+                    state.status === 'playing' &&
+                    state.round &&
+                    cmd.state === state.round.state &&
+                    isResult(cmd.result) &&
+                    !state.results[uid]
+
+                if (!valid) {
+                    this.diag('finishGameplay-rejected', { userId: uid })
+                    return this.resync(uid)
+                }
+
+                const expectedCount = state.levelInfo?.noteCount ?? null
+                const judgedCount =
+                    (Number(cmd.result.perfect) || 0) +
+                    (Number(cmd.result.great) || 0) +
+                    (Number(cmd.result.good) || 0) +
+                    (Number(cmd.result.miss) || 0)
+
+                const incomplete =
+                    expectedCount !== null && judgedCount < expectedCount
+
+                const result: GameplayResult = {
+                    ...cmd.result,
+                    grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
+                    disqualified:
+                        incomplete ||
+                        cmd.result.disqualified === true ||
+                        cmd.result.grade === 'X',
+                }
+
+                state.results[uid] = result
+                state.statuses[uid] = 'waiting'
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: 'waiting',
+                    },
+                })
+
+                this.sendResult(uid, result)
+                this.pushScoreboard()
+                this.diag('finishGameplay-accepted', {
+                    userId: uid,
+                    grade: result.grade,
+                    disqualified: result.disqualified === true,
+                })
+
+                await this.maybeFinishRound(true)
+                return
+            }
+
+            case 'addChatMessage': {
+                const incoming = cmd.message
+                let message: Ev | null = null
+
+                if (
+                    incoming?.type === 'quick' &&
+                    ['hello', 'glhf', 'gg', 'ns', 'ty'].includes(incoming.value)
+                ) {
+                    message = {
+                        userId: uid,
+                        type: 'quick',
+                        value: incoming.value,
+                    }
+                } else if (
+                    incoming?.type === 'text' &&
+                    typeof incoming.value === 'string' &&
+                    incoming.value.trim()
+                ) {
+                    message = {
+                        userId: uid,
+                        type: 'text',
+                        value: incoming.value.slice(0, 200),
+                    }
+                }
+
+                if (!message) return
+
+                for (const member of state.members) {
+                    const event: Ev = {
+                        type: 'addChatMessage',
+                        message,
+                    }
+
+                    if (member.id === uid && typeof cmd.nonce === 'number') {
+                        event.nonce = cmd.nonce
+                    }
+
+                    this.sendTo(member.id, event)
+                }
+
+                return
+            }
+
+            case 'reportUser':
+            default:
+                return
+        }
+    }
+
+    private async changeStatus(
+        uid: string,
+        next: RoomStatus,
+    ): Promise<void> {
+        const state = this.st
+        const current = state.status
+
+        const waitAll = () => {
+            for (const member of state.members) {
+                state.statuses[member.id] = 'waiting'
+            }
+        }
+
+        if (current === 'selecting' && next === 'preparing') {
+            if (state.settings.type === 'rankedRoom') {
+                let pick: SheetChart | null = null
+
+                try {
+                    pick = await pickRankedLevel(
+                        state.settings.tier as RankedTier,
+                        state.settings.customSongs,
+                        this.env,
+                    )
+                } catch (error) {
+                    console.error('Could not pick a ranked level:', error)
+                }
+
+                if (state.status !== 'selecting' || !pick) {
+                    return this.resync(uid)
+                }
+
+                state.level = { address: pick.address, name: pick.name }
+                state.levelInfo = null
+                state.levelOptions = []
+
+                this.sendAll({ type: 'updateLevel', level: state.level })
+                this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+            } else if (
+                state.settings.type === 'casualRoom' &&
+                state.settings.random
+            ) {
+                await this.applyRandomLevel(true)
+                if (state.status !== 'selecting') return this.resync(uid)
+            }
+        }
+
+        if (current === 'selecting' && next === 'preparing' && state.level) {
+            if (!state.levelInfo) {
+                state.levelInfo = await fetchLevelInfo(state.level)
+            }
+
+            if (state.status !== 'selecting' || !state.level) {
+                return this.resync(uid)
+            }
+
+            state.status = 'preparing'
+            waitAll()
+
+            if (!isOpenType(state.settings.type)) {
+                for (const member of state.members) {
+                    if (member.id !== state.hostId) {
+                        this.sendTo(member.id, {
+                            type: 'updateLevel',
+                            level: state.level,
+                        })
+                    }
+                }
+            }
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'preparing',
+            })
+            this.diag('status-preparing', { level: state.level.name })
+        } else if (current === 'preparing' && next === 'selecting') {
+            state.status = 'selecting'
+            waitAll()
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'selecting',
+            })
+            this.diag('status-selecting-from-preparing')
+        } else if (current === 'preparing' && next === 'playing') {
+            const readyMembers = state.members.filter(
+                (member) =>
+                    this.socketsOf(member.id).length > 0 &&
+                    state.statuses[member.id] === 'ready',
+            )
+
+            if (!state.level || readyMembers.length === 0) {
+                return this.resync(uid)
+            }
+
+            state.status = 'playing'
+            state.results = {}
+            state.round = {
+                state: crypto.randomUUID(),
+                seed: Math.random(),
+            }
+
+            for (const member of state.members) {
+                if (state.statuses[member.id] === 'skipped') {
+                    state.statuses[member.id] = 'waiting'
+                }
+            }
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'playing',
+            })
+
+            const start = {
+                type: 'startRound',
+                state: state.round.state,
+                seed: state.round.seed,
+            }
+
+            for (const member of readyMembers) {
+                this.sendTo(member.id, start)
+            }
+
+            this.pushScoreboard()
+            this.diag('status-playing', { readyCount: readyMembers.length })
+        } else if (current === 'playing' && next === 'selecting') {
+            if (Object.keys(state.results).length > 0) {
+                state.history.push(this.makeRoundRecord())
+            }
+
+            state.results = {}
+            state.round = null
+            state.status = 'selecting'
+            waitAll()
+
+            if (state.settings.type === 'rankedRoom') {
+                state.level = null
+                state.levelInfo = null
+                this.sendAll({ type: 'updateLevel', level: null })
+            }
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'selecting',
+            })
+
+            this.pushScoreboard()
+            await this.applyRandomLevel(true)
+
+            for (const member of state.members) {
+                if (this.socketsOf(member.id).length > 0) {
+                    this.resync(member.id)
+                }
+            }
+
+            this.diag('status-selecting-from-playing')
+        } else {
+            return this.resync(uid)
+        }
+    }
+
+    private makeRoundRecord(): RoundRecord {
+        const info = this.st.levelInfo
+
+        return {
+            level: this.st.level,
+            levelTitle: info?.title,
+            levelTag: info?.firstTag,
+            levelRating: info?.rating ?? undefined,
+            levelConstant: info?.constant ?? undefined,
+            noteCount: info?.noteCount ?? undefined,
+            difficulty: info?.difficulty || info?.firstTag || undefined,
+            results: { ...this.st.results },
+        }
+    }
+
+    private canSee(_uid: string): boolean {
+        return true
+    }
+
+    private sendLevel(): void {
+        if (!this.st.level) return
+
+        const event = { type: 'updateLevel', level: this.st.level }
+        if (isOpenType(this.st.settings.type)) this.sendAll(event)
+        else this.sendHost(event)
+    }
+
+    private sendResult(uid: string, result: GameplayResult): void {
+        const activeIds = new Set(
+            this.st.members
+                .filter((member) => this.socketsOf(member.id).length > 0)
+                .map((member) => member.id),
+        )
+        if (!activeIds.has(uid)) return
+
+        const wireResult = sanitizeWireResult(result)
+
+        for (const member of this.st.members) {
+            if (activeIds.has(member.id) && this.canSee(member.id)) {
+                this.sendTo(member.id, {
+                    type: 'addResult',
+                    result: { userId: uid, result: wireResult },
+                })
+            }
+        }
+    }
+
+    private async applyRandomLevel(force: boolean): Promise<void> {
+        const s = this.st
+
+        if (
+            s.settings.type !== 'casualRoom' ||
+            !s.settings.random ||
+            s.status !== 'selecting' ||
+            s.suggestions.length === 0
+        ) return
+
+        if (s.level && !force) return
+
+        const pool = s.suggestions.filter(
+            (x) =>
+                !(
+                    s.level &&
+                    x.level.address === s.level.address &&
+                    x.level.name === s.level.name
+                ),
+        )
+
+        const list = pool.length > 0 ? pool : s.suggestions
+        const pick = list[Math.floor(Math.random() * list.length)]!.level
+
+        s.level = { address: pick.address, name: pick.name }
+        s.levelInfo = null
+
+        if (s.levelOptions.length > 0) {
+            s.levelOptions = []
+            this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+        }
+
+        this.sendLevel()
+        this.pushScoreboard()
+
+        s.levelInfo = await fetchLevelInfo(s.level)
+        this.pushScoreboard()
+    }
+
+    private hostIsTournament(): boolean {
+        const host = this.st.members.find((m) => m.id === this.st.hostId)
+        return (host?.handle ?? '') === TOURNAMENT_HOST_HANDLE
+    }
+
+    private roundBusy(): boolean {
+        const s = this.st
+
+        return s.members.some(
+            (member) =>
+                this.socketsOf(member.id).length > 0 &&
+                (s.statuses[member.id] === 'ready' ||
+                    s.statuses[member.id] === 'playing'),
+        )
+    }
+
+    private async maybeFinishRound(immediate: boolean): Promise<void> {
+        const s = this.st
+
+        if (s.status !== 'playing' || !s.round || this.roundBusy()) return
+
+        if (!immediate) {
+            if (this.ctx.getWebSockets().length > 0) {
+                await this.scheduleNextAlarm(8000)
+            }
+            return
+        }
+
+        await this.changeStatus(s.hostId, 'selecting')
+    }
+
+    private hostPresent = () =>
+        this.socketsOf(this.st.hostId).length > 0
+
+    private view(uid: string): Ev {
+        const state = this.st
+        const isHost = uid === state.hostId
+        const master = this.hostPresent() ? state.hostId : null
+
+        const activeMembers = state.members.filter(
+            (member) => this.socketsOf(member.id).length > 0,
+        )
+        const activeIds = new Set(activeMembers.map((member) => member.id))
+        const canEditLevelOptions = state.settings.type === 'casualRoom' && state.status === 'selecting'
+
+        return {
+            type: 'update',
+            allowOtherServers: true,
+            reportUserOptions: [],
+            title: getRoomTitle(state.settings, state.edition),
+            status: state.status,
+            master,
+            lead: master,
+            options: [
+                ...roomFormsForType(state.settings.type, this.hostIsTournament()),
+                ...(isHost ? [closeRoomForm] : []),
+            ],
+            optionValues: serializeSettings(state.settings),
+            level: isHost ||
+                isOpenType(state.settings.type) ||
+                state.status !== 'selecting'
+                ? state.level
+                : null,
+            levelOptions: canEditLevelOptions
+                ? state.levelOptions
+                : [],
+            autoExit: 'off',
+            isSuggestionsLocked: state.settings.type === 'rankedRoom' ||
+                (state.settings.type !== 'casualRoom' && !isHost),
+            suggestions: isHost || state.settings.type === 'casualRoom'
+                ? state.suggestions
+                : [],
+            scoreboardDescription: this.description(),
+            scoreboardSections: this.canSee(uid) ? this.sections() : [],
+            results: Object.entries(state.results)
+                .filter(([id]) => activeIds.has(id) && (this.canSee(uid) || id === uid))
+                .map(([userId, result]) => ({
+                    userId,
+                    result: sanitizeWireResult(result),
+                })),
+            users: activeMembers.map((member) => member.roomUser),
+            userStatuses: activeMembers.map((member) => ({
+                userId: member.id,
+                status: state.statuses[member.id] ?? 'waiting',
+            })),
+        }
+    }
+
+    private description(): string {
+        const mode = this.st.settings.scoring
+        const tieBreakers = 'Tiebreakers: most perfects, then highest combo.'
+
+        if (mode === 'pp') {
+            return PP_CONFIGURED
+                ? `PP scoring. Each round is rounded up before the total. ${tieBreakers}`
+                : `PP scoring unavailable. ${tieBreakers}`
+        }
+
+        return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}`
+    }
+
+    private sections() {
+        try {
+            const state = this.st
+            const mode = state.settings.scoring
+
+            const presentMembers = state.members.filter(
+                (member) => this.socketsOf(member.id).length > 0,
+            )
+            const present = new Set(presentMembers.map((member) => member.id))
+
+            const live: RoundRecord | null =
+                state.status === 'playing' &&
+                Object.keys(state.results).length > 0
+                    ? this.makeRoundRecord()
+                    : null
+
+            const history = live ? [...state.history, live] : state.history
+
+            const output: {
+                title: string
+                scores: {
+                    userId: string
+                    value: string
+                }[]
+            }[] = []
+
+            const divisions = this.getDivisions(presentMembers)
+
+            for (const division of divisions) {
+                const divisionIds = new Set(division.members.map((member) => member.id))
+                const divisionTotals = totals(history, mode)
+                    .filter((total) => divisionIds.has(total.userId) && present.has(total.userId))
+
+                output.push({
+                    title: division.title
+                        ? `Standings · ${division.title}`
+                        : 'Standings',
+                    scores: divisionTotals.map((total) => ({
+                        userId: total.userId,
+                        value: fmtScore(total.score, mode),
+                    })),
+                })
+            }
+
+            if (state.settings.type !== 'casualRoom') {
+                const allTotals = totals(history, mode)
+
+                for (const member of state.members) {
+                    if (present.has(member.id)) continue
+
+                    const total = allTotals.find((t) => t.userId === member.id)
+                    if (!total) continue
+
+                    output.push({
+                        title: `Left · ${member.name || member.handle} · ${fmtScore(total.score, mode)}`,
+                        scores: [],
+                    })
+                }
+            }
+
+            const roundSection = (round: RoundRecord, label: string) => {
+                const song = round.levelTitle || round.level?.name
+                const title = song
+                    ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
+                    : label
+
+                const scores = Object.entries(round.results)
+                    .filter(([id]) => present.has(id))
+                    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
+                    .map(([userId, result]) => ({
+                        userId,
+                        value: fmtDetail(result, mode, round),
+                    }))
+
+                output.push({ title, scores })
+            }
+
+            if (live) {
+                roundSection(live, `Round ${state.history.length + 1} (live)`)
+            }
+
+            for (let index = state.history.length - 1; index >= 0; index--) {
+                roundSection(state.history[index]!, `Round ${index + 1}`)
+            }
+
+            return output
+        } catch (error) {
+            console.error('[Room] Failed building scoreboard sections:', error)
+            return []
+        }
+    }
+
+    private getDivisions(members: Member[]) {
+        const type = this.st.settings.type
+
+        if (isOpenType(type)) {
+            return [{ title: '', members }]
+        }
+
+        if (type === 'groupStage') {
+            const groupNames = [
+                ...new Set(
+                    Object.values(this.st.divisions)
+                        .filter((division) => /^Group\s+/i.test(division))
+                        .map((division) => division.replace(/^Group\s+/i, '').trim()),
+                ),
+            ].sort((a, b) => a.localeCompare(b, undefined, {
+                numeric: true,
+                sensitivity: 'base',
+            }))
+
+            const groups = groupNames.map((group) => ({
+                title: `Group ${group}`,
+                members: members.filter(
+                    (member) => this.st.divisions[member.handle] === `Group ${group}`,
+                ),
+            })).filter((division) => division.members.length > 0)
+
+            const assigned = new Set(
+                groups.flatMap((division) => division.members.map((member) => member.id)),
+            )
+
+            const unassigned = members.filter((member) => !assigned.has(member.id))
+            if (unassigned.length > 0) {
+                groups.push({ title: 'Unassigned', members: unassigned })
+            }
+
+            return groups
+        }
+
+        const brackets = [
+            {
+                title: 'Upper Bracket',
+                members: members.filter(
+                    (member) => this.st.divisions[member.handle] === 'Upper Bracket',
+                ),
+            },
+            {
+                title: 'Lower Bracket',
+                members: members.filter(
+                    (member) => this.st.divisions[member.handle] === 'Lower Bracket',
+                ),
+            },
+        ].filter((division) => division.members.length > 0)
+
+        const assigned = new Set(
+            brackets.flatMap((division) => division.members.map((member) => member.id)),
+        )
+
+        const unassigned = members.filter((member) => !assigned.has(member.id))
+        if (unassigned.length > 0) {
+            brackets.push({ title: 'Unassigned', members: unassigned })
+        }
+
+        return brackets
+    }
+
+    private pushScoreboard(): void {
+        const scoreboardSections = this.sections()
+
+        for (const member of this.st.members) {
+            if (this.canSee(member.id)) {
+                this.sendTo(member.id, {
+                    type: 'updateScoreboardSections',
+                    scoreboardSections,
+                })
+            }
+        }
+    }
+
+    private async dropMember(
+        uid: string,
+        announce: boolean,
+        retain = false,
+    ): Promise<void> {
+        const state = this.st
+        const member = state.members.find((entry) => entry.id === uid)
+        if (!member) return
+
+        if (retain) {
+            if (
+                state.status === 'playing' &&
+                state.statuses[uid] === 'playing' &&
+                !state.results[uid]
+            ) {
+                const result: GameplayResult = {
+                    grade: 'fail',
+                    disqualified: true,
+                    arcadeScore: 0,
+                    accuracyScore: 0,
+                    combo: 0,
+                    perfect: 0,
+                    great: 0,
+                    good: 0,
+                    miss: 0,
+                    totalCount: 0,
+                }
+
+                state.results[uid] = result
+                if (announce) this.sendResult(uid, result)
+            }
+
+            state.statuses[uid] = 'waiting'
+
+            if (announce) {
+                this.sendAll({
+                    type: 'removeUser',
+                    user: member.roomUser,
+                })
+            }
+        } else {
+            state.members = state.members.filter((entry) => entry.id !== uid)
+            delete state.statuses[uid]
+            delete state.results[uid]
+
+            if (announce) {
+                this.sendAll({
+                    type: 'removeUser',
+                    user: member.roomUser,
+                })
+            }
+        }
+
+        if (announce) this.pushScoreboard()
+
+        await this.save()
+        await this.maybeFinishRound(true)
+        await this.save()
+
+        const otherSockets = this.ctx.getWebSockets().filter(
+            (socket) =>
+                (socket.deserializeAttachment() as { userId?: string } | null)?.userId !== uid,
+        )
+
+        if (otherSockets.length === 0) {
+            await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
+        } else {
+            await this.scheduleNextAlarm()
+        }
+    }
+
+    private closing = new WeakSet<WebSocket>()
+
+    private socketsOf = (uid: string) =>
+        this.ctx.getWebSockets().filter(
+            (socket) =>
+                !this.closing.has(socket) &&
+                (socket.deserializeAttachment() as { userId?: string } | null)?.userId === uid,
+        )
+
+    private send(ws: WebSocket, event: Ev) {
+        try {
+            ws.send(JSON.stringify(event))
+        } catch {
+            // Socket already closed.
+        }
+    }
+
+    private sendTo(uid: string, event: Ev) {
+        for (const socket of this.socketsOf(uid)) {
+            this.send(socket, event)
+        }
+    }
+
+    private sendAll(event: Ev) {
+        for (const member of this.st.members) {
+            this.sendTo(member.id, event)
+        }
+    }
+
+    private sendExcept(uid: string, event: Ev) {
+        for (const member of this.st.members) {
+            if (member.id !== uid) {
+                this.sendTo(member.id, event)
+            }
+        }
+    }
+
+    private sendHost(event: Ev) {
+        this.sendTo(this.st.hostId, event)
+    }
+
+    private resync(uid: string) {
+        this.sendTo(uid, this.view(uid))
+    }
+
+    private async save(): Promise<void> {
+        await this.ctx.storage.put('st', this.st)
+    }
+
+    private async syncLobby(): Promise<void> {
+        const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName('main'))
+
+        await lobby.upsert({
+            name: this.st.name,
+            title: getRoomTitle(this.st.settings, this.st.edition),
+            subtitle: this.subtitle(),
+            master: this.st.hostName,
+            hostId: this.st.hostId,
+            visibility: this.st.settings.visibility,
+        })
     }
 }
