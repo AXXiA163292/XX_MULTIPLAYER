@@ -8,6 +8,7 @@ import {
     type RoomType,
     type ScoringMode,
 } from './config.ts'
+import type { RoundKind } from './scoring.ts'
 
 export type CustomSongsMode = 'off' | 'on' | 'customOnly'
 
@@ -17,6 +18,18 @@ export const CUSTOM_SONGS_MODES: Record<CustomSongsMode, string> = {
     customOnly: 'Custom only',
 }
 
+export const ROUND_MODES: Record<RoundKind, string> = {
+    tournament: 'Normal (Round)',
+    warmup: 'Warmup',
+    rewind: 'Rewind',
+    freeplay: 'Freeplay',
+}
+
+export function defaultCustomRoomTitle(hostName?: string): string {
+    const clean = String(hostName ?? '').trim()
+    return clean ? `${clean}'s room` : 'Custom Room'
+}
+
 const tournamentScoringOption = {
     query: 'scoring',
     name: 'Round scoring',
@@ -24,6 +37,18 @@ const tournamentScoringOption = {
     type: 'select' as const,
     def: DEFAULT_SCORING,
     values: Object.entries(SCORING_MODES).map(([name, title]) => ({ name, title })),
+}
+
+const roundModeOption = {
+    query: 'roundMode',
+    name: 'Round type',
+    required: false,
+    type: 'select' as const,
+    def: 'tournament' as RoundKind,
+    values: (Object.keys(ROUND_MODES) as RoundKind[]).map((name) => ({
+        name,
+        title: ROUND_MODES[name],
+    })),
 }
 
 const customScoringOption = {
@@ -49,8 +74,8 @@ const titleOption = {
     description: 'Choose a name for your Custom Room.',
     required: false,
     type: 'text' as const,
-    def: 'Custom Room',
-    placeholder: 'Custom Room',
+    def: '',
+    placeholder: "Player's room",
     limit: 48,
     shortcuts: [],
 }
@@ -131,12 +156,12 @@ export const roomForms = (isTournamentHost = false) =>
             title: ROOM_TYPES[type],
             requireConfirmation: false,
             options: type === 'groupStage'
-                ? [groupOption, tournamentScoringOption, tournamentVisibilityOption]
+                ? [groupOption, roundModeOption, tournamentScoringOption, tournamentVisibilityOption]
                 : type === 'casualRoom'
                     ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
                     : type === 'rankedRoom'
                         ? [tierOption, customSongsOption]
-                        : [tournamentScoringOption, tournamentVisibilityOption],
+                        : [roundModeOption, tournamentScoringOption, tournamentVisibilityOption],
         }))
 
 export const roomFormsForType = (
@@ -147,6 +172,7 @@ export const roomFormsForType = (
 export type RoomSettings = {
     type: RoomType
     scoring: ScoringMode
+    roundMode: RoundKind
     group: string
     title: string
     visibility: 'public' | 'private' | 'locked'
@@ -162,7 +188,13 @@ export const serializeSettings = (s: RoomSettings) => {
         `visibility=${s.visibility}`,
     ]
 
-    if (s.type === 'groupStage') values.push(`group=${encodeURIComponent(s.group || 'A')}`)
+    if (s.type === 'groupStage') {
+        values.push(`group=${encodeURIComponent(s.group || 'A')}`)
+        values.push(`roundMode=${encodeURIComponent(s.roundMode || 'tournament')}`)
+    }
+    if (s.type === 'final') {
+        values.push(`roundMode=${encodeURIComponent(s.roundMode || 'tournament')}`)
+    }
     if (s.type === 'casualRoom') {
         values.push(`title=${encodeURIComponent(s.title || '')}`)
         values.push(`random=${s.random ? '1' : '0'}`)
@@ -190,18 +222,36 @@ export function normalizeCustomSongsMode(value: unknown): CustomSongsMode {
     return 'off'
 }
 
-export function parseSettings(input: string | URLSearchParams): RoomSettings | null {
+export function normalizeRoundMode(value: unknown): RoundKind {
+    const normalized = String(value ?? '').trim().toLowerCase()
+    if (normalized === 'warmup' || normalized === 'rewind' || normalized === 'freeplay') {
+        return normalized
+    }
+    return 'tournament'
+}
+
+export function parseSettings(
+    input: string | URLSearchParams,
+    existing?: RoomSettings,
+    fallbackHostName?: string,
+): RoomSettings | null {
     const p = typeof input === 'string' ? new URLSearchParams(input) : input
 
-    const type = p.get('type') || DEFAULT_TYPE
+    const type = p.get('type') || existing?.type || DEFAULT_TYPE
     if (!(type in ROOM_TYPES)) return null
 
     const open = isOpenType(type as RoomType)
-    const scoring = p.get('scoring') || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
-    const group = (p.get('group') || 'A').trim() || 'A'
-    const title = (p.get('title') || '').trim()
-    const rawVisibility = p.get('visibility')
-    const rawTier = (p.get('tier') || 'master').trim().toLowerCase()
+    const scoring = p.get('scoring') || existing?.scoring || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
+    const roundMode: RoundKind = !open
+        ? normalizeRoundMode(p.get('roundMode') ?? existing?.roundMode)
+        : 'tournament'
+    const group = (p.get('group') ?? existing?.group ?? 'A').trim() || 'A'
+    const rawTitle = p.has('title') ? (p.get('title') ?? '').trim() : (existing?.title ?? '').trim()
+    const title = type === 'casualRoom'
+        ? (rawTitle || defaultCustomRoomTitle(fallbackHostName))
+        : rawTitle
+    const rawVisibility = p.get('visibility') ?? existing?.visibility ?? null
+    const rawTier = (p.get('tier') ?? existing?.tier ?? 'master').trim().toLowerCase()
 
     const tier = (RANKED_TIER_NAMES as readonly string[]).includes(rawTier)
         ? rawTier
@@ -213,9 +263,9 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
             ? (rawVisibility === 'private' ? 'private' : 'public')
             : (rawVisibility === 'public' ? 'public' : 'locked')
 
-    const random = type === 'casualRoom' && isOn(p.get('random'))
+    const random = type === 'casualRoom' && (p.has('random') ? isOn(p.get('random')) : Boolean(existing?.random))
     const customSongs: CustomSongsMode = type === 'rankedRoom'
-        ? normalizeCustomSongsMode(p.get('customSongs'))
+        ? normalizeCustomSongsMode(p.get('customSongs') ?? existing?.customSongs)
         : 'off'
 
     if (!(scoring in SCORING_MODES)) return null
@@ -225,6 +275,7 @@ export function parseSettings(input: string | URLSearchParams): RoomSettings | n
     return {
         type: type as RoomType,
         scoring: type === 'rankedRoom' ? 'rankedMatch' : (scoring as ScoringMode),
+        roundMode,
         group,
         title,
         visibility,
