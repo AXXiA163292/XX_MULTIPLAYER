@@ -128,7 +128,7 @@ const POST_LABELS: Record<PostCategory, {
 }> = {
     announcements: {
         section: 'Announcements',
-        create: 'Create announcement',
+        create: 'Post an announcement',
         titlePlaceholder: 'Announcement title',
         bodyPlaceholder: 'Write your announcement...',
     },
@@ -140,7 +140,7 @@ const POST_LABELS: Record<PostCategory, {
     },
     results: {
         section: 'Results',
-        create: 'Create result',
+        create: 'Post results',
         titlePlaceholder: 'Result title',
         bodyPlaceholder: 'Write the results...',
     },
@@ -175,23 +175,23 @@ function resolveCategory(
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
     const candidates: (string | null | undefined)[] = [
+        urlSearchParams?.get('category'),
         url.searchParams.get('category'),
+        bodySearchParams?.get('category'),
+        values?.get('category'),
+        bodyValueParams?.get('category'),
+        body?.category,
+        urlSearchParams?.get('type'),
+        urlSearchParams?.get('infoType'),
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
-        urlSearchParams?.get('category'),
-        urlSearchParams?.get('type'),
-        urlSearchParams?.get('infoType'),
-        bodySearchParams?.get('category'),
         bodySearchParams?.get('type'),
         bodySearchParams?.get('infoType'),
-        values?.get('category'),
         values?.get('type'),
         values?.get('infoType'),
-        bodyValueParams?.get('category'),
         bodyValueParams?.get('type'),
         bodyValueParams?.get('infoType'),
-        body?.category,
         body?.type,
         body?.infoType,
         body?.postType,
@@ -208,13 +208,13 @@ function resolveCategory(
             const refUrl = new URL(referer)
             const refSearchParams = parseEncodedParams(refUrl.searchParams.get('searchValues'))
             const refCandidates: (string | null | undefined)[] = [
+                refSearchParams?.get('category'),
                 refUrl.searchParams.get('category'),
+                refSearchParams?.get('type'),
+                refSearchParams?.get('infoType'),
                 refUrl.searchParams.get('type'),
                 refUrl.searchParams.get('infoType'),
                 refUrl.searchParams.get('postType'),
-                refSearchParams?.get('category'),
-                refSearchParams?.get('type'),
-                refSearchParams?.get('infoType'),
             ]
             for (const c of refCandidates) {
                 const parsed = parseCategoryString(c)
@@ -265,7 +265,7 @@ const chatActionForm = {
         {
             name: 'Chat',
             query: 'text',
-            required: true,
+            required: false,
             type: 'text',
             def: '',
             placeholder: 'Write a message...',
@@ -285,7 +285,7 @@ const postCommentForm = {
         {
             name: 'Comment',
             query: 'text',
-            required: true,
+            required: false,
             type: 'text',
             def: '',
             placeholder: 'Write a comment...',
@@ -380,17 +380,47 @@ function externalChatUrl(req: Request, env: Env, url: URL): string | null {
     return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
 }
 
-function rawPostCategory(url: URL): string | null {
-    const val =
+function rawPostCategory(url: URL, req?: Request): string | null {
+    const searchParams = parseEncodedParams(url.searchParams.get('searchValues'))
+    const fromSearch =
+        searchParams?.get('category') ??
+        searchParams?.get('type') ??
+        searchParams?.get('infoType')
+
+    const fromDirect =
         url.searchParams.get('category') ??
         url.searchParams.get('type') ??
         url.searchParams.get('infoType') ??
         url.searchParams.get('postType')
-    return val ? val.trim().toLowerCase() : null
+
+    if (fromSearch || fromDirect) {
+        return String(fromSearch ?? fromDirect).trim().toLowerCase()
+    }
+
+    const referer = req?.headers.get('Referer')
+    if (referer) {
+        try {
+            const refUrl = new URL(referer)
+            const refSearch = parseEncodedParams(refUrl.searchParams.get('searchValues'))
+            const fromRef =
+                refSearch?.get('category') ??
+                refSearch?.get('type') ??
+                refSearch?.get('infoType') ??
+                refUrl.searchParams.get('category') ??
+                refUrl.searchParams.get('type') ??
+                refUrl.searchParams.get('infoType') ??
+                refUrl.searchParams.get('postType')
+            if (fromRef) return String(fromRef).trim().toLowerCase()
+        } catch {
+            // ignore invalid referer
+        }
+    }
+
+    return null
 }
 
-const isChatCategory = (url: URL) => {
-    const raw = rawPostCategory(url)
+const isChatCategory = (url: URL, req?: Request) => {
+    const raw = rawPostCategory(url, req)
     return raw === 'chat' || raw === 'staff-chat'
 }
 
@@ -588,7 +618,7 @@ function postForm(category: PostCategory) {
             {
                 name: 'title',
                 query: 'title',
-                required: true,
+                required: false,
                 type: 'text',
                 def: '',
                 placeholder: label.titlePlaceholder,
@@ -598,7 +628,7 @@ function postForm(category: PostCategory) {
             {
                 name: 'description',
                 query: 'description',
-                required: true,
+                required: false,
                 type: 'textArea',
                 def: '',
                 placeholder: label.bodyPlaceholder,
@@ -1176,7 +1206,7 @@ export default {
                             {
                                 type: 'post',
                                 title: 'Chat',
-                                icon: 'message',
+                                icon: 'comment',
                                 infoType: 'chat',
                             },
                         ]
@@ -1225,7 +1255,7 @@ export default {
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
 
-            if (isChatCategory(url)) {
+            if (isChatCategory(url, req)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return json({ creates: [], searches: [], sections: [] })
                 }
@@ -1270,14 +1300,8 @@ export default {
             )
 
             return json({
-                creates: canManagePosts(session)
-                    ? explicit
-                        ? [postForm(explicit)]
-                        : [
-                            postForm('announcements'),
-                            postForm('posts'),
-                            postForm('results'),
-                        ]
+                creates: canManagePosts(session) && explicit
+                    ? [postForm(explicit)]
                     : [],
                 searches: [],
                 sections,
@@ -1289,7 +1313,7 @@ export default {
             const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
             const pageSize = 10
 
-            if (isChatCategory(url)) {
+            if (isChatCategory(url, req)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return json({ title: 'Chat', pageCount: 1, items: [], searches: [] })
                 }
