@@ -159,7 +159,6 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
         time: latest?.time ?? 0,
         author: SERVER_TITLE,
         tags: [],
-        actions: [],
     }
 }
 
@@ -200,6 +199,84 @@ function escapeAttr(str: string): string {
         .replace(/"/g, '&quot;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
+}
+
+function escapeHtml(str: string): string {
+    return String(str).replace(/[<>&"]/g, (ch) => ({
+        '<': '&lt;',
+        '>': '&gt;',
+        '&': '&amp;',
+        '"': '&quot;',
+    }[ch] ?? ch))
+}
+
+function renderPostWebHtml(post: StoredPost, shareUrl: string): string {
+    const comments = [...(post.comments ?? [])].reverse()
+    const likesCount = (post.likes ?? []).length
+    const commentsHtml = comments.length
+        ? comments
+            .map(
+                (c) =>
+                    `<div class="comment"><div class="c-meta"><span>${escapeHtml(c.author)} (${escapeHtml(c.handle)})</span><span>${escapeHtml(new Date(c.time).toLocaleString())}</span></div><p>${escapeHtml(c.text)}</p></div>`,
+            )
+            .join('')
+        : '<p class="muted">No comments yet.</p>'
+
+    const thumbHtml = post.item.thumbnail?.url
+        ? `<img class="thumb" src="${escapeAttr(post.item.thumbnail.url)}" alt="thumbnail"/>`
+        : ''
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${escapeHtml(post.item.title)} · ${escapeHtml(SERVER_TITLE)}</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:24px 16px}
+  .wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+  .card{background:#151922;border:1px solid #242b3a;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:12px}
+  .meta{font-size:13px;color:#9ca3af;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  h1{font-size:26px;font-weight:700}
+  .badges{display:flex;flex-wrap:wrap;gap:8px}
+  .badge{background:#232938;border:1px solid #374151;border-radius:999px;padding:4px 10px;font-size:12px;font-weight:600}
+  .thumb{max-width:100%;max-height:320px;object-fit:contain;border-radius:10px}
+  .body-text{white-space:pre-wrap;line-height:1.55;font-size:15px}
+  .share-box{background:#0d0f14;border:1px solid #374151;border-radius:10px;padding:10px 12px;font-size:13px;word-break:break-all;color:#93c5fd}
+  h2{font-size:20px;font-weight:700}
+  .comment{background:#0d0f14;border:1px solid #283042;border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:6px}
+  .c-meta{font-size:12px;color:#9ca3af;display:flex;justify-content:space-between;gap:10px}
+  .muted{color:#9ca3af;font-size:14px}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <article class="card">
+      <div class="meta">
+        <span>${escapeHtml(post.item.name)}</span>
+        <span>·</span>
+        <span>${escapeHtml(post.item.author)}</span>
+        <span>·</span>
+        <span>${escapeHtml(new Date(post.item.time).toLocaleString())}</span>
+      </div>
+      <h1>${escapeHtml(post.item.title)}</h1>
+      <div class="badges">
+        ${post.pinned ? '<span class="badge">Pinned</span>' : ''}
+        <span class="badge">♥ ${likesCount}</span>
+        <span class="badge">💬 ${comments.length}</span>
+      </div>
+      ${thumbHtml}
+      <p class="body-text">${escapeHtml(post.description)}</p>
+      <div class="share-box">Share link: ${escapeHtml(shareUrl)}</div>
+    </article>
+    <section class="card">
+      <h2>Community (${comments.length})</h2>
+      ${commentsHtml}
+    </section>
+  </div>
+</body>
+</html>`
 }
 
 function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
@@ -486,6 +563,14 @@ function makePinPostForm(pinned: boolean) {
     }
 }
 
+const sharePostForm = {
+    type: 'sharePost',
+    title: 'Share',
+    icon: 'share',
+    requireConfirmation: false,
+    options: [],
+}
+
 const deletePostForm = {
     type: 'deletePost',
     title: 'Delete',
@@ -500,6 +585,7 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
     const actions = [
         makeLikePostForm(liked),
         makePinPostForm(pinned),
+        sharePostForm,
     ]
     if (canManagePosts(session)) {
         actions.push(deletePostForm)
@@ -1085,15 +1171,12 @@ export default {
                 ])
 
                 return json({
-                    description: '',
                     creates: [],
                     searches: [],
-                    hasMore: false,
                     sections: [
                         {
                             title: 'Chat',
                             itemType: 'post',
-                            hasMore: false,
                             items: [buildChatPostItem(messages, pinnedId)],
                         },
                     ],
@@ -1126,7 +1209,7 @@ export default {
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
+                    return json({ pageCount: 1, items: [], searches: [] })
                 }
 
                 const [messages, pinnedId] = await Promise.all([
@@ -1135,9 +1218,7 @@ export default {
                 ])
 
                 return json({
-                    description: '',
                     pageCount: 1,
-                    hasMore: false,
                     items: [buildChatPostItem(messages, pinnedId)],
                     searches: [],
                 })
@@ -1218,7 +1299,7 @@ export default {
 
             if (isChatItemName(itemName)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
+                    return json({ creates: [], actions: [] })
                 }
 
                 return json({
@@ -1228,7 +1309,9 @@ export default {
             }
 
             const post = await lobby(env).getPost(itemName)
-            if (!post) return new Response(null, { status: 404 })
+            if (!post) {
+                return json({ creates: [], actions: [] })
+            }
 
             const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
             const pinned = Boolean(post.pinned)
@@ -1336,7 +1419,7 @@ export default {
 
             if (isChatItemName(itemName)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
+                    return json({ pageCount: 1, comments: [] })
                 }
 
                 const messages = await lobby(env).listChatMessages().catch(() => [])
@@ -1344,7 +1427,9 @@ export default {
             }
 
             const post = await lobby(env).getPost(itemName)
-            if (!post) return new Response(null, { status: 404 })
+            if (!post) {
+                return json({ pageCount: 1, comments: [] })
+            }
 
             return json(formatPostComments(post, page))
         }
@@ -1434,6 +1519,14 @@ export default {
             if (actionType === 'pinPost') {
                 await lobby(env).togglePostPin(postName)
                 return json({ shouldUpdateItem: true, shouldUpdatePosts: true })
+            }
+
+            if (actionType === 'sharePost') {
+                const shareUrl = `${addressOf(req, env)}/sonolus/posts/${encodeURIComponent(postName)}`
+                return json({
+                    message: shareUrl,
+                    shouldUpdateItem: true,
+                })
             }
 
             if (!canManagePosts(session)) {
@@ -1560,6 +1653,8 @@ export default {
 
         if (postPath && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
+            const acceptsHtml = (req.headers.get('Accept') ?? '').includes('text/html') &&
+                !req.headers.get('Sonolus-Version')
 
             if (isChatItemName(postPath[1]!)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -1584,6 +1679,11 @@ export default {
 
             const post = await lobby(env).getPost(postPath[1]!)
             if (!post) return new Response(null, { status: 404 })
+
+            if (acceptsHtml) {
+                const shareUrl = `${addressOf(req, env)}/sonolus/posts/${encodeURIComponent(post.item.name)}`
+                return html(renderPostWebHtml(post, shareUrl))
+            }
 
             return json({
                 item: post.item,
