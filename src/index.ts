@@ -119,6 +119,24 @@ function buildStaffChatPostItem(unread: number) {
     }
 }
 
+async function getServerBanner(
+    env: Env,
+    origin: string,
+): Promise<{ hash: string; url: string } | undefined> {
+    if (!env.POSTS_BUCKET) return undefined
+    try {
+        const obj = await env.POSTS_BUCKET.get('banner.png')
+        if (!obj) return undefined
+        const hash = obj.httpEtag.replace(/"/g, '') || 'banner'
+        return {
+            hash,
+            url: `${origin}/assets/banner.png`,
+        }
+    } catch {
+        return undefined
+    }
+}
+
 async function getAllCatalogLevels(env: Env): Promise<LevelItem[]> {
     if (env.POSTS_BUCKET) {
         try {
@@ -352,6 +370,19 @@ export default {
             })
         }
 
+        if (url.pathname === '/assets/banner.png' && env.POSTS_BUCKET) {
+            const bannerObj = await env.POSTS_BUCKET.get('banner.png')
+            if (!bannerObj) {
+                return new Response('Banner not found', { status: 404 })
+            }
+            return new Response(bannerObj.body, {
+                headers: {
+                    'Content-Type': 'image/png',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
         if (url.pathname === '/refresh' || url.pathname === '/admin/refresh') {
             if (!env.POSTS_BUCKET) {
                 return Response.json(
@@ -467,48 +498,19 @@ export default {
             }
 
             const chatItem = canSeeChat ? buildStaffChatPostItem(unread) : null
-            const previewLevels = (await getAllCatalogLevels(env)).slice(0, 5)
+            const banner = await getServerBanner(env, url.origin)
 
             return Response.json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
+                ...(banner ? { banner } : {}),
                 buttons: [],
                 configuration: {
                     options: [],
                 },
                 levels: {
-                    items: previewLevels,
-                    searches: [
-                        {
-                            title: 'Search',
-                            options: [
-                                {
-                                    query: 'keywords',
-                                    name: 'Keywords',
-                                    required: false,
-                                    type: 'text',
-                                    def: '',
-                                    placeholder: 'Song, artist, charter...',
-                                    limit: 100,
-                                    shortcuts: [],
-                                },
-                                {
-                                    query: 'difficulty',
-                                    name: 'Difficulty',
-                                    required: false,
-                                    type: 'select',
-                                    def: 'ALL',
-                                    values: [
-                                        { name: 'ALL', title: 'All' },
-                                        { name: 'HARD', title: 'HARD' },
-                                        { name: 'EXPERT', title: 'EXPERT' },
-                                        { name: 'MASTER', title: 'MASTER' },
-                                        { name: 'APPEND', title: 'APPEND' },
-                                    ],
-                                },
-                            ],
-                        },
-                    ],
+                    items: [],
+                    searches: [],
                 },
                 rooms: {
                     items: [],
