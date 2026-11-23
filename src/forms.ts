@@ -34,7 +34,6 @@ const customScoringOption = {
 const groupOption = {
     query: 'group',
     name: 'Group',
-    description: 'Enter the group name, for example A.',
     required: false,
     type: 'text' as const,
     def: 'A',
@@ -46,7 +45,6 @@ const groupOption = {
 const titleOption = {
     query: 'title',
     name: 'Room title',
-    description: "Defaults to <username>'s room.",
     required: false,
     type: 'text' as const,
     def: '',
@@ -58,7 +56,6 @@ const titleOption = {
 const tierOption = {
     query: 'tier',
     name: 'Ranked tier',
-    description: 'Pick the rank tier of this room.',
     required: false,
     type: 'select' as const,
     def: 'master',
@@ -115,7 +112,6 @@ const randomOption = {
 export const closeRoomForm = {
     type: 'closeRoom',
     title: 'Close Room',
-    icon: 'delete',
     requireConfirmation: true,
     options: [],
 }
