@@ -3,7 +3,6 @@ import {
     SERVER_TITLE,
     STAFF_CHAT_HANDLES,
     STAFF_CHAT_SHORTCUTS,
-    STAFF_CHAT_URL,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import {
@@ -30,6 +29,15 @@ const json = (data: unknown, status = 200) =>
         },
     })
 
+const html = (body: string, status = 200) =>
+    new Response(body, {
+        status,
+        headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+        },
+    })
+
 const message = (status: number, text: string) =>
     json({ message: text }, status)
 
@@ -41,9 +49,6 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         handle &&
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
-
-const externalChatDescription = () =>
-    `External chat:\n${STAFF_CHAT_URL}\n\nShortcuts: ${STAFF_CHAT_SHORTCUTS.join(' · ')}`
 
 async function verifySigned(
     req: Request,
@@ -94,8 +99,12 @@ const profileOf = (p: any): UserProfile => ({
 async function sessionOf(
     req: Request,
     env: Env,
+    url?: URL,
 ): Promise<AuthSession | null> {
-    const token = req.headers.get('Sonolus-Session')
+    const token =
+        req.headers.get('Sonolus-Session') ??
+        url?.searchParams.get('session') ??
+        null
     return token ? verifyToken<AuthSession>(env.SESSION_SECRET, token) : null
 }
 
@@ -104,6 +113,210 @@ const roomStub = (env: Env, name: string) =>
 
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
+
+function renderStaffChatHtml(sessionToken: string, user: UserProfile): string {
+    const shortcutsJson = JSON.stringify(STAFF_CHAT_SHORTCUTS)
+    const selfHandleJson = JSON.stringify(user.handle)
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>XX! Staff Chat</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --border: #262b38;
+    --text: #eef1f8;
+    --muted: #8f98ad;
+    --accent: #6c8cff;
+    --mine: #233052;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+  }
+  header {
+    padding: 12px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header span { font-size: 12px; color: var(--muted); }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .msg {
+    max-width: 82%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 9px 12px;
+    align-self: flex-start;
+  }
+  .msg.mine {
+    background: var(--mine);
+    border-color: #364a7c;
+    align-self: flex-end;
+  }
+  .meta {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .body {
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .shortcuts {
+    display: flex;
+    gap: 6px;
+    padding: 8px 12px 0;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .chip {
+    background: #222736;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  form {
+    display: flex;
+    gap: 8px;
+    padding: 10px 12px 14px;
+    background: var(--panel);
+  }
+  input {
+    flex: 1;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 14px;
+    outline: none;
+  }
+  button.send {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 10px;
+    padding: 0 16px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>XX! Staff Chat</h1>
+    <span>${user.name || user.handle} (${user.handle})</span>
+  </header>
+  <div id="messages"></div>
+  <div class="shortcuts" id="shortcuts"></div>
+  <form id="form">
+    <input id="input" maxlength="500" placeholder="Write a message..." autocomplete="off" />
+    <button class="send" type="submit">Send</button>
+  </form>
+<script>
+  const TOKEN = ${JSON.stringify(sessionToken)};
+  const SELF_HANDLE = ${selfHandleJson};
+  const SHORTCUTS = ${shortcutsJson};
+  const listEl = document.getElementById('messages');
+  const inputEl = document.getElementById('input');
+  const shortcutsEl = document.getElementById('shortcuts');
+  let lastCount = -1;
+
+  for (const tag of SHORTCUTS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'chip';
+    btn.textContent = tag;
+    btn.onclick = () => {
+      const prefix = inputEl.value && !inputEl.value.endsWith(' ') ? ' ' : '';
+      inputEl.value += prefix + tag + ' ';
+      inputEl.focus();
+    };
+    shortcutsEl.appendChild(btn);
+  }
+
+  function render(items) {
+    if (items.length === lastCount) return;
+    const atBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 60;
+    lastCount = items.length;
+    listEl.innerHTML = '';
+    for (const m of items) {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg' + (m.handle === SELF_HANDLE ? ' mine' : '');
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const t = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      meta.textContent = (m.author || m.handle) + ' (' + m.handle + ') · ' + t;
+      const body = document.createElement('div');
+      body.className = 'body';
+      body.textContent = m.text;
+      wrap.appendChild(meta);
+      wrap.appendChild(body);
+      listEl.appendChild(wrap);
+    }
+    if (atBottom || items.length <= 20) {
+      listEl.scrollTop = listEl.scrollHeight;
+    }
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch('/api/chat?session=' + encodeURIComponent(TOKEN));
+      if (!res.ok) return;
+      const data = await res.json();
+      render(data.messages || []);
+    } catch {}
+  }
+
+  document.getElementById('form').onsubmit = async (e) => {
+    e.preventDefault();
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = '';
+    await fetch('/api/chat?session=' + encodeURIComponent(TOKEN), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    lastCount = -1;
+    await poll();
+  };
+
+  poll();
+  setInterval(poll, 3000);
+</script>
+</body>
+</html>`
+}
 
 async function roomItems(env: Env, _session: AuthSession | null) {
     const rooms = await lobby(env).list()
@@ -571,31 +784,49 @@ export default {
             })
         }
 
-        if (path === '/api/staff-chat' && req.method === 'POST') {
-            if (env.CHAT_WEBHOOK_SECRET) {
-                const auth = req.headers.get('Authorization')
-                if (auth !== `Bearer ${env.CHAT_WEBHOOK_SECRET}`) {
-                    return message(401, 'Unauthorized')
+        if (path === '/chat' && req.method === 'GET') {
+            const token = url.searchParams.get('session') ?? ''
+            const session = token
+                ? await verifyToken<AuthSession>(env.SESSION_SECRET, token)
+                : null
+
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return html('<h1>403 Forbidden</h1><p>Staff chat is restricted.</p>', 403)
+            }
+
+            return html(renderStaffChatHtml(token, session.user))
+        }
+
+        if (path === '/api/chat') {
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Staff chat is restricted.')
+            }
+
+            if (req.method === 'GET') {
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json({ messages })
+            }
+
+            if (req.method === 'POST') {
+                let body: any
+                try {
+                    body = await req.json()
+                } catch {
+                    return message(400, 'Invalid JSON.')
                 }
+
+                const text = typeof body?.text === 'string' ? body.text.trim() : ''
+                if (!text) return message(400, 'Message cannot be empty.')
+
+                const saved = await lobby(env).addChatMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
+
+                return json({ ok: true, message: saved })
             }
-
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid JSON')
-            }
-
-            const text = typeof body?.text === 'string' ? body.text.trim() : ''
-            if (!text) return message(400, 'Missing text')
-
-            const msg = await lobby(env).addChatMessage({
-                handle: String(body?.handle ?? 'external'),
-                author: String(body?.author ?? body?.handle ?? 'External'),
-                text: text.slice(0, 500),
-            })
-
-            return json({ ok: true, message: msg })
         }
 
         const ws = path.match(/^\/ws\/([\w-]+)$/)
@@ -628,8 +859,14 @@ export default {
         }
 
         if (path === '/sonolus/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env)
+            const rawSession = req.headers.get('Sonolus-Session') ?? ''
+            const session = rawSession
+                ? await verifyToken<AuthSession>(env.SESSION_SECRET, rawSession)
+                : null
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
+            const chatUrl = canChat
+                ? `${addressOf(req, env)}/chat?session=${encodeURIComponent(rawSession)}`
+                : ''
 
             const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
             let banner: { hash: string; url: string } | undefined
@@ -650,7 +887,9 @@ export default {
 
             return json({
                 title: SERVER_TITLE,
-                description: SERVER_DESCRIPTION,
+                description: canChat
+                    ? `${SERVER_DESCRIPTION}\n\nStaff Chat (${STAFF_CHAT_SHORTCUTS.join(' · ')}):\n${chatUrl}`
+                    : SERVER_DESCRIPTION,
                 ...(banner ? { banner } : {}),
                 buttons: [
                     { type: 'authentication' },
@@ -673,16 +912,6 @@ export default {
                         icon: 'medal',
                         infoType: 'results',
                     },
-                    ...(canChat
-                        ? [
-                            {
-                                type: 'post',
-                                title: 'Chat',
-                                icon: 'message',
-                                infoType: 'staff-chat',
-                            },
-                        ]
-                        : []),
                     { type: 'level' },
                     { type: 'playlist' },
                     { type: 'configuration' },
@@ -727,19 +956,6 @@ export default {
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env)
 
-            if ((url.searchParams.get('type') ?? url.searchParams.get('infoType')) === 'staff-chat') {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted.')
-                }
-
-                return json({
-                    description: externalChatDescription(),
-                    creates: [],
-                    searches: [],
-                    sections: [],
-                })
-            }
-
             const kinds: PostKind[] = hasPostCategory(url)
                 ? [postCategory(url)]
                 : ['announcements', 'posts', 'results']
@@ -762,20 +978,6 @@ export default {
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env)
-            if ((url.searchParams.get('type') ?? url.searchParams.get('infoType')) === 'staff-chat') {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ pageCount: 1, items: [], searches: [] })
-                }
-
-                return json({
-                    description: externalChatDescription(),
-                    pageCount: 1,
-                    items: [],
-                    searches: [],
-                })
-            }
-
             const posts = await lobby(env).listPosts(postCategory(url))
 
             return json({
@@ -1168,7 +1370,7 @@ export default {
                 })
             } catch (error) {
                 console.error('Could not read playlists sheet:', error)
-                return message(502, 'Could not read playlists sheet.')
+                return message(502, 'Could not read the playlists sheet.')
             }
         }
 
