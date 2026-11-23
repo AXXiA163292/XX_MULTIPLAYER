@@ -1,13 +1,10 @@
-import { RANKED_POINTS, type ScoringMode } from './config.ts'
-import { calculatePP, formatPP, roundPP, PP_SETTINGS } from './pp.ts'
-import type { GameplayResult } from './types.ts'
+import type { ScoringMode } from './config.ts'
+import type { GameplayResult, Sil } from './types.ts'
 
-export const PP_CONFIGURED = true
-
-export type RoundKind = 'tournament' | 'rewind' | 'warmup' | 'freeplay'
+export type RoundKind = 'tournament' | 'warmup' | 'rewind' | 'freeplay'
 
 export type RoundRecord = {
-    level: { address: string; name: string } | null
+    level: Sil | null
     levelTitle?: string
     levelTag?: string
     levelRating?: number
@@ -18,193 +15,146 @@ export type RoundRecord = {
     roundLabel?: string
     countsTowardScore?: boolean
     isReplay?: boolean
+    rewindEligibleUserIds?: string[]
     results: Record<string, GameplayResult>
 }
 
-export type Total = {
-    userId: string
-    score: number
-    perfect: number
-    bestCombo: number
+export const PP_CONFIGURED = true
+
+export function isPlayerX(result: GameplayResult | undefined): boolean {
+    if (!result) return false
+    return result.disqualified === true || (result.grade as string) === 'X'
 }
 
-export const isXResult = (r: GameplayResult) =>
-    r.disqualified === true || r.grade === 'X'
-
-export const rankedScore = (r: GameplayResult): number =>
-    isXResult(r)
-        ? 0
-        : (Number(r.perfect) || 0) * RANKED_POINTS.perfect +
-          (Number(r.great) || 0) * RANKED_POINTS.great +
-          (Number(r.good) || 0) * RANKED_POINTS.good
-
-export function ppScore(
-    r: GameplayResult,
-    round?: RoundRecord,
-): number {
-    if (!round || isXResult(r)) return 0
-
-    const rating = round.levelConstant ?? round.levelRating
-    const noteCount = round.noteCount ?? r.totalCount
-
-    if (
-        typeof rating !== 'number' ||
-        !Number.isFinite(rating) ||
-        rating <= 0 ||
-        !Number.isInteger(noteCount) ||
-        noteCount <= 0
-    ) return 0
-
-    const great = Number(r.great) || 0
-    const good = Number(r.good) || 0
-    const miss = Number(r.miss) || 0
-    const combo = Number(r.combo) || 0
-
-    const value = calculatePP({
-        rating,
-        noteCount,
-        perfect: Math.max(0, noteCount - great - good - miss),
-        great,
-        good,
-        bad: 0,
-        miss,
-        combo,
-        difficulty: round.difficulty ?? round.levelTag ?? 'MASTER',
-    }).pp
-
-    return Number.isFinite(value) ? value : 0
-}
-
-export const roundScore = (
-    r: GameplayResult,
+export function roundPoints(
+    result: GameplayResult | undefined,
     mode: ScoringMode,
-    round?: RoundRecord,
-): number =>
-    mode === 'pp'
-        ? ppScore(r, round)
-        : rankedScore(r)
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
+): number {
+    if (!result || isPlayerX(result)) return 0
+
+    if (mode === 'rankedMatch') {
+        const p = Number(result.perfect) || 0
+        const g = Number(result.great) || 0
+        const gd = Number(result.good) || 0
+        return p * 3 + g * 2 + gd
+    }
+
+    const baseConstant =
+        typeof round?.levelConstant === 'number' && Number.isFinite(round.levelConstant) && round.levelConstant > 0
+            ? round.levelConstant
+            : typeof round?.levelRating === 'number' && Number.isFinite(round.levelRating) && round.levelRating > 0
+                ? round.levelRating
+                : 30
+
+    const totalNotes = Math.max(
+        1,
+        Number(round?.noteCount) ||
+            (Number(result.perfect) || 0) +
+                (Number(result.great) || 0) +
+                (Number(result.good) || 0) +
+                (Number(result.miss) || 0),
+    )
+
+    const p = Number(result.perfect) || 0
+    const g = Number(result.great) || 0
+    const gd = Number(result.good) || 0
+    const weightedNotes = p + g * 0.7 + gd * 0.3
+    const accuracyRatio = Math.max(0, Math.min(1, weightedNotes / totalNotes))
+
+    const gradeBonus =
+        result.grade === 'allPerfect' ? 1.05 :
+        result.grade === 'fullCombo' ? 1.02 :
+        1.0
+
+    const rawPp = baseConstant * Math.pow(accuracyRatio, 2) * gradeBonus * 10
+    return Math.ceil(rawPp)
+}
+
+export function fmtScore(score: number, mode: ScoringMode): string {
+    const safe = Number.isFinite(score) ? score : 0
+    return mode === 'rankedMatch' ? `${Math.round(safe)} pts` : `${Math.ceil(safe)} PP`
+}
+
+export function fmtDetail(
+    result: GameplayResult,
+    mode: ScoringMode,
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
+): string {
+    const pts = roundPoints(result, mode, round)
+    const gradeTag = isPlayerX(result) ? 'X' : result.grade.toUpperCase()
+    const combo = Number(result.combo) || 0
+    return `${gradeTag} · ${fmtScore(pts, mode)} · ${combo}c`
+}
 
 export function compareResults(
     a: GameplayResult,
     b: GameplayResult,
     mode: ScoringMode,
-    round?: RoundRecord,
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
 ): number {
-    return (
-        roundScore(b, mode, round) -
-        roundScore(a, mode, round) ||
-        Number(isXResult(a)) - Number(isXResult(b)) ||
-        (Number(b.perfect) || 0) - (Number(a.perfect) || 0) ||
-        (Number(b.combo) || 0) - (Number(a.combo) || 0)
-    )
+    const ptsDiff = roundPoints(b, mode, round) - roundPoints(a, mode, round)
+    if (ptsDiff !== 0) return ptsDiff
+
+    const perfDiff = (Number(b.perfect) || 0) - (Number(a.perfect) || 0)
+    if (perfDiff !== 0) return perfDiff
+
+    return (Number(b.combo) || 0) - (Number(a.combo) || 0)
 }
 
-export function levelKey(level: RoundRecord['level']): string {
-    if (!level) return ''
-    return `${level.address.replace(/\/+$/, '')}::${level.name}`
-}
-
-/**
- * Computes cumulative totals across rounds:
- * - Warmup rounds never add to score.
- * - When a song is played more than once:
- *   - Only the first result counts UNLESS that first result was 0 due to X,
- *     in which case the first non-X result counts instead.
- */
 export function totals(
     history: RoundRecord[],
     mode: ScoringMode,
-): Total[] {
-    const map = new Map<string, Total>()
-    const countedSongForUser = new Set<string>()
-    const hadFirstXForSongUser = new Set<string>()
+): { userId: string; score: number }[] {
+    const map = new Map<string, number>()
+    const scoredRewindKeys = new Set<string>()
 
-    for (const round of history) {
-        if (round.roundKind === 'warmup' || round.countsTowardScore === false) {
-            continue
-        }
+    for (let i = 0; i < history.length; i++) {
+        const rec = history[i]!
+        const kind: RoundKind = rec.roundKind ?? 'tournament'
+        const songKey = rec.level
+            ? `${rec.level.address.replace(/\/+$/, '').toLowerCase()}::${rec.level.name.trim().toLowerCase()}`
+            : ''
 
-        const songKey = levelKey(round.level) || round.levelTitle || 'unknown'
-
-        for (const [userId, result] of Object.entries(round.results)) {
-            const total = map.get(userId) ?? {
-                userId,
-                score: 0,
-                perfect: 0,
-                bestCombo: 0,
-            }
-            map.set(userId, total)
-
-            const pairKey = `${userId}::${songKey}`
-            const isX = isXResult(result)
-            const rawPoints = roundScore(result, mode, round)
-            const added = mode === 'pp' ? roundPP(rawPoints) : rawPoints
-            const validPoints = !isX && Number.isFinite(added) ? added : 0
-
-            if (!countedSongForUser.has(pairKey)) {
-                if (isX || validPoints === 0) {
-                    hadFirstXForSongUser.add(pairKey)
-                } else {
-                    total.score += validPoints
-                    total.perfect += Number(result.perfect) || 0
-                    total.bestCombo = Math.max(total.bestCombo, Number(result.combo) || 0)
-                    countedSongForUser.add(pairKey)
+        const priorEligible = new Set<string>(rec.rewindEligibleUserIds ?? [])
+        if (kind === 'rewind' && priorEligible.size === 0 && songKey) {
+            for (let j = i - 1; j >= 0; j--) {
+                const prev = history[j]!
+                const prevKey = prev.level
+                    ? `${prev.level.address.replace(/\/+$/, '').toLowerCase()}::${prev.level.name.trim().toLowerCase()}`
+                    : ''
+                if (prevKey === songKey) {
+                    for (const [uid, res] of Object.entries(prev.results ?? {})) {
+                        if (isPlayerX(res)) priorEligible.add(uid)
+                    }
+                    break
                 }
-            } else if (hadFirstXForSongUser.has(pairKey) && !isX && validPoints > 0) {
-                total.score += validPoints
-                total.perfect += Number(result.perfect) || 0
-                total.bestCombo = Math.max(total.bestCombo, Number(result.combo) || 0)
-                countedSongForUser.add(pairKey)
-                hadFirstXForSongUser.delete(pairKey)
+            }
+        }
+
+        for (const [userId, res] of Object.entries(rec.results ?? {})) {
+            map.set(userId, map.get(userId) ?? 0)
+
+            if (kind === 'warmup' || kind === 'freeplay') {
+                continue
+            }
+
+            if (kind === 'tournament') {
+                map.set(userId, (map.get(userId) ?? 0) + roundPoints(res, mode, rec))
+                continue
+            }
+
+            if (kind === 'rewind') {
+                const claimKey = `${songKey}::${userId}`
+                if (priorEligible.has(userId) && !isPlayerX(res) && !scoredRewindKeys.has(claimKey)) {
+                    scoredRewindKeys.add(claimKey)
+                    map.set(userId, (map.get(userId) ?? 0) + roundPoints(res, mode, rec))
+                }
             }
         }
     }
 
-    return [...map.values()].sort(
-        (a, b) =>
-            b.score - a.score ||
-            b.perfect - a.perfect ||
-            b.bestCombo - a.bestCombo,
-    )
-}
-
-export const fmtScore = (
-    n: number,
-    _mode: ScoringMode,
-) => `${Math.round(Number.isFinite(n) ? n : 0)}`
-
-export function fmtDetail(
-    result: GameplayResult,
-    mode: ScoringMode,
-    round?: RoundRecord,
-): string {
-    const great = Number(result.great) || 0
-    const good = Number(result.good) || 0
-    const miss = Number(result.miss) || 0
-    const combo = Number(result.combo) || 0
-
-    if (isXResult(result)) {
-        const zeroLabel = mode === 'pp' ? formatPP(0) : '0'
-        return `${zeroLabel} | X • ${combo}x (${great}/${good}/${miss})`
-    }
-
-    const score = roundScore(result, mode, round)
-
-    const grade = result.grade === 'allPerfect'
-        ? 'AP'
-        : result.grade === 'fullCombo'
-            ? 'FC'
-            : mode === 'pp'
-                ? miss > PP_SETTINGS.skill.failedMissThreshold
-                    ? 'F'
-                    : 'P'
-                : result.grade === 'pass'
-                    ? 'P'
-                    : 'F'
-
-    const formattedScore = mode === 'pp'
-        ? formatPP(score)
-        : `${score}`
-
-    return `${formattedScore} | ${grade} • ${combo}x (${great}/${good}/${miss})`
+    return [...map.entries()]
+        .map(([userId, score]) => ({ userId, score }))
+        .sort((a, b) => b.score - a.score)
 }
