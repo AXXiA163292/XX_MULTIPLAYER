@@ -12,6 +12,7 @@ const R2_CONSTANTS_KEY = 'server/constants/index.json'
 const rankedTierKey = (tier: RankedTier) => `ranked-match/${tier.toUpperCase()}/pool.json`
 const R2_RANKED_CUSTOM_KEY = 'ranked-match/CUSTOM/pool.json'
 const DAY_MS = 24 * 60 * 60 * 1000
+const SHEET_FETCH_TIMEOUT_MS = 90000
 
 type Row = {
     id: string
@@ -105,7 +106,7 @@ async function fetchSheet(id: string, tab: string): Promise<string[][]> {
                 Accept: 'text/csv,text/plain,*/*',
                 'Cache-Control': 'no-cache',
             },
-            signal: AbortSignal.timeout(90000),
+            signal: AbortSignal.timeout(SHEET_FETCH_TIMEOUT_MS),
             cache: 'no-store',
         })
 
