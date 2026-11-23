@@ -341,6 +341,12 @@ function resolveCategory(
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
     const candidates: (string | null | undefined)[] = [
+        urlSearchParams?.get('category'),
+        bodySearchParams?.get('category'),
+        values?.get('category'),
+        bodyValueParams?.get('category'),
+        url.searchParams.get('category'),
+        body?.category,
         values?.get('type'),
         bodyValueParams?.get('type'),
         body?.type,
@@ -349,12 +355,6 @@ function resolveCategory(
         url.searchParams.get('postType'),
         body?.infoType,
         body?.postType,
-        url.searchParams.get('category'),
-        values?.get('category'),
-        bodyValueParams?.get('category'),
-        body?.category,
-        urlSearchParams?.get('category'),
-        bodySearchParams?.get('category'),
         urlSearchParams?.get('infoType'),
         bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
@@ -717,7 +717,7 @@ function renderStaffChatHtml(
   .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
   .msg-footer{margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:6px}
-  .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 7px;font-size:11px;color:#fda4af}
+  .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 6px;color:#fda4af}
   .like-avatars{display:inline-flex;align-items:center;gap:3px}
   .like-pfp{width:14px;height:14px;aspect-ratio:1/1;border-radius:4px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
   .reply-banner{display:none;align-items:center;justify-content:space-between;gap:8px;background:#1e293b;border:1px solid #3b82f6;border-radius:8px;padding:6px 10px;font-size:12px;color:#dbeafe}
@@ -1002,7 +1002,7 @@ function renderStaffChatHtml(
         '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt="' + escapeHtml(h) + '"/>'
       ).join('');
       const likeBadgeHtml = likers.length > 0
-        ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span> ' + likers.length + '</span>'
+        ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span></span>'
         : '';
 
       return '<div class="row ' + mine + '" data-row-id="' + escapeHtml(m.id) + '">' +
@@ -1061,12 +1061,15 @@ function renderStaffChatHtml(
       return;
     }
 
+    const wasOpen = chatViewEl.classList.contains('open');
+
     badgeEl.textContent = formatTag(active.name, active.handle);
     settingsBtn.style.display = 'inline-block';
     pickerEl.classList.remove('open');
     chatViewEl.classList.add('open');
     renderKnownUserChips();
-    void loadMessages();
+
+    if (!wasOpen) void loadMessages();
   }
 
   logoutBtn.addEventListener('click', () => {
@@ -1336,20 +1339,7 @@ function renderStaffChatHtml(
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
   }
 
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) void loadMessages();
-  });
-  window.addEventListener('focus', () => {
-    void loadMessages();
-  });
-  window.addEventListener('pageshow', () => {
-    syncMode();
-  });
-
   syncMode();
-  setInterval(() => {
-    void loadMessages();
-  }, 2500);
 </script>
 </body>
 </html>`
@@ -1921,7 +1911,8 @@ self.addEventListener('fetch', (event) => {
             const prefsMap = Object.fromEntries(prefsEntries)
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await lobby(env).getChatMessagesFromR2()
+                    .catch(() => lobby(env).listChatMessages().catch(() => []))
                 return json({ messages, prefs: prefsMap })
             }
 
@@ -2142,7 +2133,6 @@ self.addEventListener('fetch', (event) => {
                             title: 'Chat',
                             itemType: 'post',
                             items: [buildChatPostItem(messages, pinnedId)],
-                            searchValues: new URLSearchParams({ category: 'chat' }).toString(),
                         },
                     ],
                 })
@@ -2164,7 +2154,9 @@ self.addEventListener('fetch', (event) => {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         items: posts.map(buildPostItemWithBadges),
-                        searchValues: new URLSearchParams({ category: kind }).toString(),
+                        ...(explicit
+                            ? { searchValues: new URLSearchParams({ category: explicit }).toString() }
+                            : {}),
                     }
                 }),
             )
