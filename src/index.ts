@@ -20,6 +20,8 @@ import type { PostCategory, PostComment, StoredPost } from './lobby.ts'
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
 
+const CHAT_PFP_HANDLES = new Set(['163292', '283420', '3227470'])
+
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
         status,
@@ -50,6 +52,19 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         handle &&
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
+
+function formatAuthorTag(author: string | undefined, handle: string | undefined): string {
+    const cleanHandle = String(handle ?? '').trim()
+    const cleanAuthor = String(author ?? '').trim() || cleanHandle
+    if (!cleanHandle) return cleanAuthor
+    return `${cleanAuthor}#${cleanHandle}`
+}
+
+function chatPfpPath(handle: string | undefined): string | null {
+    const clean = String(handle ?? '').trim()
+    if (!CHAT_PFP_HANDLES.has(clean)) return null
+    return `/api/chat/pfp/${encodeURIComponent(clean)}`
+}
 
 async function verifySigned(
     req: Request,
@@ -176,18 +191,18 @@ function resolveCategory(
 
     const candidates: (string | null | undefined)[] = [
         urlSearchParams?.get('category'),
-        url.searchParams.get('category'),
         bodySearchParams?.get('category'),
+        url.searchParams.get('category'),
         values?.get('category'),
         bodyValueParams?.get('category'),
         body?.category,
         urlSearchParams?.get('type'),
         urlSearchParams?.get('infoType'),
+        bodySearchParams?.get('type'),
+        bodySearchParams?.get('infoType'),
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
-        bodySearchParams?.get('type'),
-        bodySearchParams?.get('infoType'),
         values?.get('type'),
         values?.get('infoType'),
         bodyValueParams?.get('type'),
@@ -318,9 +333,9 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
     const countLabel = `${count} ${count === 1 ? 'comment' : 'comments'}`
 
     const subtitle = pinnedMsg
-        ? `${pinnedMsg.author}: ${pinnedMsg.text} · ${countLabel}`
+        ? `${formatAuthorTag(pinnedMsg.author, pinnedMsg.handle)}: ${pinnedMsg.text} · ${countLabel}`
         : latest
-            ? `${latest.author}: ${latest.text} · ${countLabel}`
+            ? `${formatAuthorTag(latest.author, latest.handle)}: ${latest.text} · ${countLabel}`
             : countLabel
 
     return {
@@ -348,7 +363,7 @@ function formatChatCommunityComments(
         pageCount,
         comments: slice.map((m) => ({
             name: m.id,
-            author: `${m.author} (${m.handle})`,
+            author: formatAuthorTag(m.author, m.handle),
             time: m.time,
             content: m.text,
             message: m.text,
@@ -387,14 +402,18 @@ function rawPostCategory(url: URL, req?: Request): string | null {
         searchParams?.get('type') ??
         searchParams?.get('infoType')
 
+    if (fromSearch) {
+        return String(fromSearch).trim().toLowerCase()
+    }
+
     const fromDirect =
         url.searchParams.get('category') ??
         url.searchParams.get('type') ??
         url.searchParams.get('infoType') ??
         url.searchParams.get('postType')
 
-    if (fromSearch || fromDirect) {
-        return String(fromSearch ?? fromDirect).trim().toLowerCase()
+    if (fromDirect) {
+        return String(fromDirect).trim().toLowerCase()
     }
 
     const referer = req?.headers.get('Referer')
@@ -455,7 +474,9 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
   #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
   .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;max-width:85%}
   .msg.me{align-self:flex-end;background:#1d2b45;border-color:#3b82f6}
-  .meta{font-size:11px;color:#9ca3af;margin-bottom:3px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .author-wrap{display:inline-flex;align-items:center;gap:6px}
+  .pfp{width:16px;height:16px;border-radius:4px;object-fit:cover;image-rendering:pixelated;display:inline-block}
   .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .del-btn:hover{background:rgba(248,113,113,.15)}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
@@ -472,7 +493,7 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
 <body>
   <header>
     <span>${escapeAttr(SERVER_TITLE)} chat</span>
-    <span class="badge">${escapeAttr(user.name || user.handle)} (${escapeAttr(user.handle)})</span>
+    <span class="badge">${escapeAttr(formatAuthorTag(user.name, user.handle))}</span>
   </header>
   <div id="messages"></div>
   <div class="bottom-bar">
@@ -485,6 +506,11 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
 <script>
   const myHandle = ${JSON.stringify(user.handle)};
   const sessionToken = ${JSON.stringify(sessionToken)};
+  const pfpMap = ${JSON.stringify({
+      '163292': '/api/chat/pfp/163292',
+      '283420': '/api/chat/pfp/283420',
+      '3227470': '/api/chat/pfp/3227470',
+  })};
   const box = document.getElementById('messages');
   const input = document.getElementById('chatInput');
 
@@ -517,12 +543,20 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     }[ch] ?? ch));
   }
 
+  function formatTag(author, handle) {
+    const h = String(handle || '').trim();
+    const a = String(author || '').trim() || h;
+    return h ? a + '#' + h : a;
+  }
+
   function render(messages) {
     box.innerHTML = (messages || []).map((m) => {
       const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       const mine = m.handle === myHandle ? 'me' : '';
+      const pfpUrl = pfpMap[String(m.handle || '').trim()];
+      const pfpImg = pfpUrl ? '<img class="pfp" src="' + escapeHtml(pfpUrl) + '" alt=""/>' : '';
       return '<div class="msg ' + mine + '">' +
-        '<div class="meta"><span>' + escapeHtml(m.author) + ' (' + escapeHtml(m.handle) + ') · ' + escapeHtml(time) + '</span>' +
+        '<div class="meta"><span class="author-wrap">' + pfpImg + '<span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span></span>' +
         '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button></div>' +
         '<div class="text">' + escapeHtml(m.text) + '</div>' +
       '</div>';
@@ -712,7 +746,7 @@ function formatPostComments(
         pageCount,
         comments: slice.map((c) => ({
             name: c.id,
-            author: `${c.author} (${c.handle})`,
+            author: formatAuthorTag(c.author, c.handle),
             time: c.time,
             content: c.text,
             message: c.text,
@@ -1065,6 +1099,25 @@ export default {
             })
         }
 
+        const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
+        if (pfpMatch && req.method === 'GET') {
+            const handle = decodeURIComponent(pfpMatch[1]!).trim()
+            if (!CHAT_PFP_HANDLES.has(handle) || !env.COMMUNITY_BUCKET) {
+                return new Response(null, { status: 404 })
+            }
+
+            const obj = await env.COMMUNITY_BUCKET.get(`chat/${handle}.png`).catch(() => null)
+            if (!obj) return new Response(null, { status: 404 })
+
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
         if (path === '/chat' && req.method === 'GET') {
             const token = url.searchParams.get('session') ?? ''
             const session = token
@@ -1395,7 +1448,7 @@ export default {
                     version: 1,
                     title,
                     time: Date.now(),
-                    author: session.user.name || session.user.handle,
+                    author: formatAuthorTag(session.user.name, session.user.handle),
                     tags: [],
                 },
                 description,
@@ -1812,10 +1865,16 @@ export default {
                     lobby(env).getPinnedChatId().catch(() => null),
                 ])
                 const extUrl = externalChatUrl(req, env, url)
+                const pfpLinks = [...CHAT_PFP_HANDLES]
+                    .map((h) => `${addressOf(req, env)}${chatPfpPath(h)}`)
+                    .join('\n')
 
                 return json({
                     item: buildChatPostItem(messages, pinnedId),
-                    description: extUrl ? `External chat:\n${extUrl}` : '',
+                    description: [
+                        extUrl ? `External chat:\n${extUrl}` : '',
+                        pfpLinks ? `Chat PFPs:\n${pfpLinks}` : '',
+                    ].filter(Boolean).join('\n\n'),
                     actions: [],
                     hasCommunity: true,
                     leaderboards: [],
