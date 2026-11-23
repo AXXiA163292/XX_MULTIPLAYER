@@ -26,6 +26,22 @@ export function isPlayerX(result: GameplayResult | undefined): boolean {
     return result.disqualified === true || (result.grade as string) === 'X'
 }
 
+export function formatGradeShortcut(result: GameplayResult | undefined): string {
+    if (!result) return 'F'
+    if (isPlayerX(result)) return 'X'
+    switch (result.grade) {
+        case 'allPerfect':
+            return 'AP'
+        case 'fullCombo':
+            return 'FC'
+        case 'pass':
+            return 'P'
+        case 'fail':
+        default:
+            return 'F'
+    }
+}
+
 export function roundPoints(
     result: GameplayResult | undefined,
     mode: ScoringMode,
@@ -73,7 +89,18 @@ export function roundPoints(
 
 export function fmtScore(score: number, mode: ScoringMode): string {
     const safe = Number.isFinite(score) ? score : 0
-    return mode === 'rankedMatch' ? `${Math.round(safe)} pts` : `${Math.ceil(safe)} PP`
+    if (mode === 'rankedMatch') {
+        return `${Math.round(safe)}`
+    }
+    return `${Math.ceil(safe)}pp`
+}
+
+export function fmtIndividualScore(pts: number, mode: ScoringMode): string {
+    const safe = Number.isFinite(pts) ? pts : 0
+    if (mode === 'rankedMatch') {
+        return `${Math.round(safe)}`
+    }
+    return `${safe.toFixed(1)}pp`
 }
 
 export function fmtDetail(
@@ -82,9 +109,21 @@ export function fmtDetail(
     round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
 ): string {
     const pts = roundPoints(result, mode, round)
-    const gradeTag = isPlayerX(result) ? 'X' : result.grade.toUpperCase()
+    const gradeTag = formatGradeShortcut(result)
+    const scoreText = fmtIndividualScore(pts, mode)
+
+    const p = Number(result.perfect) || 0
+    const g = Number(result.great) || 0
+    const gd = Number(result.good) || 0
+    const m = Number(result.miss) || 0
+
+    if (isPlayerX(result)) {
+        const notesHit = p + g + gd
+        return `${gradeTag} · ${scoreText} · x${notesHit}`
+    }
+
     const combo = Number(result.combo) || 0
-    return `${gradeTag} · ${fmtScore(pts, mode)} · ${combo}c`
+    return `${gradeTag} · ${scoreText} · ${combo}x (${g}-${gd}-${m})`
 }
 
 export function compareResults(
@@ -124,7 +163,6 @@ export function unresolvedXUsersForSong(
             if (isPlayerX(res)) {
                 hasUnresolvedX.set(userId, true)
             } else if (hasUnresolvedX.get(userId)) {
-                // Once a player gets a non-X play on this song, their X is resolved.
                 hasUnresolvedX.set(userId, false)
             }
         }
