@@ -1,4 +1,3 @@
-
 import { DurableObject } from 'cloudflare:workers'
 import { STAFF_CHAT_ALERT_EMAIL } from './config.ts'
 import type { ChatMessage, Env } from './types.ts'
@@ -51,35 +50,12 @@ export class Lobby extends DurableObject<Env> {
             const saved = await ctx.storage.get<Partial<LobbyState>>('st')
             const base = freshLobby()
 
-            const rawPosts =
-                saved?.posts && typeof saved.posts === 'object' ? saved.posts : {}
-            const cleanPosts: Record<string, StoredPost> = {}
-            let removedLegacyChatPosts = false
-
-            for (const [key, post] of Object.entries(rawPosts)) {
-                if (
-                    !post ||
-                    (post as any).category === 'chat' ||
-                    key.startsWith('msg-') ||
-                    key === 'staff-chat' ||
-                    key === 'open-external-chat'
-                ) {
-                    removedLegacyChatPosts = true
-                    continue
-                }
-                cleanPosts[key] = post
-            }
-
             this.st = {
                 ...base,
                 ...(saved ?? {}),
                 rooms: saved?.rooms && typeof saved.rooms === 'object' ? saved.rooms : {},
-                posts: cleanPosts,
+                posts: saved?.posts && typeof saved.posts === 'object' ? saved.posts : {},
                 chat: Array.isArray(saved?.chat) ? saved.chat.slice(-200) : [],
-            }
-
-            if (removedLegacyChatPosts) {
-                await ctx.storage.put('st', this.st)
             }
         })
     }
@@ -163,10 +139,17 @@ export class Lobby extends DurableObject<Env> {
         return msg
     }
 
-    async removeChatMessage(id: string): Promise<boolean> {
-        const before = this.st.chat.length
-        this.st.chat = this.st.chat.filter((m) => m.id !== id)
-        if (this.st.chat.length === before) return false
+    async deleteChatMessage(id?: string): Promise<boolean> {
+        if (!this.st.chat.length) return false
+
+        if (id) {
+            const before = this.st.chat.length
+            this.st.chat = this.st.chat.filter((m) => m.id !== id)
+            if (this.st.chat.length === before) return false
+        } else {
+            this.st.chat = this.st.chat.slice(0, -1)
+        }
+
         await this.persist()
         return true
     }
@@ -186,7 +169,7 @@ export class Lobby extends DurableObject<Env> {
                 body: JSON.stringify({
                     from,
                     to: [STAFF_CHAT_ALERT_EMAIL],
-                    subject: `New ${msg.author} (${msg.handle}) comment in XX! Chat`,
+                    subject: `New ${msg.author} (${msg.handle}) message in XX! Chat`,
                     text: `${msg.author} (${msg.handle}):\n${msg.text}`,
                 }),
                 signal: AbortSignal.timeout(8000),
