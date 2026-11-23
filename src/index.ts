@@ -175,83 +175,73 @@ function buildPostItemWithBadges(post: StoredPost) {
     }
 }
 
-async function syncPostToBucket(env: Env, post: StoredPost) {
-    try {
-        await env.POSTS_BUCKET.put(
-            `community/post/${post.item.name}.json`,
-            JSON.stringify(post),
-            { httpMetadata: { contentType: 'application/json' } },
-        )
-        const category = (post.category === 'announcements' || post.category === 'results')
-            ? post.category
-            : 'posts'
-        const allInCategory = await lobby(env).listPosts(category).catch(() => [])
-        const merged = allInCategory.some((p) => p.item.name === post.item.name)
-            ? allInCategory.map((p) => (p.item.name === post.item.name ? post : p))
-            : [...allInCategory, post]
-        await env.POSTS_BUCKET.put(
-            `community/posts/${category}.json`,
-            JSON.stringify(sortPostsPinnedFirst(merged)),
-            { httpMetadata: { contentType: 'application/json' } },
-        )
-    } catch (err) {
-        console.error('R2 syncPostToBucket failed:', err)
-    }
+function rawPostCategory(url: URL): string | null {
+    const val =
+        url.searchParams.get('type') ??
+        url.searchParams.get('infoType') ??
+        url.searchParams.get('category') ??
+        url.searchParams.get('postType')
+    return val ? val.trim().toLowerCase() : null
 }
 
-async function removePostFromBucket(env: Env, postName: string, category?: PostKind) {
-    try {
-        await env.POSTS_BUCKET.delete(`community/post/${postName}.json`)
-        const kinds: PostKind[] = category ? [category] : ['announcements', 'posts', 'results']
-        for (const kind of kinds) {
-            const existing = await lobby(env).listPosts(kind).catch(() => [])
-            const filtered = existing.filter((p) => p.item.name !== postName)
-            await env.POSTS_BUCKET.put(
-                `community/posts/${kind}.json`,
-                JSON.stringify(sortPostsPinnedFirst(filtered)),
-                { httpMetadata: { contentType: 'application/json' } },
-            )
+const isChatCategory = (url: URL) => {
+    const raw = rawPostCategory(url)
+    return raw === 'chat' || raw === 'staff-chat'
+}
+
+const isChatItemName = (name: string) =>
+    name === 'chat' || name === 'staff-chat'
+
+function postCategory(url: URL): PostKind {
+    const type = rawPostCategory(url)
+    if (type === 'announcements' || type === 'announcement') return 'announcements'
+    if (type === 'results' || type === 'result') return 'results'
+    return 'posts'
+}
+
+const hasPostCategory = (url: URL) =>
+    ['type', 'infoType', 'category', 'postType'].some((key) => url.searchParams.has(key))
+
+async function getPostsByKind(env: Env, kind: PostKind): Promise<StoredPost[]> {
+    const fromLobby = await lobby(env).listPosts(kind).catch(() => [])
+    if (fromLobby.length > 0) return sortPostsListByKind(fromLobby, kind)
+
+    if (env.POSTS_BUCKET) {
+        try {
+            const obj = await env.POSTS_BUCKET.get(`community/posts/${kind}.json`)
+            if (obj) {
+                const parsed = (await obj.json()) as StoredPost[]
+                if (Array.isArray(parsed)) {
+                    return sortPostsListByKind(
+                        parsed.filter((p) => p.category === kind),
+                        kind,
+                    )
+                }
+            }
+        } catch {
+            // ignore
         }
-    } catch (err) {
-        console.error('R2 removePostFromBucket failed:', err)
     }
+    return []
 }
 
-async function getPostWithBucketFallback(env: Env, postName: string): Promise<StoredPost | null> {
-    const live = await lobby(env).getPost(postName).catch(() => null)
-    if (live) return live
-    try {
-        const obj = await env.POSTS_BUCKET.get(`community/post/${postName}.json`)
-        if (!obj) return null
-        return (await obj.json()) as StoredPost
-    } catch {
-        return null
-    }
+function sortPostsListByKind(posts: StoredPost[], kind: PostKind): StoredPost[] {
+    return sortPostsPinnedFirst(posts.filter((p) => p.category === kind))
 }
 
-async function listPostsWithBucketFallback(env: Env, kind: PostKind): Promise<StoredPost[]> {
-    const live = await lobby(env).listPosts(kind).catch(() => [])
-    if (live.length > 0) return sortPostsPinnedFirst(live)
-    try {
-        const obj = await env.POSTS_BUCKET.get(`community/posts/${kind}.json`)
-        if (!obj) return []
-        const data = (await obj.json()) as StoredPost[]
-        return Array.isArray(data) ? sortPostsPinnedFirst(data) : []
-    } catch {
-        return []
-    }
-}
+async function getPostByName(env: Env, name: string): Promise<StoredPost | null> {
+    const fromLobby = await lobby(env).getPost(name).catch(() => null)
+    if (fromLobby) return fromLobby
 
-async function syncChatToBucket(env: Env, messages: ChatMessage[], pinnedId: string | null) {
-    try {
-        await env.POSTS_BUCKET.put(
-            'community/chat.json',
-            JSON.stringify({ messages, pinnedId }),
-            { httpMetadata: { contentType: 'application/json' } },
-        )
-    } catch (err) {
-        console.error('R2 syncChatToBucket failed:', err)
+    if (env.POSTS_BUCKET) {
+        try {
+            const obj = await env.POSTS_BUCKET.get(`community/post/${name}.json`)
+            if (obj) return (await obj.json()) as StoredPost
+        } catch {
+            // ignore
+        }
     }
+    return null
 }
 
 const chatCommentForm = {
@@ -318,30 +308,6 @@ function externalChatUrl(req: Request, env: Env, url: URL): string | null {
     if (!token) return null
     return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
 }
-
-function rawPostCategory(url: URL): string | null {
-    return (
-        url.searchParams.get('type') ??
-        url.searchParams.get('infoType') ??
-        url.searchParams.get('category')
-    )
-}
-
-const isChatCategory = (url: URL) => {
-    const raw = rawPostCategory(url)
-    return raw === 'chat' || raw === 'staff-chat'
-}
-
-const isChatItemName = (name: string) =>
-    name === 'chat' || name === 'staff-chat'
-
-function postCategory(url: URL): PostKind {
-    const type = rawPostCategory(url)
-    return type === 'announcements' || type === 'results' ? type : 'posts'
-}
-
-const hasPostCategory = (url: URL) =>
-    ['type', 'infoType', 'category'].some((key) => url.searchParams.has(key))
 
 function escapeAttr(str: string): string {
     return String(str)
@@ -980,6 +946,7 @@ export default {
 
         if (path === '/refresh' || path === '/admin/refresh') {
             const summary = await refreshDailyAssets(env)
+            await lobby(env).syncAllToR2().catch(() => {})
             levelIndex = null
             return json({
                 ok: summary.errors.length === 0,
@@ -1023,11 +990,7 @@ export default {
                     await lobby(env).deleteChatMessage(
                         typeof body?.id === 'string' ? body.id : undefined,
                     )
-                    const [messages, pinnedId] = await Promise.all([
-                        lobby(env).listChatMessages().catch(() => []),
-                        lobby(env).getPinnedChatId().catch(() => null),
-                    ])
-                    await syncChatToBucket(env, messages, pinnedId)
+                    const messages = await lobby(env).listChatMessages().catch(() => [])
                     return json({ ok: true, messages })
                 }
 
@@ -1040,22 +1003,14 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-                await syncChatToBucket(env, messages, pinnedId)
+                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({ ok: true, messages })
             }
 
             if (req.method === 'DELETE') {
                 const id = url.searchParams.get('id') ?? undefined
                 await lobby(env).deleteChatMessage(id)
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-                await syncChatToBucket(env, messages, pinnedId)
+                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({ ok: true, messages })
             }
         }
@@ -1188,6 +1143,7 @@ export default {
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
+            await lobby(env).syncAllToR2().catch(() => {})
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -1219,7 +1175,7 @@ export default {
 
             const sections = await Promise.all(
                 kinds.map(async (kind) => {
-                    const sorted = await listPostsWithBucketFallback(env, kind)
+                    const sorted = await getPostsByKind(env, kind)
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
@@ -1260,7 +1216,7 @@ export default {
             }
 
             const kind = postCategory(url)
-            const sorted = await listPostsWithBucketFallback(env, kind)
+            const sorted = await getPostsByKind(env, kind)
 
             return json({
                 title: POST_LABELS[kind].section,
@@ -1302,7 +1258,7 @@ export default {
             const name = randomId(12)
             const key = randomId(24)
 
-            const createdPost: StoredPost = {
+            await lobby(env).createPost({
                 category,
                 item: {
                     name,
@@ -1318,10 +1274,7 @@ export default {
                 likes: [],
                 comments: [],
                 pinned: false,
-            }
-
-            await lobby(env).createPost(createdPost)
-            await syncPostToBucket(env, createdPost)
+            })
 
             return json({
                 key,
@@ -1348,7 +1301,7 @@ export default {
                 })
             }
 
-            const post = await getPostWithBucketFallback(env, itemName)
+            const post = await getPostByName(env, itemName)
             if (!post) {
                 return json({ creates: [], actions: [] })
             }
@@ -1392,12 +1345,6 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-                await syncChatToBucket(env, messages, pinnedId)
-
                 return json({
                     key: '',
                     hashes: [],
@@ -1406,13 +1353,11 @@ export default {
                 })
             }
 
-            const post = await getPostWithBucketFallback(env, itemName)
+            const post = await getPostByName(env, itemName)
             if (!post) return new Response(null, { status: 404 })
 
             if (actionType === 'likePost') {
                 await lobby(env).togglePostLike(itemName, session.user.handle)
-                const updated = await getPostWithBucketFallback(env, itemName)
-                if (updated) await syncPostToBucket(env, updated)
                 return json({
                     key: '',
                     hashes: [],
@@ -1423,8 +1368,6 @@ export default {
 
             if (actionType === 'pinPost') {
                 await lobby(env).togglePostPin(itemName)
-                const updated = await getPostWithBucketFallback(env, itemName)
-                if (updated) await syncPostToBucket(env, updated)
                 return json({
                     key: '',
                     hashes: [],
@@ -1443,9 +1386,6 @@ export default {
                 author: session.user.name || session.user.handle,
                 text: text.slice(0, 500),
             })
-
-            const updated = await getPostWithBucketFallback(env, itemName)
-            if (updated) await syncPostToBucket(env, updated)
 
             return json({
                 key: '',
@@ -1471,7 +1411,7 @@ export default {
                 return json(formatChatCommunityComments(messages, page))
             }
 
-            const post = await getPostWithBucketFallback(env, itemName)
+            const post = await getPostByName(env, itemName)
             if (!post) {
                 return json({ pageCount: 1, comments: [] })
             }
@@ -1496,12 +1436,6 @@ export default {
                 }
 
                 await lobby(env).deleteChatMessage(commentName)
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-                await syncChatToBucket(env, messages, pinnedId)
-
                 return json({
                     key: '',
                     hashes: [],
@@ -1510,13 +1444,10 @@ export default {
                 })
             }
 
-            const post = await getPostWithBucketFallback(env, itemName)
+            const post = await getPostByName(env, itemName)
             if (!post) return new Response(null, { status: 404 })
 
             await lobby(env).deletePostComment(itemName, commentName)
-            const updated = await getPostWithBucketFallback(env, itemName)
-            if (updated) await syncPostToBucket(env, updated)
-
             return json({
                 key: '',
                 hashes: [],
@@ -1559,12 +1490,6 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-                await syncChatToBucket(env, messages, pinnedId)
-
                 return json({
                     key: '',
                     hashes: [],
@@ -1572,13 +1497,11 @@ export default {
                 })
             }
 
-            const post = await getPostWithBucketFallback(env, postName)
+            const post = await getPostByName(env, postName)
             if (!post) return new Response(null, { status: 404 })
 
             if (actionType === 'likePost') {
                 await lobby(env).togglePostLike(postName, session.user.handle)
-                const updated = await getPostWithBucketFallback(env, postName)
-                if (updated) await syncPostToBucket(env, updated)
                 return json({
                     key: '',
                     hashes: [],
@@ -1588,8 +1511,6 @@ export default {
 
             if (actionType === 'pinPost') {
                 await lobby(env).togglePostPin(postName)
-                const updated = await getPostWithBucketFallback(env, postName)
-                if (updated) await syncPostToBucket(env, updated)
                 return json({
                     key: '',
                     hashes: [],
@@ -1607,7 +1528,6 @@ export default {
 
             await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
             await lobby(env).removePost(postName)
-            await removePostFromBucket(env, postName, post.category as PostKind | undefined)
 
             return json({
                 key: '',
@@ -1705,9 +1625,6 @@ export default {
                 `/sonolus/posts/${post.item.name}/thumbnail`,
             )
 
-            const updated = await getPostWithBucketFallback(env, post.item.name)
-            if (updated) await syncPostToBucket(env, updated)
-
             return json({})
         }
 
@@ -1751,7 +1668,7 @@ export default {
                 })
             }
 
-            const post = await getPostWithBucketFallback(env, postPath[1]!)
+            const post = await getPostByName(env, postPath[1]!)
             if (!post) return new Response(null, { status: 404 })
 
             return json({
