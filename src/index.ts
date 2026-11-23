@@ -119,53 +119,8 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-const chatCommentForm = {
-    type: 'chatComment',
-    title: 'Chat',
-    icon: 'comment',
-    requireConfirmation: false,
-    options: [
-        {
-            query: 'text',
-            name: 'Chat',
-            required: true,
-            type: 'textArea',
-            def: '',
-            placeholder: 'Write a message...',
-            limit: 500,
-            shortcuts: [...STAFF_CHAT_SHORTCUTS],
-        },
-    ],
-}
-
-const deleteChatForm = {
-    type: 'deleteChat',
-    title: 'Delete chat',
-    icon: 'delete',
-    requireConfirmation: true,
-    options: [],
-}
-
-function buildChatPostItem(latestMessage?: ChatMessage | null) {
-    const newestText = latestMessage?.text?.trim() || 'No messages yet.'
-
-    return {
-        name: 'chat',
-        version: 1 as const,
-        title: 'Chat',
-        subtitle: newestText,
-        time: 0,
-        author: SERVER_TITLE,
-        tags: [],
-        actions: [chatCommentForm, deleteChatForm],
-    }
-}
-
-function formatChatDetailDescription(messages: ChatMessage[], extUrl: string | null): string {
-    const recent = messages.slice(-15).map((m) => `${m.author} (${m.handle}): ${m.text}`)
-    const logBlock = recent.length ? recent.join('\n') : 'No messages yet.'
-    return extUrl ? `${logBlock}\n\nExternal chat:\n${extUrl}` : logBlock
-}
+const isChatName = (name: string) =>
+    name === 'chat' || name === 'staff-chat'
 
 function externalChatUrl(req: Request, env: Env, url: URL): string | null {
     const token = extractSessionToken(req, url)
@@ -173,13 +128,84 @@ function externalChatUrl(req: Request, env: Env, url: URL): string | null {
     return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
 }
 
-const isChatCategory = (url: URL) => {
-    const raw = rawPostCategory(url)
-    return raw === 'chat' || raw === 'staff-chat'
+function buildChatLevelItem(latestMessage?: ChatMessage | null) {
+    const newestText = latestMessage
+        ? `${latestMessage.author} (${latestMessage.handle}): ${latestMessage.text}`
+        : 'No messages yet.'
+
+    return {
+        name: 'chat',
+        version: 1 as const,
+        rating: 0,
+        title: 'Chat',
+        artists: newestText,
+        author: SERVER_TITLE,
+        tags: [],
+        engine: {
+            name: 'pjsekai',
+            version: 1,
+            title: 'Chat',
+            subtitle: '',
+            author: SERVER_TITLE,
+            tags: [],
+            skin: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' } },
+            background: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' }, image: { hash: '', url: '' } },
+            effect: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' } },
+            particle: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' } },
+        },
+        useSkin: { useDefault: true },
+        useBackground: { useDefault: true },
+        useEffect: { useDefault: true },
+        useParticle: { useDefault: true },
+        cover: { hash: '', url: '' },
+        bgm: { hash: '', url: '' },
+        data: { hash: '', url: '' },
+    }
 }
 
-const isChatItemName = (name: string) =>
-    name === 'chat' || name === 'staff-chat'
+function chatCommentsPayload(messages: ChatMessage[], page = 0) {
+    const ordered = [...messages].reverse()
+    const pageSize = 20
+    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
+    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
+
+    return {
+        pageCount,
+        comments: slice.map((m) => ({
+            id: m.id,
+            author: `${m.author} (${m.handle})`,
+            time: m.time,
+            message: m.text,
+        })),
+        creates: [
+            {
+                type: 'chatComment',
+                title: 'Chat',
+                icon: 'comment',
+                requireConfirmation: false,
+                options: [
+                    {
+                        query: 'text',
+                        name: 'Chat',
+                        required: true,
+                        type: 'textArea',
+                        def: '',
+                        placeholder: 'Write a message...',
+                        limit: 500,
+                        shortcuts: [...STAFF_CHAT_SHORTCUTS],
+                    },
+                ],
+            },
+            {
+                type: 'deleteChat',
+                title: 'Delete latest',
+                icon: 'delete',
+                requireConfirmation: true,
+                options: [],
+            },
+        ],
+    }
+}
 
 function escapeAttr(str: string): string {
     return String(str)
@@ -940,7 +966,7 @@ export default {
                     ...(canChat
                         ? [
                             {
-                                type: 'post',
+                                type: 'level',
                                 title: 'Chat',
                                 icon: 'message',
                                 infoType: 'chat',
@@ -990,31 +1016,6 @@ export default {
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
-
-            if (isChatCategory(url)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const latest = messages[messages.length - 1] ?? null
-
-                return json({
-                    description: '',
-                    creates: [],
-                    searches: [],
-                    hasMore: false,
-                    sections: [
-                        {
-                            title: 'Chat',
-                            itemType: 'post',
-                            hasMore: false,
-                            items: [buildChatPostItem(latest)],
-                        },
-                    ],
-                })
-            }
-
             const kinds: PostKind[] = hasPostCategory(url)
                 ? [postCategory(url)]
                 : ['announcements', 'posts', 'results']
@@ -1037,25 +1038,6 @@ export default {
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-
-            if (isChatCategory(url)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const latest = messages[messages.length - 1] ?? null
-
-                return json({
-                    description: '',
-                    pageCount: 1,
-                    hasMore: false,
-                    items: [buildChatPostItem(latest)],
-                    searches: [],
-                })
-            }
-
             const posts = await lobby(env).listPosts(postCategory(url))
 
             return json({
@@ -1126,7 +1108,13 @@ export default {
             const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can delete posts.')
+            }
+
             const postName = postSubmitPath[1]!
+            const post = await lobby(env).getPost(postName)
+            if (!post) return new Response(null, { status: 404 })
 
             let body: any
             try {
@@ -1136,44 +1124,7 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            const actionType = values.get('type')
-
-            if (isChatItemName(postName)) {
-                if (!isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                if (actionType === 'deleteChat') {
-                    await lobby(env).deleteChatMessage()
-                    return json({ shouldUpdatePosts: true })
-                }
-
-                const text = (values.get('text') ?? '').trim()
-                if (!text) {
-                    return message(400, 'Message cannot be empty.')
-                }
-
-                if (actionType && actionType !== 'chatComment') {
-                    return message(400, 'Unknown chat action.')
-                }
-
-                await lobby(env).addChatMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
-
-                return json({ shouldUpdatePosts: true })
-            }
-
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can delete posts.')
-            }
-
-            const post = await lobby(env).getPost(postName)
-            if (!post) return new Response(null, { status: 404 })
-
-            if (actionType !== 'deletePost') {
+            if (values.get('type') !== 'deletePost') {
                 return message(400, 'Unknown post action.')
             }
 
@@ -1292,26 +1243,6 @@ export default {
         const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
 
         if (postPath && req.method === 'GET') {
-            if (isChatItemName(postPath[1]!)) {
-                const session = await sessionOf(req, env, url)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const latest = messages[messages.length - 1] ?? null
-                const extUrl = externalChatUrl(req, env, url)
-
-                return json({
-                    item: buildChatPostItem(latest),
-                    description: formatChatDetailDescription(messages, extUrl),
-                    actions: [chatCommentForm, deleteChatForm],
-                    hasCommunity: false,
-                    leaderboards: [],
-                    sections: [],
-                })
-            }
-
             const post = await lobby(env).getPost(postPath[1]!)
             if (!post) return new Response(null, { status: 404 })
 
@@ -1328,6 +1259,33 @@ export default {
         }
 
         if (path === '/sonolus/levels/info' && req.method === 'GET') {
+            const rawType = url.searchParams.get('type') ?? url.searchParams.get('infoType')
+
+            if (rawType === 'chat' || rawType === 'staff-chat') {
+                const session = await sessionOf(req, env, url)
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const latest = messages[messages.length - 1] ?? null
+
+                return json({
+                    description: '',
+                    creates: [],
+                    searches: [],
+                    hasMore: false,
+                    sections: [
+                        {
+                            title: 'Chat',
+                            itemType: 'level',
+                            hasMore: false,
+                            items: [buildChatLevelItem(latest)],
+                        },
+                    ],
+                })
+            }
+
             try {
                 const { charts, pageCount } = await getCustomLevelPage(0, env)
                 const loaded = await loadLevelItems(charts)
@@ -1354,6 +1312,26 @@ export default {
         }
 
         if (path === '/sonolus/levels/list' && req.method === 'GET') {
+            const rawType = url.searchParams.get('type') ?? url.searchParams.get('infoType')
+
+            if (rawType === 'chat' || rawType === 'staff-chat') {
+                const session = await sessionOf(req, env, url)
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
+                }
+
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const latest = messages[messages.length - 1] ?? null
+
+                return json({
+                    description: '',
+                    pageCount: 1,
+                    hasMore: false,
+                    items: [buildChatLevelItem(latest)],
+                    searches: [],
+                })
+            }
+
             try {
                 const requestedPage = Number(url.searchParams.get('page') ?? '0')
                 const page = Number.isInteger(requestedPage) && requestedPage >= 0
@@ -1393,6 +1371,60 @@ export default {
             }
         }
 
+        const chatCommunityMatch = path.match(/^\/sonolus\/levels\/([^/]+)\/community(?:\/(.*))?$/)
+
+        if (chatCommunityMatch && isChatName(decodeURIComponent(chatCommunityMatch[1]!))) {
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Chat is restricted.')
+            }
+
+            if (req.method === 'GET') {
+                const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json(chatCommentsPayload(messages, page))
+            }
+
+            if (req.method === 'POST') {
+                let body: any
+                try {
+                    body = await req.json()
+                } catch {
+                    return message(400, 'Invalid comment data.')
+                }
+
+                const values = new URLSearchParams(String(body.values ?? ''))
+                const actionType = values.get('type')
+
+                if (actionType === 'deleteChat') {
+                    await lobby(env).deleteChatMessage()
+                    const messages = await lobby(env).listChatMessages().catch(() => [])
+                    return json(chatCommentsPayload(messages, 0))
+                }
+
+                const text = (values.get('text') ?? values.get('message') ?? '').trim()
+                if (!text) {
+                    return message(400, 'Message cannot be empty.')
+                }
+
+                await lobby(env).addChatMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
+
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json(chatCommentsPayload(messages, 0))
+            }
+
+            if (req.method === 'DELETE') {
+                const id = url.searchParams.get('id') ?? undefined
+                await lobby(env).deleteChatMessage(id)
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                return json(chatCommentsPayload(messages, 0))
+            }
+        }
+
         const levelSub = path.match(
             /^\/sonolus\/levels\/([^/]+)\/((?:community|leaderboards|submit|upload)(?:\/.*)?)$/,
         )
@@ -1407,6 +1439,26 @@ export default {
 
         if (levelPath && req.method === 'GET') {
             const requestedName = decodeURIComponent(levelPath[1]!)
+
+            if (isChatName(requestedName)) {
+                const session = await sessionOf(req, env, url)
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const latest = messages[messages.length - 1] ?? null
+                const extUrl = externalChatUrl(req, env, url)
+
+                return json({
+                    item: buildChatLevelItem(latest),
+                    description: extUrl ? `External chat:\n${extUrl}` : '',
+                    actions: [],
+                    hasCommunity: true,
+                    leaderboards: [],
+                    sections: [],
+                })
+            }
 
             try {
                 const [customCharts, playlists] = await Promise.all([
