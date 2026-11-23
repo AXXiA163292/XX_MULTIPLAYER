@@ -99,7 +99,7 @@ export function compareResults(
     )
 }
 
-function levelKey(level: RoundRecord['level']): string {
+export function levelKey(level: RoundRecord['level']): string {
     if (!level) return ''
     return `${level.address.replace(/\/+$/, '')}::${level.name}`
 }
