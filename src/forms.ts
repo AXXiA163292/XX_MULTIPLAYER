@@ -35,6 +35,18 @@ export type ServerForm = {
     options: ServerOption[]
 }
 
+export const defaultCustomRoomTitle = "Custom Room"
+
+export type CustomSongsMode = 'all' | 'customOnly' | 'officialOnly'
+
+export function normalizeCustomSongsMode(value: unknown): CustomSongsMode {
+    const normalized = String(value ?? '').trim()
+    if (normalized === 'customOnly' || normalized === 'officialOnly' || normalized === 'all') {
+        return normalized
+    }
+    return 'all'
+}
+
 export function roomForms(isHost: boolean): ServerForm[] {
     const typeValues: { name: RoomType; title: string }[] = isHost
         ? [
@@ -88,16 +100,16 @@ export function roomForms(isHost: boolean): ServerForm[] {
 
 export function parseSettings(
     optionValues: string,
-    _existing: RoomSettings | undefined,
+    existing: RoomSettings | undefined,
     fallbackName: string,
     isHost = false,
 ): RoomSettings | null {
     const params = new URLSearchParams(optionValues)
 
-    const rawName = (params.get('name') ?? '').trim()
+    const rawName = (params.get('name') ?? existing?.name ?? '').trim()
     const name = rawName.slice(0, 40) || `${fallbackName}'s Room`
 
-    const rawType = (params.get('type') ?? '').trim() as RoomType
+    const rawType = (params.get('type') ?? existing?.type ?? '').trim() as RoomType
     const allowedTypes = new Set<RoomType>(
         isHost
             ? ['groupStage', 'final', 'casualRoom', 'rankedRoom']
@@ -109,7 +121,7 @@ export function parseSettings(
           ? DEFAULT_TYPE
           : 'casualRoom'
 
-    const rawScoring = (params.get('scoring') ?? '').trim() as ScoringMode
+    const rawScoring = (params.get('scoring') ?? existing?.scoring ?? '').trim() as ScoringMode
     const allowedScoring = new Set<ScoringMode>(['pp', 'rankedMatch'])
     const scoring: ScoringMode = allowedScoring.has(rawScoring)
         ? rawScoring
@@ -118,9 +130,18 @@ export function parseSettings(
           : DEFAULT_OPEN_SCORING
 
     return {
+        ...existing,
         name,
         type,
         scoring,
-        hostHandle: isHost ? TOURNAMENT_HOST_HANDLE : undefined,
+        hostHandle: isHost ? TOURNAMENT_HOST_HANDLE : existing?.hostHandle,
     }
+}
+
+export function serializeSettings(settings: RoomSettings): string {
+    const params = new URLSearchParams()
+    if (settings.name) params.set('name', settings.name)
+    if (settings.type) params.set('type', settings.type)
+    if (settings.scoring) params.set('scoring', settings.scoring)
+    return params.toString()
 }
