@@ -467,6 +467,7 @@ export default {
             }
 
             const chatItem = canSeeChat ? buildStaffChatPostItem(unread) : null
+            const previewLevels = (await getAllCatalogLevels(env)).slice(0, 5)
 
             return Response.json({
                 title: SERVER_TITLE,
@@ -476,8 +477,38 @@ export default {
                     options: [],
                 },
                 levels: {
-                    items: [],
-                    searches: [],
+                    items: previewLevels,
+                    searches: [
+                        {
+                            title: 'Search',
+                            options: [
+                                {
+                                    query: 'keywords',
+                                    name: 'Keywords',
+                                    required: false,
+                                    type: 'text',
+                                    def: '',
+                                    placeholder: 'Song, artist, charter...',
+                                    limit: 100,
+                                    shortcuts: [],
+                                },
+                                {
+                                    query: 'difficulty',
+                                    name: 'Difficulty',
+                                    required: false,
+                                    type: 'select',
+                                    def: 'ALL',
+                                    values: [
+                                        { name: 'ALL', title: 'All' },
+                                        { name: 'HARD', title: 'HARD' },
+                                        { name: 'EXPERT', title: 'EXPERT' },
+                                        { name: 'MASTER', title: 'MASTER' },
+                                        { name: 'APPEND', title: 'APPEND' },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
                 },
                 rooms: {
                     items: [],
