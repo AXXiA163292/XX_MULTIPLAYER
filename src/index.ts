@@ -119,52 +119,69 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-const isChatName = (name: string) =>
-    name === 'chat' || name === 'staff-chat'
-
-function externalChatUrl(req: Request, env: Env, url: URL): string | null {
-    const token = extractSessionToken(req, url)
-    if (!token) return null
-    return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
+const chatCommentForm = {
+    type: 'chatComment',
+    title: 'Comment',
+    icon: 'comment',
+    requireConfirmation: false,
+    options: [
+        {
+            query: 'text',
+            name: 'Comment',
+            required: true,
+            type: 'textArea',
+            def: '',
+            placeholder: 'Write a comment...',
+            limit: 500,
+            shortcuts: [...STAFF_CHAT_SHORTCUTS],
+        },
+    ],
 }
 
-function buildChatLevelItem(latestMessage?: ChatMessage | null) {
-    const newestText = latestMessage
-        ? `${latestMessage.author} (${latestMessage.handle}): ${latestMessage.text}`
-        : 'No messages yet.'
+const pinChatForm = {
+    type: 'pinChat',
+    title: 'Pin / Unpin latest',
+    icon: 'pin',
+    requireConfirmation: false,
+    options: [],
+}
+
+const deleteChatForm = {
+    type: 'deleteChat',
+    title: 'Delete latest',
+    icon: 'delete',
+    requireConfirmation: true,
+    options: [],
+}
+
+function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
+    const latest = messages[messages.length - 1] ?? null
+    const pinnedMsg = pinnedId ? messages.find((m) => m.id === pinnedId) ?? null : null
+    const count = messages.length
+    const countLabel = `${count} ${count === 1 ? 'comment' : 'comments'}`
+
+    const subtitle = pinnedMsg
+        ? `Pinned: ${pinnedMsg.author}: ${pinnedMsg.text} · ${countLabel}`
+        : latest
+            ? `${latest.author}: ${latest.text} · ${countLabel}`
+            : countLabel
 
     return {
         name: 'chat',
         version: 1 as const,
-        rating: 0,
         title: 'Chat',
-        artists: newestText,
+        subtitle,
+        time: latest?.time ?? 0,
         author: SERVER_TITLE,
-        tags: [],
-        engine: {
-            name: 'pjsekai',
-            version: 1,
-            title: 'Chat',
-            subtitle: '',
-            author: SERVER_TITLE,
-            tags: [],
-            skin: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' } },
-            background: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' }, image: { hash: '', url: '' } },
-            effect: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' } },
-            particle: { name: 'default', version: 1, title: '', subtitle: '', author: '', tags: [], data: { hash: '', url: '' } },
-        },
-        useSkin: { useDefault: true },
-        useBackground: { useDefault: true },
-        useEffect: { useDefault: true },
-        useParticle: { useDefault: true },
-        cover: { hash: '', url: '' },
-        bgm: { hash: '', url: '' },
-        data: { hash: '', url: '' },
+        tags: pinnedMsg ? [{ title: 'Pinned' }] : [],
+        actions: [chatCommentForm, pinChatForm, deleteChatForm],
     }
 }
 
-function chatCommentsPayload(messages: ChatMessage[], page = 0) {
-    const ordered = [...messages].reverse()
+function formatChatCommunityComments(messages: ChatMessage[], pinnedId: string | null, page = 0) {
+    const pinnedMsg = pinnedId ? messages.find((m) => m.id === pinnedId) ?? null : null
+    const rest = pinnedMsg ? messages.filter((m) => m.id !== pinnedMsg.id) : messages
+    const ordered = [...(pinnedMsg ? [pinnedMsg] : []), ...[...rest].reverse()]
     const pageSize = 20
     const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
     const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
@@ -172,40 +189,43 @@ function chatCommentsPayload(messages: ChatMessage[], page = 0) {
     return {
         pageCount,
         comments: slice.map((m) => ({
-            id: m.id,
-            author: `${m.author} (${m.handle})`,
+            name: m.id,
+            author: m.id === pinnedId ? `Pinned · ${m.author} (${m.handle})` : `${m.author} (${m.handle})`,
             time: m.time,
             message: m.text,
+            actions: [
+                {
+                    type: 'pinComment',
+                    title: m.id === pinnedId ? 'Unpin' : 'Pin',
+                    icon: 'pin',
+                    requireConfirmation: false,
+                    options: [],
+                },
+                {
+                    type: 'deleteComment',
+                    title: 'Delete',
+                    icon: 'delete',
+                    requireConfirmation: true,
+                    options: [],
+                },
+            ],
         })),
-        creates: [
-            {
-                type: 'chatComment',
-                title: 'Chat',
-                icon: 'comment',
-                requireConfirmation: false,
-                options: [
-                    {
-                        query: 'text',
-                        name: 'Chat',
-                        required: true,
-                        type: 'textArea',
-                        def: '',
-                        placeholder: 'Write a message...',
-                        limit: 500,
-                        shortcuts: [...STAFF_CHAT_SHORTCUTS],
-                    },
-                ],
-            },
-            {
-                type: 'deleteChat',
-                title: 'Delete latest',
-                icon: 'delete',
-                requireConfirmation: true,
-                options: [],
-            },
-        ],
     }
 }
+
+function externalChatUrl(req: Request, env: Env, url: URL): string | null {
+    const token = extractSessionToken(req, url)
+    if (!token) return null
+    return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
+}
+
+const isChatCategory = (url: URL) => {
+    const raw = rawPostCategory(url)
+    return raw === 'chat' || raw === 'staff-chat'
+}
+
+const isChatItemName = (name: string) =>
+    name === 'chat' || name === 'staff-chat'
 
 function escapeAttr(str: string): string {
     return String(str)
@@ -235,9 +255,12 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
   #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
   .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;max-width:85%}
   .msg.me{align-self:flex-end;background:#1d2b45;border-color:#3b82f6}
+  .msg.pinned{border-color:#f59e0b}
   .meta{font-size:11px;color:#9ca3af;margin-bottom:3px;display:flex;align-items:center;justify-content:space-between;gap:8px}
-  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
-  .del-btn:hover{background:rgba(248,113,113,.15)}
+  .actions{display:flex;gap:4px}
+  .act-btn{background:transparent;color:#d1d5db;border:1px solid #374151;border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .act-btn.del{color:#f87171;border-color:rgba(248,113,113,.35)}
+  .act-btn:hover{background:rgba(255,255,255,.08)}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
   .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
   .shortcuts{display:flex;gap:8px;flex-wrap:wrap}
@@ -297,13 +320,17 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     }[ch] ?? ch));
   }
 
-  function render(messages) {
+  function render(messages, pinnedId) {
     box.innerHTML = (messages || []).map((m) => {
       const time = new Date(m.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
       const mine = m.handle === myHandle ? 'me' : '';
-      return '<div class="msg ' + mine + '">' +
-        '<div class="meta"><span>' + escapeHtml(m.author) + ' (' + escapeHtml(m.handle) + ') · ' + escapeHtml(time) + '</span>' +
-        '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button></div>' +
+      const isPinned = m.id === pinnedId;
+      return '<div class="msg ' + mine + (isPinned ? ' pinned' : '') + '">' +
+        '<div class="meta"><span>' + (isPinned ? '[Pinned] ' : '') + escapeHtml(m.author) + ' (' + escapeHtml(m.handle) + ') · ' + escapeHtml(time) + '</span>' +
+        '<span class="actions">' +
+        '<button type="button" class="act-btn" data-pin-id="' + escapeHtml(m.id) + '">' + (isPinned ? 'Unpin' : 'Pin') + '</button>' +
+        '<button type="button" class="act-btn del" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>' +
+        '</span></div>' +
         '<div class="text">' + escapeHtml(m.text) + '</div>' +
       '</div>';
     }).join('');
@@ -311,17 +338,33 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
   }
 
   box.addEventListener('click', async (e) => {
-    const target = e.target.closest('[data-delete-id]');
-    if (!target) return;
-    const id = target.getAttribute('data-delete-id');
-    if (!id) return;
-    const res = await fetch('/api/chat?id=' + encodeURIComponent(id), {
-      method: 'DELETE',
-      headers: authHeaders(),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      render(data.messages || []);
+    const pinBtn = e.target.closest('[data-pin-id]');
+    if (pinBtn) {
+      const id = pinBtn.getAttribute('data-pin-id');
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ action: 'pin', id }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        render(data.messages || [], data.pinnedId ?? null);
+      }
+      return;
+    }
+
+    const delBtn = e.target.closest('[data-delete-id]');
+    if (delBtn) {
+      const id = delBtn.getAttribute('data-delete-id');
+      if (!id) return;
+      const res = await fetch('/api/chat?id=' + encodeURIComponent(id), {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        render(data.messages || [], data.pinnedId ?? null);
+      }
     }
   });
 
@@ -329,7 +372,7 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     const res = await fetch('/api/chat', { headers: authHeaders() });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || []);
+      render(data.messages || [], data.pinnedId ?? null);
     }
   }
 
@@ -345,7 +388,7 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || []);
+      render(data.messages || [], data.pinnedId ?? null);
     }
   });
 
@@ -847,8 +890,11 @@ export default {
             }
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ messages })
+                const [messages, pinnedId] = await Promise.all([
+                    lobby(env).listChatMessages().catch(() => []),
+                    lobby(env).getPinnedChatId().catch(() => null),
+                ])
+                return json({ messages, pinnedId })
             }
 
             if (req.method === 'POST') {
@@ -859,12 +905,23 @@ export default {
                     return message(400, 'Invalid JSON.')
                 }
 
+                if (body?.action === 'pin') {
+                    const pinnedId = await lobby(env).pinChatMessage(
+                        typeof body?.id === 'string' ? body.id : undefined,
+                    )
+                    const messages = await lobby(env).listChatMessages().catch(() => [])
+                    return json({ ok: true, messages, pinnedId })
+                }
+
                 if (body?.action === 'delete') {
                     await lobby(env).deleteChatMessage(
                         typeof body?.id === 'string' ? body.id : undefined,
                     )
-                    const messages = await lobby(env).listChatMessages().catch(() => [])
-                    return json({ ok: true, messages })
+                    const [messages, pinnedId] = await Promise.all([
+                        lobby(env).listChatMessages().catch(() => []),
+                        lobby(env).getPinnedChatId().catch(() => null),
+                    ])
+                    return json({ ok: true, messages, pinnedId })
                 }
 
                 const text = typeof body?.text === 'string' ? body.text.trim() : ''
@@ -876,15 +933,21 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages })
+                const [messages, pinnedId] = await Promise.all([
+                    lobby(env).listChatMessages().catch(() => []),
+                    lobby(env).getPinnedChatId().catch(() => null),
+                ])
+                return json({ ok: true, messages, pinnedId })
             }
 
             if (req.method === 'DELETE') {
                 const id = url.searchParams.get('id') ?? undefined
                 await lobby(env).deleteChatMessage(id)
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages })
+                const [messages, pinnedId] = await Promise.all([
+                    lobby(env).listChatMessages().catch(() => []),
+                    lobby(env).getPinnedChatId().catch(() => null),
+                ])
+                return json({ ok: true, messages, pinnedId })
             }
         }
 
@@ -966,7 +1029,7 @@ export default {
                     ...(canChat
                         ? [
                             {
-                                type: 'level',
+                                type: 'post',
                                 title: 'Chat',
                                 icon: 'message',
                                 infoType: 'chat',
@@ -1016,6 +1079,33 @@ export default {
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
+
+            if (isChatCategory(url)) {
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                const [messages, pinnedId] = await Promise.all([
+                    lobby(env).listChatMessages().catch(() => []),
+                    lobby(env).getPinnedChatId().catch(() => null),
+                ])
+
+                return json({
+                    description: '',
+                    creates: [],
+                    searches: [],
+                    hasMore: false,
+                    sections: [
+                        {
+                            title: 'Chat',
+                            itemType: 'post',
+                            hasMore: false,
+                            items: [buildChatPostItem(messages, pinnedId)],
+                        },
+                    ],
+                })
+            }
+
             const kinds: PostKind[] = hasPostCategory(url)
                 ? [postCategory(url)]
                 : ['announcements', 'posts', 'results']
@@ -1038,6 +1128,27 @@ export default {
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
+            const session = await sessionOf(req, env, url)
+
+            if (isChatCategory(url)) {
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
+                }
+
+                const [messages, pinnedId] = await Promise.all([
+                    lobby(env).listChatMessages().catch(() => []),
+                    lobby(env).getPinnedChatId().catch(() => null),
+                ])
+
+                return json({
+                    description: '',
+                    pageCount: 1,
+                    hasMore: false,
+                    items: [buildChatPostItem(messages, pinnedId)],
+                    searches: [],
+                })
+            }
+
             const posts = await lobby(env).listPosts(postCategory(url))
 
             return json({
@@ -1102,19 +1213,155 @@ export default {
             })
         }
 
+        const postCommunityInfo = path.match(/^\/sonolus\/posts\/([\w-]+)\/community\/info$/)
+
+        if (postCommunityInfo && req.method === 'GET') {
+            if (!isChatItemName(postCommunityInfo[1]!)) {
+                return new Response(null, { status: 404 })
+            }
+
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Chat is restricted.')
+            }
+
+            return json({
+                creates: [chatCommentForm, pinChatForm, deleteChatForm],
+                actions: [chatCommentForm, pinChatForm, deleteChatForm],
+            })
+        }
+
+        const postCommunitySubmit = path.match(/^\/sonolus\/posts\/([\w-]+)\/community\/submit$/)
+
+        if (postCommunitySubmit && req.method === 'POST') {
+            if (!isChatItemName(postCommunitySubmit[1]!)) {
+                return new Response(null, { status: 404 })
+            }
+
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Chat is restricted.')
+            }
+
+            let body: any
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid community action.')
+            }
+
+            const values = new URLSearchParams(String(body.values ?? ''))
+            const actionType = values.get('type')
+
+            if (actionType === 'pinChat') {
+                await lobby(env).pinChatMessage()
+                return json({
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            if (actionType === 'deleteChat') {
+                await lobby(env).deleteChatMessage()
+                return json({
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            const text = (values.get('text') ?? '').trim()
+            if (!text) {
+                return message(400, 'Comment cannot be empty.')
+            }
+
+            await lobby(env).addChatMessage({
+                handle: session.user.handle,
+                author: session.user.name || session.user.handle,
+                text: text.slice(0, 500),
+            })
+
+            return json({
+                shouldUpdateCommunity: true,
+                shouldUpdateComments: true,
+                shouldNavigateCommentsToPage: 0,
+            })
+        }
+
+        const postCommentsList = path.match(/^\/sonolus\/posts\/([\w-]+)\/community\/comments\/list$/)
+
+        if (postCommentsList && req.method === 'GET') {
+            if (!isChatItemName(postCommentsList[1]!)) {
+                return new Response(null, { status: 404 })
+            }
+
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Chat is restricted.')
+            }
+
+            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+            const [messages, pinnedId] = await Promise.all([
+                lobby(env).listChatMessages().catch(() => []),
+                lobby(env).getPinnedChatId().catch(() => null),
+            ])
+
+            return json(formatChatCommunityComments(messages, pinnedId, page))
+        }
+
+        const postCommentSubmit = path.match(
+            /^\/sonolus\/posts\/([\w-]+)\/community\/comments\/([^/]+)\/submit$/,
+        )
+
+        if (postCommentSubmit && req.method === 'POST') {
+            if (!isChatItemName(postCommunitySubmit[1]!)) {
+                return new Response(null, { status: 404 })
+            }
+
+            const session = await sessionOf(req, env, url)
+            if (!session || !isStaffChatHandle(session.user.handle)) {
+                return message(403, 'Chat is restricted.')
+            }
+
+            const commentName = decodeURIComponent(postCommentSubmit[2]!)
+            let body: any
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid comment action.')
+            }
+
+            const values = new URLSearchParams(String(body.values ?? ''))
+            const actionType = values.get('type')
+
+            if (actionType === 'pinComment') {
+                await lobby(env).pinChatMessage(commentName)
+                return json({
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            if (actionType === 'deleteComment') {
+                await lobby(env).deleteChatMessage(commentName)
+                return json({
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            return json({
+                shouldUpdateCommunity: true,
+                shouldUpdateComments: true,
+            })
+        }
+
         const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
 
         if (postSubmitPath && req.method === 'POST') {
             const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can delete posts.')
-            }
-
             const postName = postSubmitPath[1]!
-            const post = await lobby(env).getPost(postName)
-            if (!post) return new Response(null, { status: 404 })
 
             let body: any
             try {
@@ -1124,7 +1371,45 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            if (values.get('type') !== 'deletePost') {
+            const actionType = values.get('type')
+
+            if (isChatItemName(postName)) {
+                if (!isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                if (actionType === 'pinChat') {
+                    await lobby(env).pinChatMessage()
+                    return json({ shouldUpdatePosts: true })
+                }
+
+                if (actionType === 'deleteChat') {
+                    await lobby(env).deleteChatMessage()
+                    return json({ shouldUpdatePosts: true })
+                }
+
+                const text = (values.get('text') ?? '').trim()
+                if (!text) {
+                    return message(400, 'Message cannot be empty.')
+                }
+
+                await lobby(env).addChatMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
+
+                return json({ shouldUpdatePosts: true })
+            }
+
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can delete posts.')
+            }
+
+            const post = await lobby(env).getPost(postName)
+            if (!post) return new Response(null, { status: 404 })
+
+            if (actionType !== 'deletePost') {
                 return message(400, 'Unknown post action.')
             }
 
@@ -1243,6 +1528,28 @@ export default {
         const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
 
         if (postPath && req.method === 'GET') {
+            if (isChatItemName(postPath[1]!)) {
+                const session = await sessionOf(req, env, url)
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                const [messages, pinnedId] = await Promise.all([
+                    lobby(env).listChatMessages().catch(() => []),
+                    lobby(env).getPinnedChatId().catch(() => null),
+                ])
+                const extUrl = externalChatUrl(req, env, url)
+
+                return json({
+                    item: buildChatPostItem(messages, pinnedId),
+                    description: extUrl ? `External chat:\n${extUrl}` : '',
+                    actions: [chatCommentForm, pinChatForm, deleteChatForm],
+                    hasCommunity: true,
+                    leaderboards: [],
+                    sections: [],
+                })
+            }
+
             const post = await lobby(env).getPost(postPath[1]!)
             if (!post) return new Response(null, { status: 404 })
 
@@ -1259,33 +1566,6 @@ export default {
         }
 
         if (path === '/sonolus/levels/info' && req.method === 'GET') {
-            const rawType = url.searchParams.get('type') ?? url.searchParams.get('infoType')
-
-            if (rawType === 'chat' || rawType === 'staff-chat') {
-                const session = await sessionOf(req, env, url)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const latest = messages[messages.length - 1] ?? null
-
-                return json({
-                    description: '',
-                    creates: [],
-                    searches: [],
-                    hasMore: false,
-                    sections: [
-                        {
-                            title: 'Chat',
-                            itemType: 'level',
-                            hasMore: false,
-                            items: [buildChatLevelItem(latest)],
-                        },
-                    ],
-                })
-            }
-
             try {
                 const { charts, pageCount } = await getCustomLevelPage(0, env)
                 const loaded = await loadLevelItems(charts)
@@ -1312,26 +1592,6 @@ export default {
         }
 
         if (path === '/sonolus/levels/list' && req.method === 'GET') {
-            const rawType = url.searchParams.get('type') ?? url.searchParams.get('infoType')
-
-            if (rawType === 'chat' || rawType === 'staff-chat') {
-                const session = await sessionOf(req, env, url)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const latest = messages[messages.length - 1] ?? null
-
-                return json({
-                    description: '',
-                    pageCount: 1,
-                    hasMore: false,
-                    items: [buildChatLevelItem(latest)],
-                    searches: [],
-                })
-            }
-
             try {
                 const requestedPage = Number(url.searchParams.get('page') ?? '0')
                 const page = Number.isInteger(requestedPage) && requestedPage >= 0
@@ -1371,60 +1631,6 @@ export default {
             }
         }
 
-        const chatCommunityMatch = path.match(/^\/sonolus\/levels\/([^/]+)\/community(?:\/(.*))?$/)
-
-        if (chatCommunityMatch && isChatName(decodeURIComponent(chatCommunityMatch[1]!))) {
-            const session = await sessionOf(req, env, url)
-            if (!session || !isStaffChatHandle(session.user.handle)) {
-                return message(403, 'Chat is restricted.')
-            }
-
-            if (req.method === 'GET') {
-                const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json(chatCommentsPayload(messages, page))
-            }
-
-            if (req.method === 'POST') {
-                let body: any
-                try {
-                    body = await req.json()
-                } catch {
-                    return message(400, 'Invalid comment data.')
-                }
-
-                const values = new URLSearchParams(String(body.values ?? ''))
-                const actionType = values.get('type')
-
-                if (actionType === 'deleteChat') {
-                    await lobby(env).deleteChatMessage()
-                    const messages = await lobby(env).listChatMessages().catch(() => [])
-                    return json(chatCommentsPayload(messages, 0))
-                }
-
-                const text = (values.get('text') ?? values.get('message') ?? '').trim()
-                if (!text) {
-                    return message(400, 'Message cannot be empty.')
-                }
-
-                await lobby(env).addChatMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json(chatCommentsPayload(messages, 0))
-            }
-
-            if (req.method === 'DELETE') {
-                const id = url.searchParams.get('id') ?? undefined
-                await lobby(env).deleteChatMessage(id)
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json(chatCommentsPayload(messages, 0))
-            }
-        }
-
         const levelSub = path.match(
             /^\/sonolus\/levels\/([^/]+)\/((?:community|leaderboards|submit|upload)(?:\/.*)?)$/,
         )
@@ -1439,26 +1645,6 @@ export default {
 
         if (levelPath && req.method === 'GET') {
             const requestedName = decodeURIComponent(levelPath[1]!)
-
-            if (isChatName(requestedName)) {
-                const session = await sessionOf(req, env, url)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                const latest = messages[messages.length - 1] ?? null
-                const extUrl = externalChatUrl(req, env, url)
-
-                return json({
-                    item: buildChatLevelItem(latest),
-                    description: extUrl ? `External chat:\n${extUrl}` : '',
-                    actions: [],
-                    hasCommunity: true,
-                    leaderboards: [],
-                    sections: [],
-                })
-            }
 
             try {
                 const [customCharts, playlists] = await Promise.all([
