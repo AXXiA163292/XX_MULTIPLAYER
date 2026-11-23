@@ -1082,21 +1082,6 @@ function renderStaffChatHtml(
     syncMode();
   });
 
-  async function toggleLikeMessage(id) {
-    const active = getActiveUser();
-    if (!active || !id) return;
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      credentials: 'same-origin',
-      body: JSON.stringify({ action: 'like', id, handle: active.handle }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      render(data.messages || []);
-    }
-  }
-
   function updateCropTransform() {
     if (!cropState.loaded) return;
     const boxSize = 180;
@@ -1232,8 +1217,6 @@ function renderStaffChatHtml(
   let swipeRow = null;
   let swipeStartX = 0;
   let swipeDeltaX = 0;
-  let lastTapId = '';
-  let lastTapAt = 0;
 
   box.addEventListener('touchstart', (e) => {
     const row = e.target.closest('[data-row-id]');
@@ -1265,13 +1248,6 @@ function renderStaffChatHtml(
     }
   });
 
-  box.addEventListener('dblclick', async (e) => {
-    const msgEl = e.target.closest('[data-msg-id]');
-    if (!msgEl) return;
-    const id = msgEl.getAttribute('data-msg-id');
-    if (id) await toggleLikeMessage(id);
-  });
-
   box.addEventListener('click', async (e) => {
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
@@ -1293,21 +1269,6 @@ function renderStaffChatHtml(
       if (res.ok) {
         const data = await res.json();
         render(data.messages || []);
-      }
-      return;
-    }
-
-    const msgEl = e.target.closest('[data-msg-id]');
-    if (msgEl) {
-      const id = msgEl.getAttribute('data-msg-id') || '';
-      const now = Date.now();
-      if (id && id === lastTapId && now - lastTapAt < 320) {
-        lastTapId = '';
-        lastTapAt = 0;
-        await toggleLikeMessage(id);
-      } else {
-        lastTapId = id;
-        lastTapAt = now;
       }
     }
   });
