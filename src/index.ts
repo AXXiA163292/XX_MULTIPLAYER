@@ -155,42 +155,69 @@ function parseCategoryString(raw: string | null | undefined): PostCategory | nul
     return null
 }
 
-function resolveCategoryFromUrlAndHeaders(
+function parseEncodedParams(raw: string | null | undefined): URLSearchParams | null {
+    if (!raw) return null
+    try {
+        return new URLSearchParams(String(raw))
+    } catch {
+        return null
+    }
+}
+
+function resolveCategory(
     url: URL,
     req?: Request,
     body?: any,
     values?: URLSearchParams,
 ): PostCategory | null {
-    const fromParams =
-        url.searchParams.get('type') ??
-        url.searchParams.get('infoType') ??
-        url.searchParams.get('category') ??
-        url.searchParams.get('postType')
-    const p1 = parseCategoryString(fromParams)
-    if (p1) return p1
+    const bodySearchParams = parseEncodedParams(body?.searchValues ?? body?.values)
+    const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues') ?? url.searchParams.get('values'))
 
-    const fromBody =
-        body?.type ??
-        body?.infoType ??
-        body?.category ??
-        body?.postType ??
-        values?.get('type') ??
-        values?.get('infoType') ??
-        values?.get('category')
-    const p2 = parseCategoryString(fromBody)
-    if (p2) return p2
+    const candidates: (string | null | undefined)[] = [
+        url.searchParams.get('category'),
+        url.searchParams.get('type'),
+        url.searchParams.get('infoType'),
+        url.searchParams.get('postType'),
+        urlSearchParams?.get('category'),
+        urlSearchParams?.get('type'),
+        urlSearchParams?.get('infoType'),
+        values?.get('category'),
+        values?.get('type'),
+        values?.get('infoType'),
+        bodySearchParams?.get('category'),
+        bodySearchParams?.get('type'),
+        bodySearchParams?.get('infoType'),
+        body?.category,
+        body?.type,
+        body?.infoType,
+        body?.postType,
+    ]
+
+    for (const c of candidates) {
+        const parsed = parseCategoryString(c)
+        if (parsed) return parsed
+    }
 
     const referer = req?.headers.get('Referer')
     if (referer) {
         try {
             const refUrl = new URL(referer)
-            const fromRef =
-                refUrl.searchParams.get('type') ??
-                refUrl.searchParams.get('infoType') ??
-                refUrl.searchParams.get('category') ??
-                refUrl.searchParams.get('postType')
-            const p3 = parseCategoryString(fromRef)
-            if (p3) return p3
+            const refSearchParams = parseEncodedParams(
+                refUrl.searchParams.get('searchValues') ?? refUrl.searchParams.get('values'),
+            )
+            const refCandidates: (string | null | undefined)[] = [
+                refUrl.searchParams.get('category'),
+                refUrl.searchParams.get('type'),
+                refUrl.searchParams.get('infoType'),
+                refUrl.searchParams.get('postType'),
+                refSearchParams?.get('category'),
+                refSearchParams?.get('type'),
+                refSearchParams?.get('infoType'),
+            ]
+            for (const c of refCandidates) {
+                const parsed = parseCategoryString(c)
+                if (parsed) return parsed
+            }
         } catch {
             // ignore invalid referer
         }
@@ -199,12 +226,13 @@ function resolveCategoryFromUrlAndHeaders(
     return null
 }
 
-function hasExplicitCategory(url: URL, req?: Request): boolean {
-    return resolveCategoryFromUrlAndHeaders(url, req) !== null
-}
-
-function postCategory(url: URL, req?: Request, body?: any, values?: URLSearchParams): PostCategory {
-    return resolveCategoryFromUrlAndHeaders(url, req, body, values) ?? 'posts'
+function postCategory(
+    url: URL,
+    req?: Request,
+    body?: any,
+    values?: URLSearchParams,
+): PostCategory {
+    return resolveCategory(url, req, body, values) ?? 'posts'
 }
 
 function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
@@ -289,7 +317,9 @@ function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
             name: m.id,
             author: `${m.author} (${m.handle})`,
             time: m.time,
+            content: m.text,
             message: m.text,
+            actions: [],
         })),
     }
 }
@@ -299,6 +329,7 @@ function extractCommentText(values: URLSearchParams): string {
         values.get('text') ??
         values.get('Comment') ??
         values.get('comment') ??
+        values.get('content') ??
         values.get('message') ??
         ''
     if (direct.trim()) return direct.trim()
@@ -317,9 +348,9 @@ function externalChatUrl(req: Request, env: Env, url: URL): string | null {
 
 function rawPostCategory(url: URL): string | null {
     const val =
+        url.searchParams.get('category') ??
         url.searchParams.get('type') ??
         url.searchParams.get('infoType') ??
-        url.searchParams.get('category') ??
         url.searchParams.get('postType')
     return val ? val.trim().toLowerCase() : null
 }
@@ -647,7 +678,9 @@ function formatPostComments(post: StoredPost, page = 0) {
             name: c.id,
             author: `${c.author} (${c.handle})`,
             time: c.time,
+            content: c.text,
             message: c.text,
+            actions: [],
         })),
     }
 }
@@ -1204,13 +1237,14 @@ export default {
                             title: 'Chat',
                             itemType: 'post',
                             hasMore: false,
+                            searchValues: new URLSearchParams({ category: 'chat' }).toString(),
                             items: [buildChatPostItem(messages, pinnedId)],
                         },
                     ],
                 })
             }
 
-            const explicit = resolveCategoryFromUrlAndHeaders(url, req)
+            const explicit = resolveCategory(url, req)
             const kinds: PostCategory[] = explicit
                 ? [explicit]
                 : ['announcements', 'posts', 'results']
@@ -1226,6 +1260,7 @@ export default {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         hasMore: posts.length > 0,
+                        searchValues: new URLSearchParams({ category: kind }).toString(),
                         items: posts.map(buildPostItemWithBadges),
                     }
                 }),
@@ -1233,7 +1268,13 @@ export default {
 
             return json({
                 creates: canManagePosts(session)
-                    ? [postForm(explicit ?? 'posts')]
+                    ? explicit
+                        ? [postForm(explicit)]
+                        : [
+                            postForm('announcements'),
+                            postForm('posts'),
+                            postForm('results'),
+                        ]
                     : [],
                 searches: [],
                 sections,
@@ -1349,10 +1390,11 @@ export default {
                     return json({ creates: [], actions: [], topComments: [] })
                 }
 
+                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({
-                    creates: [chatCommentForm],
-                    actions: [],
-                    topComments: [],
+                    creates: [],
+                    actions: [chatCommentForm],
+                    topComments: formatChatCommunityComments(messages, 0).comments.slice(0, 3),
                 })
             }
 
@@ -1362,9 +1404,9 @@ export default {
             }
 
             return json({
-                creates: [postCommentForm],
-                actions: [],
-                topComments: [],
+                creates: [],
+                actions: [postCommentForm],
+                topComments: formatPostComments(post, 0).comments.slice(0, 3),
             })
         }
 
