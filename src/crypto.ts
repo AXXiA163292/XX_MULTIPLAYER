@@ -14,17 +14,24 @@ const getSonolusKey = () =>
         'verify',
     ]))
 
-export const b64decode = (s: string): Uint8Array => Uint8Array.from(atob(s), (c) => c.charCodeAt(0))
+export const b64decode = (s: string): Uint8Array => {
+    const normalized = s.trim().replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=')
+    return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))
+}
+
 export const b64encode = (b: Uint8Array): string => {
     let s = ''
     for (const x of b) s += String.fromCharCode(x)
     return btoa(s)
 }
+
 const b64url = (b: Uint8Array) => b64encode(b).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-const unb64url = (s: string) => b64decode(s.replace(/-/g, '+').replace(/_/g, '/'))
+const unb64url = (s: string) => b64decode(s)
 
 /** Verifies a message signed by Sonolus (ECDSA P-256 / SHA-256, base64 signature). */
 export async function verifySonolusSignature(body: Uint8Array, signatureB64: string): Promise<boolean> {
+    if (!signatureB64) return false
     try {
         return await crypto.subtle.verify(
             { name: 'ECDSA', hash: 'SHA-256' },
