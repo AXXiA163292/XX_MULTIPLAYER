@@ -48,14 +48,7 @@ type LobbyState = {
     pinnedChatId: string | null
 }
 
-const POST_CATEGORIES: readonly PostCategory[] = [
-    'announcements',
-    'posts',
-    'results',
-]
-
 const CHAT_INDEX_KEY = 'chat/index.json'
-const LEGACY_CHAT_KEY = 'chat.json'
 
 const freshLobby = (): LobbyState => ({
     rooms: {},
@@ -63,6 +56,10 @@ const freshLobby = (): LobbyState => ({
     chat: [],
     pinnedChatId: null,
 })
+
+function isValidCategory(value: unknown): value is PostCategory {
+    return value === 'announcements' || value === 'posts' || value === 'results'
+}
 
 function sortPostsList(posts: StoredPost[]): StoredPost[] {
     return [...posts].sort((a, b) => {
@@ -74,10 +71,9 @@ function sortPostsList(posts: StoredPost[]): StoredPost[] {
 }
 
 function normalizePost(post: StoredPost): StoredPost {
-    const category: PostCategory =
-        post.category === 'announcements' || post.category === 'results'
-            ? post.category
-            : 'posts'
+    const category: PostCategory = isValidCategory(post.category)
+        ? post.category
+        : 'posts'
 
     const likes = Array.isArray(post.likes) ? post.likes : []
     const comments = Array.isArray(post.comments) ? post.comments : []
@@ -149,116 +145,54 @@ export class Lobby extends DurableObject<Env> {
                         : null,
             }
 
-            await this.initFromR2IfNeeded().catch(() => {})
+            await this.initChatFromR2IfEmpty().catch(() => {})
         })
     }
 
-    private async putJson(key: string, data: unknown): Promise<void> {
-        if (!this.env.COMMUNITY_BUCKET) return
-        await this.env.COMMUNITY_BUCKET.put(key, JSON.stringify(data, null, 2), {
-            httpMetadata: {
-                contentType: 'application/json',
-            },
-        })
-    }
+    private async initChatFromR2IfEmpty(): Promise<void> {
+        const bucket = this.env.COMMUNITY_BUCKET
+        if (!bucket) return
 
-    private async getJson<T>(key: string): Promise<T | null> {
-        if (!this.env.COMMUNITY_BUCKET) return null
-        const object = await this.env.COMMUNITY_BUCKET.get(key)
-        if (!object) return null
-
-        try {
-            return (await object.json()) as T
-        } catch {
-            return null
-        }
-    }
-
-    private async initFromR2IfNeeded(): Promise<void> {
-        if (!this.env.COMMUNITY_BUCKET) return
-
-        // Clean up legacy root chat.json if present
-        await this.env.COMMUNITY_BUCKET.delete(LEGACY_CHAT_KEY).catch(() => {})
-
-        const hasAnySavedPosts = Object.keys(this.st.posts).length > 0
-        if (hasAnySavedPosts) {
-            await this.syncAllToR2()
-            return
-        }
-
-        let imported = false
-        for (const category of POST_CATEGORIES) {
-            const stored = await this.getJson<StoredPost[]>(`${category}/index.json`)
-            if (!Array.isArray(stored)) continue
-
-            for (const rawPost of stored) {
-                if (rawPost?.item?.name) {
-                    const post = normalizePost({ ...rawPost, category })
-                    this.st.posts[post.item.name] = post
-                    imported = true
+        if (this.st.chat.length === 0) {
+            const obj = await bucket.get(CHAT_INDEX_KEY).catch(() => null)
+            if (obj) {
+                const parsed = (await obj.json().catch(() => null)) as {
+                    messages?: ChatMessage[]
+                    pinnedChatId?: string | null
+                } | null
+                if (parsed && Array.isArray(parsed.messages)) {
+                    this.st.chat = parsed.messages.slice(-200)
+                    if (typeof parsed.pinnedChatId === 'string') {
+                        this.st.pinnedChatId = parsed.pinnedChatId
+                    }
+                    await this.persist()
                 }
             }
         }
 
-        const storedChat = await this.getJson<{
-            messages?: ChatMessage[]
-            pinnedChatId?: string | null
-        }>(CHAT_INDEX_KEY)
-
-        if (storedChat && Array.isArray(storedChat.messages) && this.st.chat.length === 0) {
-            this.st.chat = storedChat.messages.slice(-200)
-            this.st.pinnedChatId =
-                typeof storedChat.pinnedChatId === 'string'
-                    ? storedChat.pinnedChatId
-                    : null
-            imported = true
-        }
-
-        if (imported) {
-            await this.persist()
-        }
-        await this.syncAllToR2()
-    }
-
-    private async syncCategoryToR2(category: PostCategory): Promise<void> {
-        const items = sortPostsList(
-            Object.values(this.st.posts)
-                .filter((post) => post.category === category)
-                .map(normalizePost),
-        )
-        await this.putJson(`${category}/index.json`, items)
-    }
-
-    private async syncPostToR2(post: StoredPost): Promise<void> {
-        const normalized = normalizePost(post)
-        await Promise.all([
-            this.putJson(`${normalized.category}/${normalized.item.name}.json`, normalized),
-            this.syncCategoryToR2(normalized.category),
-        ])
+        await this.syncChatToR2()
     }
 
     private async syncChatToR2(): Promise<void> {
-        await this.putJson(CHAT_INDEX_KEY, {
-            messages: this.st.chat,
-            pinnedChatId: this.st.pinnedChatId,
-        })
+        const bucket = this.env.COMMUNITY_BUCKET
+        if (!bucket) return
+
+        await bucket.put(
+            CHAT_INDEX_KEY,
+            JSON.stringify({
+                messages: this.st.chat,
+                pinnedChatId: this.st.pinnedChatId,
+            }),
+            {
+                httpMetadata: {
+                    contentType: 'application/json',
+                },
+            },
+        )
     }
 
     async syncAllToR2(): Promise<void> {
-        const writes: Promise<void>[] = POST_CATEGORIES.map((category) =>
-            this.syncCategoryToR2(category),
-        )
-        for (const post of Object.values(this.st.posts)) {
-            const normalized = normalizePost(post)
-            writes.push(
-                this.putJson(
-                    `${normalized.category}/${normalized.item.name}.json`,
-                    normalized,
-                ),
-            )
-        }
-        writes.push(this.syncChatToR2())
-        await Promise.all(writes)
+        await this.syncChatToR2()
     }
 
     private async persist(): Promise<void> {
@@ -281,27 +215,15 @@ export class Lobby extends DurableObject<Env> {
 
     async listPosts(category?: PostCategory): Promise<StoredPost[]> {
         const filtered = Object.values(this.st.posts)
-            .filter((post) => !category || post.category === category)
             .map(normalizePost)
+            .filter((post) => !category || post.category === category)
 
         return sortPostsList(filtered)
     }
 
     async getPost(name: string): Promise<StoredPost | null> {
         const existing = this.st.posts[name]
-        if (existing) return normalizePost(existing)
-
-        for (const category of POST_CATEGORIES) {
-            const stored = await this.getJson<StoredPost>(`${category}/${name}.json`)
-            if (!stored) continue
-
-            const post = normalizePost({ ...stored, category })
-            this.st.posts[name] = post
-            await this.persist()
-            return post
-        }
-
-        return null
+        return existing ? normalizePost(existing) : null
     }
 
     async findPostByUploadKey(uploadKey: string): Promise<StoredPost | null> {
@@ -315,10 +237,7 @@ export class Lobby extends DurableObject<Env> {
     async createPost(post: StoredPost): Promise<void> {
         const normalized = normalizePost(post)
         this.st.posts[normalized.item.name] = normalized
-        await Promise.all([
-            this.persist(),
-            this.syncPostToR2(normalized),
-        ])
+        await this.persist()
     }
 
     async setPostThumbnail(
@@ -333,25 +252,14 @@ export class Lobby extends DurableObject<Env> {
         post.thumbnailHash = hash
         delete post.uploadKey
 
-        const normalized = normalizePost(post)
-        this.st.posts[name] = normalized
-
-        await Promise.all([
-            this.persist(),
-            this.syncPostToR2(normalized),
-        ])
+        this.st.posts[name] = normalizePost(post)
+        await this.persist()
     }
 
     async removePost(name: string): Promise<void> {
-        const existing = this.st.posts[name]
-        if (!existing) return
-
+        if (!this.st.posts[name]) return
         delete this.st.posts[name]
-        await Promise.all([
-            this.persist(),
-            this.env.COMMUNITY_BUCKET?.delete(`${existing.category}/${name}.json`) ?? Promise.resolve(),
-            this.syncCategoryToR2(existing.category),
-        ])
+        await this.persist()
     }
 
     async togglePostLike(
@@ -371,12 +279,7 @@ export class Lobby extends DurableObject<Env> {
         post.likes = [...current]
         const normalized = normalizePost(post)
         this.st.posts[name] = normalized
-
-        await Promise.all([
-            this.persist(),
-            this.syncPostToR2(normalized),
-        ])
-
+        await this.persist()
         return normalized
     }
 
@@ -387,12 +290,7 @@ export class Lobby extends DurableObject<Env> {
         post.pinned = !post.pinned
         const normalized = normalizePost(post)
         this.st.posts[name] = normalized
-
-        await Promise.all([
-            this.persist(),
-            this.syncPostToR2(normalized),
-        ])
-
+        await this.persist()
         return normalized
     }
 
@@ -420,12 +318,7 @@ export class Lobby extends DurableObject<Env> {
         post.comments = [...(post.comments ?? []).slice(-199), comment]
         const normalized = normalizePost(post)
         this.st.posts[name] = normalized
-
-        await Promise.all([
-            this.persist(),
-            this.syncPostToR2(normalized),
-        ])
-
+        await this.persist()
         return normalized
     }
 
@@ -442,12 +335,7 @@ export class Lobby extends DurableObject<Env> {
 
         const normalized = normalizePost(post)
         this.st.posts[name] = normalized
-
-        await Promise.all([
-            this.persist(),
-            this.syncPostToR2(normalized),
-        ])
-
+        await this.persist()
         return normalized
     }
 
