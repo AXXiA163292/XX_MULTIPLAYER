@@ -8,7 +8,9 @@ import {
 } from './config.ts'
 import {
     closeRoomForm,
+    defaultCustomRoomTitle,
     normalizeCustomSongsMode,
+    normalizeRoundMode,
     parseSettings,
     roomFormsForType,
     serializeSettings,
@@ -20,6 +22,7 @@ import {
     fmtDetail,
     fmtScore,
     totals,
+    type RoundKind,
     type RoundRecord,
 } from './scoring.ts'
 import {
@@ -79,7 +82,7 @@ type RoomState = {
     suggestions: { userId: string; level: Sil }[]
     members: Member[]
     statuses: Record<string, UserStatus>
-    round: { state: string; seed: number } | null
+    round: { state: string; seed: number; kind: RoundKind; label: string } | null
     results: Record<string, GameplayResult>
     history: RoundRecord[]
 }
@@ -96,6 +99,7 @@ const fresh = (): RoomState => ({
     settings: {
         type: 'groupStage',
         scoring: 'pp',
+        roundMode: 'tournament',
         group: 'A',
         title: '',
         visibility: 'locked',
@@ -118,7 +122,7 @@ const fresh = (): RoomState => ({
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-const getRoomTitle = (settings: RoomSettings, edition = '') => {
+const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
     if (settings.type === 'rankedRoom') {
         return String(settings.tier || 'master').toUpperCase()
     }
@@ -128,10 +132,27 @@ const getRoomTitle = (settings: RoomSettings, edition = '') => {
     }
 
     if (settings.type === 'casualRoom') {
-        return settings.title || 'Custom Room'
+        return settings.title || defaultCustomRoomTitle(hostName)
     }
 
     return `${edition || 'Final'} Final`
+}
+
+function formatRoundLabel(
+    roundNumber: number,
+    kind: RoundKind,
+    isOpen: boolean,
+): string {
+    if (isOpen || kind === 'tournament') {
+        return `Round ${roundNumber}`
+    }
+    if (kind === 'warmup') {
+        return `Warmup - Round ${roundNumber}`
+    }
+    if (kind === 'rewind') {
+        return `Round ${roundNumber} - Rewind`
+    }
+    return `Freeplay • Round ${roundNumber}`
 }
 
 function sanitizeWireResult(result: GameplayResult): GameplayResult {
@@ -411,6 +432,10 @@ export class Room extends DurableObject<Env> {
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
 
+        this.ctx.setWebSocketAutoResponse(
+            new WebSocketRequestResponsePair('ping', 'pong'),
+        )
+
         ctx.blockConcurrencyWhile(async () => {
             const saved = await ctx.storage.get<Partial<RoomState>>('st')
             const base = fresh()
@@ -481,13 +506,19 @@ export class Room extends DurableObject<Env> {
                 round: saved?.round &&
                     typeof saved.round.state === 'string' &&
                     typeof saved.round.seed === 'number'
-                    ? saved.round
+                    ? {
+                        state: saved.round.state,
+                        seed: saved.round.seed,
+                        kind: normalizeRoundMode(saved.round.kind),
+                        label: typeof saved.round.label === 'string' ? saved.round.label : '',
+                    }
                     : null,
             }
 
             this.st.settings.group ||= 'A'
             this.st.settings.title ??= ''
             this.st.settings.random = this.st.settings.random === true
+            this.st.settings.roundMode = normalizeRoundMode(this.st.settings.roundMode)
 
             if (!['public', 'private', 'locked'].includes(this.st.settings.visibility)) {
                 this.st.settings.visibility =
@@ -552,6 +583,10 @@ export class Room extends DurableObject<Env> {
         })
     }
 
+    private activeSocketCount(): number {
+        return this.ctx.getWebSockets().filter((ws) => !this.closing.has(ws)).length
+    }
+
     private remainingLifespanMs(now = Date.now()): number {
         if (!this.st.createdAt) return MAX_ROOM_LIFESPAN_MS
         return Math.max(0, this.st.createdAt + MAX_ROOM_LIFESPAN_MS - now)
@@ -566,18 +601,20 @@ export class Room extends DurableObject<Env> {
         const maxRemaining = this.remainingLifespanMs(now)
 
         if (maxRemaining <= 0) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room max lifespan reached')
             return
         }
 
+        const connected = this.activeSocketCount()
+        const defaultIdleDelay = connected === 0 ? EMPTY_ROOM_TTL_MS : maxRemaining
         const targetDelay = delayMs === undefined
-            ? maxRemaining
+            ? defaultIdleDelay
             : Math.min(Math.max(1000, delayMs), maxRemaining)
 
         await this.ctx.storage.setAlarm(now + targetDelay)
     }
 
-    private async expireAndDestroy(): Promise<void> {
+    private async expireAndDestroy(reason = 'room closed'): Promise<void> {
         const roomName = this.st.name
         const sockets = this.ctx.getWebSockets()
 
@@ -593,7 +630,7 @@ export class Room extends DurableObject<Env> {
 
         for (const socket of sockets) {
             try {
-                socket.close(4002, 'room expired (3m max)')
+                socket.close(4002, reason)
             } catch {
                 // Socket may already be closed.
             }
@@ -636,7 +673,7 @@ export class Room extends DurableObject<Env> {
         host: { id: string; name: string; handle: string },
     ): Promise<boolean> {
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room expired')
             return false
         }
 
@@ -659,7 +696,7 @@ export class Room extends DurableObject<Env> {
         }
 
         if (settings.type === 'casualRoom' && !settings.title) {
-            settings.title = 'Custom Room'
+            settings.title = defaultCustomRoomTitle(host.name)
         }
 
         let editionData: EditionData | null = null
@@ -670,18 +707,23 @@ export class Room extends DurableObject<Env> {
             console.error('Could not load edition sheet while configuring room:', error)
         }
 
+        const poolCharts = editionData
+            ? chartsForType(editionData, settings.type)
+            : []
+
         if (editionData) {
             this.st.edition = editionData.edition
             this.st.divisions = cleanDivisions(editionData.divisions)
-            this.st.suggestions = suggestionsFromCharts(
-                chartsForType(editionData, settings.type),
-                host.id,
-            )
+            this.st.suggestions = suggestionsFromCharts(poolCharts, host.id)
         } else {
             this.st.edition ||= 'Final'
             this.st.divisions = {}
             this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
         }
+
+        const firstPoolChart = !isOpenType(settings.type)
+            ? (poolCharts[0] ?? null)
+            : null
 
         this.st.createdAt = Date.now()
         this.st.configured = true
@@ -690,7 +732,9 @@ export class Room extends DurableObject<Env> {
         this.st.settings = { ...settings }
         this.st.reserved = null
         this.st.status = 'selecting'
-        this.st.level = null
+        this.st.level = firstPoolChart
+            ? { address: firstPoolChart.address, name: firstPoolChart.name }
+            : null
         this.st.levelInfo = null
         this.st.levelOptions = []
         this.st.round = null
@@ -699,7 +743,7 @@ export class Room extends DurableObject<Env> {
 
         await this.save()
         await this.syncLobby()
-        await this.scheduleNextAlarm(MAX_ROOM_LIFESPAN_MS)
+        await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
         this.diag('configured')
 
         return true
@@ -707,7 +751,7 @@ export class Room extends DurableObject<Env> {
 
     async isOpen(): Promise<boolean> {
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room expired')
             return false
         }
         return this.st.configured
@@ -715,7 +759,7 @@ export class Room extends DurableObject<Env> {
 
     async summary() {
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room expired')
             return null
         }
 
@@ -723,7 +767,7 @@ export class Room extends DurableObject<Env> {
 
         return {
             name: this.st.name,
-            title: getRoomTitle(this.st.settings, this.st.edition),
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
             subtitle: this.subtitle(),
             master: this.st.hostName,
             hostId: this.st.hostId,
@@ -733,7 +777,7 @@ export class Room extends DurableObject<Env> {
 
     async canJoin(user: { id: string; handle: string }): Promise<string | null> {
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room expired')
             return 'This room has expired.'
         }
 
@@ -754,7 +798,7 @@ export class Room extends DurableObject<Env> {
 
     async fetch(request: Request): Promise<Response> {
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room expired')
             return new Response('Room expired', { status: 404 })
         }
 
@@ -845,7 +889,7 @@ export class Room extends DurableObject<Env> {
 
         this.send(server, {
             type: 'updateTitle',
-            title: getRoomTitle(this.st.settings, this.st.edition),
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
         })
 
         this.diag('ws-join', { userId: user.id, wasConnected })
@@ -864,7 +908,7 @@ export class Room extends DurableObject<Env> {
         raw: string | ArrayBuffer,
     ): Promise<void> {
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room expired')
             return
         }
 
@@ -921,15 +965,15 @@ export class Room extends DurableObject<Env> {
         this.diag('alarm-fired')
 
         if (this.isExpired()) {
-            await this.expireAndDestroy()
+            await this.expireAndDestroy('room max lifespan reached')
             return
         }
 
         await this.maybeFinishRound(true)
         await this.save()
 
-        if (this.ctx.getWebSockets().length === 0) {
-            await this.expireAndDestroy()
+        if (this.activeSocketCount() === 0) {
+            await this.expireAndDestroy('empty room closed after 3m')
             return
         }
 
@@ -941,7 +985,7 @@ export class Room extends DurableObject<Env> {
             return this.resync(uid)
         }
 
-        await this.expireAndDestroy()
+        await this.expireAndDestroy('room closed by host')
     }
 
     private async handle(uid: string, cmd: Cmd): Promise<void> {
@@ -994,7 +1038,7 @@ export class Room extends DurableObject<Env> {
 
                 const next =
                     typeof cmd.optionValues === 'string'
-                        ? parseSettings(cmd.optionValues, state.settings)
+                        ? parseSettings(cmd.optionValues, state.settings, state.hostName)
                         : null
 
                 const member = state.members.find((entry) => entry.id === uid)
@@ -1012,13 +1056,14 @@ export class Room extends DurableObject<Env> {
 
                 const randomChanged = next.random !== state.settings.random
                 const modeChanged = next.scoring !== state.settings.scoring
+                const roundModeChanged = next.roundMode !== state.settings.roundMode
                 const titleChanged =
                     next.group !== state.settings.group ||
                     next.title !== state.settings.title ||
                     next.tier !== state.settings.tier
 
                 if (next.type === 'casualRoom' && !next.title) {
-                    next.title = 'Custom Room'
+                    next.title = defaultCustomRoomTitle(state.hostName)
                 }
 
                 state.settings = next
@@ -1031,11 +1076,11 @@ export class Room extends DurableObject<Env> {
                 if (titleChanged) {
                     this.sendAll({
                         type: 'updateTitle',
-                        title: getRoomTitle(next, state.edition),
+                        title: getRoomTitle(next, state.edition, state.hostName),
                     })
                 }
 
-                if (modeChanged) {
+                if (modeChanged || roundModeChanged) {
                     this.sendAll({
                         type: 'updateScoreboardDescription',
                         scoreboardDescription: this.description(),
@@ -1468,11 +1513,23 @@ export class Room extends DurableObject<Env> {
                 return this.resync(uid)
             }
 
+            const kind: RoundKind = isOpenType(state.settings.type)
+                ? 'tournament'
+                : normalizeRoundMode(state.settings.roundMode)
+            const nextRoundNumber = state.history.length + 1
+            const label = formatRoundLabel(
+                nextRoundNumber,
+                kind,
+                isOpenType(state.settings.type),
+            )
+
             state.status = 'playing'
             state.results = {}
             state.round = {
                 state: crypto.randomUUID(),
                 seed: Math.random(),
+                kind,
+                label,
             }
 
             for (const member of state.members) {
@@ -1497,7 +1554,7 @@ export class Room extends DurableObject<Env> {
             }
 
             this.pushScoreboard()
-            this.diag('status-playing', { readyCount: readyMembers.length })
+            this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
         } else if (current === 'playing' && next === 'selecting') {
             if (Object.keys(state.results).length > 0) {
                 state.history.push(this.makeRoundRecord())
@@ -1536,6 +1593,16 @@ export class Room extends DurableObject<Env> {
 
     private makeRoundRecord(): RoundRecord {
         const info = this.st.levelInfo
+        const kind: RoundKind = isOpenType(this.st.settings.type)
+            ? 'tournament'
+            : (this.st.round?.kind ?? normalizeRoundMode(this.st.settings.roundMode))
+        const label =
+            this.st.round?.label ||
+            formatRoundLabel(
+                this.st.history.length + 1,
+                kind,
+                isOpenType(this.st.settings.type),
+            )
 
         return {
             level: this.st.level,
@@ -1545,6 +1612,10 @@ export class Room extends DurableObject<Env> {
             levelConstant: info?.constant ?? undefined,
             noteCount: info?.noteCount ?? undefined,
             difficulty: info?.difficulty || info?.firstTag || undefined,
+            roundKind: kind,
+            roundLabel: label,
+            countsTowardScore: kind !== 'warmup',
+            isReplay: kind === 'rewind' || kind === 'freeplay',
             results: { ...this.st.results },
         }
     }
@@ -1642,7 +1713,7 @@ export class Room extends DurableObject<Env> {
         if (s.status !== 'playing' || !s.round || this.roundBusy()) return
 
         if (!immediate) {
-            if (this.ctx.getWebSockets().length > 0) {
+            if (this.activeSocketCount() > 0) {
                 await this.scheduleNextAlarm(8000)
             }
             return
@@ -1669,7 +1740,7 @@ export class Room extends DurableObject<Env> {
             type: 'update',
             allowOtherServers: true,
             reportUserOptions: [],
-            title: getRoomTitle(state.settings, state.edition),
+            title: getRoomTitle(state.settings, state.edition, state.hostName),
             status: state.status,
             master,
             lead: master,
@@ -1711,20 +1782,24 @@ export class Room extends DurableObject<Env> {
     private description(): string {
         const mode = this.st.settings.scoring
         const tieBreakers = 'Tiebreakers: most perfects, then highest combo.'
+        const roundNote = !isOpenType(this.st.settings.type)
+            ? ` Next: ${formatRoundLabel(this.st.history.length + 1, this.st.settings.roundMode, false)}.`
+            : ''
 
         if (mode === 'pp') {
             return PP_CONFIGURED
-                ? `PP scoring. Each round is rounded up before the total. ${tieBreakers}`
-                : `PP scoring unavailable. ${tieBreakers}`
+                ? `PP scoring. Each round is rounded up before the total. ${tieBreakers}${roundNote}`
+                : `PP scoring unavailable. ${tieBreakers}${roundNote}`
         }
 
-        return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}`
+        return `Ranked Match: Perfect ×3, Great ×2, Good ×1. ${tieBreakers}${roundNote}`
     }
 
     private sections() {
         try {
             const state = this.st
             const mode = state.settings.scoring
+            const open = isOpenType(state.settings.type)
 
             const presentMembers = state.members.filter(
                 (member) => this.socketsOf(member.id).length > 0,
@@ -1781,7 +1856,8 @@ export class Room extends DurableObject<Env> {
                 }
             }
 
-            const roundSection = (round: RoundRecord, label: string) => {
+            const roundSection = (round: RoundRecord, fallbackLabel: string) => {
+                const label = round.roundLabel || fallbackLabel
                 const song = round.levelTitle || round.level?.name
                 const title = song
                     ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
@@ -1799,11 +1875,20 @@ export class Room extends DurableObject<Env> {
             }
 
             if (live) {
-                roundSection(live, `Round ${state.history.length + 1} (live)`)
+                const liveBase =
+                    live.roundLabel ||
+                    formatRoundLabel(state.history.length + 1, live.roundKind ?? 'tournament', open)
+                roundSection(live, `${liveBase} (live)`)
             }
 
             for (let index = state.history.length - 1; index >= 0; index--) {
-                roundSection(state.history[index]!, `Round ${index + 1}`)
+                const rec = state.history[index]!
+                const fallback = formatRoundLabel(
+                    index + 1,
+                    rec.roundKind ?? 'tournament',
+                    open,
+                )
+                roundSection(rec, fallback)
             }
 
             return output
@@ -1950,12 +2035,7 @@ export class Room extends DurableObject<Env> {
         await this.maybeFinishRound(true)
         await this.save()
 
-        const otherSockets = this.ctx.getWebSockets().filter(
-            (socket) =>
-                (socket.deserializeAttachment() as { userId?: string } | null)?.userId !== uid,
-        )
-
-        if (otherSockets.length === 0) {
+        if (this.activeSocketCount() === 0) {
             await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
         } else {
             await this.scheduleNextAlarm()
@@ -2016,7 +2096,7 @@ export class Room extends DurableObject<Env> {
 
         await lobby.upsert({
             name: this.st.name,
-            title: getRoomTitle(this.st.settings, this.st.edition),
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
             subtitle: this.subtitle(),
             master: this.st.hostName,
             hostId: this.st.hostId,
