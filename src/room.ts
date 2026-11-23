@@ -21,6 +21,7 @@ import {
     compareResults,
     fmtDetail,
     fmtScore,
+    isPlayerX,
     roundPoints,
     totals,
     type RoundKind,
@@ -158,16 +159,7 @@ function formatRoundLabel(
     if (isOpen) {
         return `Round ${roundNumber}`
     }
-    if (kind === 'tournament') {
-        return `Round ${roundNumber} · Round`
-    }
-    if (kind === 'warmup') {
-        return `Round ${roundNumber} · Warmup`
-    }
-    if (kind === 'rewind') {
-        return `Round ${roundNumber} · Rewind`
-    }
-    return `Round ${roundNumber} · Freeplay`
+    return `Round ${roundNumber} · ${roundKindTitle(kind)}`
 }
 
 function sanitizeWireResult(result: GameplayResult): GameplayResult {
@@ -228,17 +220,15 @@ async function songPoolSuggestions(
     }
 }
 
-function sameLevel(a: Sil | null | undefined, b: { address?: string; name?: string } | null | undefined): boolean {
+function sameLevel(
+    a: Sil | null | undefined,
+    b: { address?: string; name?: string } | null | undefined,
+): boolean {
     if (!a || !b || !a.address || !a.name || !b.address || !b.name) return false
     return (
         a.address.replace(/\/+$/, '').toLowerCase() === b.address.replace(/\/+$/, '').toLowerCase() &&
         a.name.trim().toLowerCase() === b.name.trim().toLowerCase()
     )
-}
-
-function hasXMark(result: GameplayResult | undefined): boolean {
-    if (!result) return false
-    return result.disqualified === true || (result.grade as string) === 'X'
 }
 
 const localize = (value: any): string => {
@@ -622,7 +612,10 @@ export class Room extends DurableObject<Env> {
         })
     }
 
-    private isPoolSong(level: Sil | null | undefined, pool: SheetChart[] = this.st.poolCharts): boolean {
+    private isPoolSong(
+        level: Sil | null | undefined,
+        pool: SheetChart[] = this.st.poolCharts,
+    ): boolean {
         if (!level) return false
         return pool.some(
             (chart) =>
@@ -643,12 +636,33 @@ export class Room extends DurableObject<Env> {
         if (!previousPlay) return eligible
 
         for (const [userId, res] of Object.entries(previousPlay.results ?? {})) {
-            if (hasXMark(res)) {
+            if (isPlayerX(res)) {
                 eligible.add(userId)
             }
         }
 
         return eligible
+    }
+
+    private alreadyScoredRewindUsers(
+        level: Sil | null | undefined,
+        priorHistory: RoundRecord[],
+    ): Set<string> {
+        const claimed = new Set<string>()
+        if (!level) return claimed
+
+        for (const rec of priorHistory) {
+            if ((rec.roundKind ?? 'tournament') !== 'rewind') continue
+            if (!sameLevel(rec.level, level)) continue
+
+            for (const [userId, res] of Object.entries(rec.results ?? {})) {
+                if (!isPlayerX(res)) {
+                    claimed.add(userId)
+                }
+            }
+        }
+
+        return claimed
     }
 
     private computeRoundKind(
@@ -1656,7 +1670,7 @@ export class Room extends DurableObject<Env> {
             this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
         } else if (current === 'playing' && next === 'selecting') {
             if (Object.keys(state.results).length > 0) {
-                state.history.push(this.makeRoundRecord())
+                state.history.push(this.makeRoundRecord(state.history))
             }
 
             state.results = {}
@@ -1692,12 +1706,15 @@ export class Room extends DurableObject<Env> {
 
     private makeRoundRecord(priorHistory: RoundRecord[] = this.st.history): RoundRecord {
         const info = this.st.levelInfo
-        const kind = this.computeRoundKind(this.st.level, priorHistory)
-        const label = formatRoundLabel(
-            priorHistory.length + 1,
-            kind,
-            isOpenType(this.st.settings.type),
-        )
+        const kind: RoundKind =
+            this.st.round?.kind ?? this.computeRoundKind(this.st.level, priorHistory)
+        const label =
+            this.st.round?.label ||
+            formatRoundLabel(
+                priorHistory.length + 1,
+                kind,
+                isOpenType(this.st.settings.type),
+            )
         const rewindEligibleUserIds =
             kind === 'rewind'
                 ? [...this.rewindEligibleUsers(this.st.level, priorHistory)]
@@ -1889,11 +1906,11 @@ export class Room extends DurableObject<Env> {
 
         if (mode === 'pp') {
             return PP_CONFIGURED
-                ? `PP scoring (Round + X-Rewind count). ${tieBreakers}${roundNote}`
+                ? `PP scoring (Round + X-Rewind once per player). ${tieBreakers}${roundNote}`
                 : `PP scoring unavailable. ${tieBreakers}${roundNote}`
         }
 
-        return `Ranked Match: Perfect ×3, Great ×2, Good ×1 (Round + X-Rewind count). ${tieBreakers}${roundNote}`
+        return `Ranked Match: Perfect ×3, Great ×2, Good ×1 (Round + X-Rewind once per player). ${tieBreakers}${roundNote}`
     }
 
     private effectiveRoundScore(
@@ -1918,7 +1935,8 @@ export class Room extends DurableObject<Env> {
                     ? round.rewindEligibleUserIds
                     : [...this.rewindEligibleUsers(round.level, priorHistory)],
             )
-            if (!eligible.has(userId)) {
+            const alreadyScored = this.alreadyScoredRewindUsers(round.level, priorHistory)
+            if (!eligible.has(userId) || alreadyScored.has(userId) || isPlayerX(result)) {
                 return 0
             }
         }
@@ -1947,8 +1965,12 @@ export class Room extends DurableObject<Env> {
         }
 
         if (kind === 'rewind') {
-            return pts > 0
-                ? `${baseDetail} · +${ptsLabel} (Rewind X)`
+            if (pts > 0) {
+                return `${baseDetail} · +${ptsLabel} (Rewind X)`
+            }
+            const alreadyScored = this.alreadyScoredRewindUsers(round.level, priorHistory).has(userId)
+            return alreadyScored
+                ? `${baseDetail} · 0 pts (Rewind already scored)`
                 : `${baseDetail} · 0 pts (Rewind no X)`
         }
 
@@ -1973,10 +1995,7 @@ export class Room extends DurableObject<Env> {
                     : null
 
             const history = live ? [...state.history, live] : state.history
-
-            const computeTotals = () => {
-                if (open) return totals(history, mode)
-
+            const allTotals = open ? totals(history, mode) : (() => {
                 const map = new Map<string, number>()
                 for (const member of state.members) {
                     map.set(member.id, 0)
@@ -1994,9 +2013,7 @@ export class Room extends DurableObject<Env> {
                 return [...map.entries()]
                     .map(([userId, score]) => ({ userId, score }))
                     .sort((a, b) => b.score - a.score)
-            }
-
-            const allTotals = computeTotals()
+            })()
 
             const output: {
                 title: string
