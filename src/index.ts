@@ -130,7 +130,7 @@ const chatCommentForm = {
             query: 'text',
             name: 'Comment',
             required: true,
-            type: 'textArea',
+            type: 'text',
             def: '',
             placeholder: 'Write a comment...',
             limit: 500,
@@ -159,7 +159,7 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
         time: latest?.time ?? 0,
         author: SERVER_TITLE,
         tags: [],
-        actions: [chatCommentForm],
+        actions: [],
     }
 }
 
@@ -176,15 +176,6 @@ function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
             author: `${m.author} (${m.handle})`,
             time: m.time,
             message: m.text,
-            actions: [
-                {
-                    type: 'deleteComment',
-                    title: 'Delete',
-                    icon: 'delete',
-                    requireConfirmation: true,
-                    options: [],
-                },
-            ],
         })),
     }
 }
@@ -466,7 +457,7 @@ const postCommentForm = {
             query: 'text',
             name: 'Comment',
             required: true,
-            type: 'textArea',
+            type: 'text',
             def: '',
             placeholder: 'Write a comment...',
             limit: 500,
@@ -479,7 +470,7 @@ function makeLikePostForm(liked: boolean) {
     return {
         type: 'likePost',
         title: liked ? 'Unlike' : 'Like',
-        icon: 'like',
+        icon: 'heart',
         requireConfirmation: false,
         options: [],
     }
@@ -488,7 +479,7 @@ function makeLikePostForm(liked: boolean) {
 function makePinPostForm(pinned: boolean) {
     return {
         type: 'pinPost',
-        title: pinned ? 'Unpin post' : 'Pin post',
+        title: pinned ? 'Unpin' : 'Pin',
         icon: 'pin',
         requireConfirmation: false,
         options: [],
@@ -497,7 +488,7 @@ function makePinPostForm(pinned: boolean) {
 
 const deletePostForm = {
     type: 'deletePost',
-    title: 'Delete post',
+    title: 'Delete',
     icon: 'delete',
     requireConfirmation: true,
     options: [],
@@ -507,7 +498,6 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
     const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
     const pinned = Boolean(post.pinned)
     const actions = [
-        postCommentForm,
         makeLikePostForm(liked),
         makePinPostForm(pinned),
     ]
@@ -531,15 +521,6 @@ function formatPostComments(post: StoredPost, page = 0) {
             author: `${c.author} (${c.handle})`,
             time: c.time,
             message: c.text,
-            actions: [
-                {
-                    type: 'deleteComment',
-                    title: 'Delete',
-                    icon: 'delete',
-                    requireConfirmation: true,
-                    options: [],
-                },
-            ],
         })),
     }
 }
@@ -1455,19 +1436,6 @@ export default {
                 return json({ shouldUpdateItem: true, shouldUpdatePosts: true })
             }
 
-            if (actionType === 'postComment') {
-                const text = (values.get('text') ?? '').trim()
-                if (!text) {
-                    return message(400, 'Comment cannot be empty.')
-                }
-                await lobby(env).addPostComment(postName, {
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
-                return json({ shouldUpdateItem: true, shouldUpdatePosts: true })
-            }
-
             if (!canManagePosts(session)) {
                 return message(403, 'Only handle 163292 can delete posts.')
             }
@@ -1607,7 +1575,7 @@ export default {
                 return json({
                     item: buildChatPostItem(messages, pinnedId),
                     description: extUrl ? `External chat:\n${extUrl}` : '',
-                    actions: [chatCommentForm],
+                    actions: [],
                     hasCommunity: true,
                     leaderboards: [],
                     sections: [],
