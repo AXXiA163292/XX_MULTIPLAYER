@@ -312,41 +312,6 @@ const POST_LABELS: Record<PostCategory, {
     },
 }
 
-function makePostSearches(defaultCategory: PostCategory) {
-    return [
-        {
-            type: 'search',
-            title: 'More',
-            icon: 'more',
-            requireConfirmation: false,
-            options: [
-                {
-                    query: 'category',
-                    name: 'Category',
-                    required: false,
-                    type: 'select',
-                    def: defaultCategory,
-                    values: [
-                        { name: 'announcements', title: 'Announcements' },
-                        { name: 'posts', title: 'Posts' },
-                        { name: 'results', title: 'Results' },
-                    ],
-                },
-                {
-                    query: 'keywords',
-                    name: 'Keywords',
-                    required: false,
-                    type: 'text',
-                    def: '',
-                    placeholder: 'Search title, body, or author...',
-                    limit: 100,
-                    shortcuts: [],
-                },
-            ],
-        },
-    ]
-}
-
 function parseCategoryString(raw: string | null | undefined): PostCategory | null {
     if (!raw) return null
     const clean = raw.trim().toLowerCase()
@@ -565,12 +530,20 @@ function extractCommentText(values: URLSearchParams): string {
     return ''
 }
 
-function externalChatUrl(req: Request, env: Env, url: URL): string {
-    const token = extractSessionToken(req, url)
-    const base = `${addressOf(req, env)}/chat`
-    if (!token) return base
-    return `${base}?session=${encodeURIComponent(token)}`
+function externalChatUrl(req: Request, env: Env): string {
+    return `${addressOf(req, env)}/chat`
 }
+
+const VALID_POST_CATEGORIES = new Set([
+    'announcements',
+    'announcement',
+    'posts',
+    'post',
+    'results',
+    'result',
+    'chat',
+    'staff-chat',
+])
 
 function rawPostCategory(url: URL): string | null {
     const searchParams = parseEncodedParams(url.searchParams.get('searchValues'))
@@ -586,8 +559,9 @@ function rawPostCategory(url: URL): string | null {
     ]
 
     for (const candidate of candidates) {
-        if (candidate && candidate.trim()) {
-            return String(candidate).trim().toLowerCase()
+        const clean = String(candidate ?? '').trim().toLowerCase()
+        if (clean && VALID_POST_CATEGORIES.has(clean)) {
+            return clean
         }
     }
 
@@ -703,7 +677,7 @@ function renderStaffChatHtml(
 <link rel="manifest" href="/manifest.webmanifest"/>
 <link rel="icon" type="image/png" href="/app-icon.png"/>
 <link rel="apple-touch-icon" href="/app-icon.png"/>
-<title>XX! • chat</title>
+<title>XX! Chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
@@ -714,6 +688,7 @@ function renderStaffChatHtml(
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
   .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}
   .btn-sm:hover{border-color:#3b82f6}
+  .btn-sm:disabled{opacity:.55;cursor:default}
   .btn-danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
   #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
   #picker.open{display:flex}
@@ -736,8 +711,8 @@ function renderStaffChatHtml(
   .row.me .msg{background:#1d2b45;border-color:#3b82f6}
   .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
   .meta-actions{display:flex;align-items:center;gap:6px}
-  .reply-btn,.react-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
-  .reply-btn:hover,.react-btn:hover{background:rgba(59,130,246,.18)}
+  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .reply-btn:hover{background:rgba(59,130,246,.18)}
   .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .del-btn:hover{background:rgba(248,113,113,.15)}
   .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -746,8 +721,6 @@ function renderStaffChatHtml(
   .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 7px;font-size:11px;color:#fda4af}
   .like-avatars{display:inline-flex;align-items:center;gap:3px}
   .like-pfp{width:14px;height:14px;aspect-ratio:1/1;border-radius:4px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
-  .reaction-pill{display:inline-flex;align-items:center;gap:4px;background:#232938;border:1px solid #374151;border-radius:999px;padding:2px 7px;font-size:11px;color:#f3f4f6;cursor:pointer}
-  .reaction-pill.active{border-color:#60a5fa;background:#1e3a5f}
   .reply-banner{display:none;align-items:center;justify-content:space-between;gap:8px;background:#1e293b;border:1px solid #3b82f6;border-radius:8px;padding:6px 10px;font-size:12px;color:#dbeafe}
   .reply-banner.open{display:flex}
   .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
@@ -758,14 +731,11 @@ function renderStaffChatHtml(
   input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
   input:focus{border-color:#3b82f6}
   button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:0 16px;font-weight:700;font-size:14px;cursor:pointer}
-  #settingsModal,#reactModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20}
-  #settingsModal.open,#reactModal.open{display:flex}
+  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20}
+  #settingsModal.open{display:flex}
   .modal-card{width:100%;max-width:400px;background:#151922;border:1px solid #283042;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px}
   .modal-title{font-size:16px;font-weight:700}
   .field-label{font-size:12px;color:#9ca3af;margin-bottom:4px;display:block}
-  .quick-emojis{display:flex;flex-wrap:wrap;gap:6px}
-  .emoji-opt{background:#232938;border:1px solid #374151;border-radius:8px;padding:6px 10px;font-size:16px;cursor:pointer}
-  .emoji-opt:hover{border-color:#3b82f6}
   .crop-box{position:relative;width:180px;height:180px;margin:6px auto;border-radius:12px;overflow:hidden;border:2px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
   .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
   .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap}
@@ -776,7 +746,7 @@ function renderStaffChatHtml(
   <header>
     <div class="header-brand">
       <img class="app-logo" src="/app-icon.png" alt="XX!"/>
-      <span>XX! • chat</span>
+      <span>XX! Chat</span>
       <button id="loadChatsBtn" type="button" class="btn-sm">Load chats</button>
     </div>
     <div class="header-right">
@@ -800,30 +770,6 @@ function renderStaffChatHtml(
         <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
         <button type="submit">Send</button>
       </form>
-    </div>
-  </div>
-  <div id="reactModal">
-    <div class="modal-card">
-      <div class="modal-title">Add Reaction</div>
-      <div class="quick-emojis">
-        <button type="button" class="emoji-opt" data-emoji="👍">👍</button>
-        <button type="button" class="emoji-opt" data-emoji="❤️">❤️</button>
-        <button type="button" class="emoji-opt" data-emoji="😂">😂</button>
-        <button type="button" class="emoji-opt" data-emoji="🔥">🔥</button>
-        <button type="button" class="emoji-opt" data-emoji="😭">😭</button>
-        <button type="button" class="emoji-opt" data-emoji="👀">👀</button>
-      </div>
-      <div>
-        <label class="field-label" for="customEmojiInput">Or type any emoji</label>
-        <input id="customEmojiInput" type="text" maxlength="16" placeholder="Any emoji..."/>
-      </div>
-      <div class="modal-actions">
-        <div></div>
-        <div class="modal-actions-right">
-          <button id="closeReactBtn" type="button" class="btn-sm">Cancel</button>
-          <button id="applyReactBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Apply</button>
-        </div>
-      </div>
     </div>
   </div>
   <div id="settingsModal">
@@ -877,11 +823,6 @@ function renderStaffChatHtml(
   const replyTextEl = document.getElementById('replyText');
   const cancelReplyBtn = document.getElementById('cancelReplyBtn');
 
-  const reactModal = document.getElementById('reactModal');
-  const customEmojiInput = document.getElementById('customEmojiInput');
-  const closeReactBtn = document.getElementById('closeReactBtn');
-  const applyReactBtn = document.getElementById('applyReactBtn');
-
   const settingsModal = document.getElementById('settingsModal');
   const displayNameInput = document.getElementById('displayNameInput');
   const pfpFileInput = document.getElementById('pfpFileInput');
@@ -890,8 +831,8 @@ function renderStaffChatHtml(
   const cropImg = document.getElementById('cropImg');
   const zoomRange = document.getElementById('zoomRange');
 
+  let loggedOut = false;
   let activeReply = null;
-  let reactingMsgId = null;
   let currentMessages = [];
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
 
@@ -946,6 +887,7 @@ function renderStaffChatHtml(
   }
 
   function getActiveUser() {
+    if (loggedOut) return null;
     if (sonolusUser && sonolusUser.handle) {
       return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
     }
@@ -962,7 +904,7 @@ function renderStaffChatHtml(
 
   function authHeaders(extra = {}) {
     const headers = { ...extra };
-    if (sessionToken) {
+    if (sessionToken && !loggedOut) {
       headers['Sonolus-Session'] = sessionToken;
     } else {
       const active = getActiveUser();
@@ -1065,27 +1007,17 @@ function renderStaffChatHtml(
         ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span> ' + likers.length + '</span>'
         : '';
 
-      const reactions = m.reactions && typeof m.reactions === 'object' ? m.reactions : {};
-      const reactionPills = Object.entries(reactions)
-        .filter(([, users]) => Array.isArray(users) && users.length > 0)
-        .map(([emoji, users]) => {
-          const isMine = myHandle && users.includes(myHandle);
-          return '<button type="button" class="reaction-pill ' + (isMine ? 'active' : '') + '" data-react-id="' + escapeHtml(m.id) + '" data-react-emoji="' + escapeAttr(emoji) + '">' +
-            escapeHtml(emoji) + ' <span>' + users.length + '</span></button>';
-        }).join('');
-
       return '<div class="row ' + mine + '" data-row-id="' + escapeHtml(m.id) + '">' +
         pfpImg +
         '<div class="msg" data-msg-id="' + escapeHtml(m.id) + '">' +
           '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
-            '<button type="button" class="react-btn" data-open-react="' + escapeHtml(m.id) + '">+</button>' +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
             delHtml +
           '</span></div>' +
           replyHtml +
           '<div class="text">' + escapeHtml(m.text) + '</div>' +
-          '<div class="msg-footer">' + likeBadgeHtml + reactionPills + '</div>' +
+          (likeBadgeHtml ? '<div class="msg-footer">' + likeBadgeHtml + '</div>' : '') +
         '</div>' +
       '</div>';
     }).join('');
@@ -1095,6 +1027,7 @@ function renderStaffChatHtml(
   async function loadMessages() {
     const active = getActiveUser();
     if (!active) return;
+    loadChatsBtn.disabled = true;
     try {
       const qs = 'handle=' + encodeURIComponent(active.handle) + '&t=' + Date.now();
       const res = await fetch('/api/chat?' + qs, {
@@ -1102,15 +1035,19 @@ function renderStaffChatHtml(
         credentials: 'same-origin',
         cache: 'no-store',
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.prefs) {
-          Object.assign(prefsMap, data.prefs);
-          renderKnownUserChips();
-        }
-        render(Array.isArray(data.messages) ? data.messages : []);
+      if (!res.ok) throw new Error(await res.text() || ('HTTP ' + res.status));
+      const data = await res.json();
+      if (data.prefs) {
+        Object.assign(prefsMap, data.prefs);
+        renderKnownUserChips();
       }
-    } catch {}
+      render(Array.isArray(data.messages) ? data.messages : []);
+    } catch (error) {
+      console.error('Could not load chat messages:', error);
+      box.innerHTML = '<div class="empty-state">Could not load messages. Try again.</div>';
+    } finally {
+      loadChatsBtn.disabled = false;
+    }
   }
 
   loadChatsBtn.addEventListener('click', () => {
@@ -1136,7 +1073,10 @@ function renderStaffChatHtml(
   }
 
   logoutBtn.addEventListener('click', () => {
+    loggedOut = true;
     persistHandle('');
+    currentMessages = [];
+    render([]);
     setReplyTarget(null);
     settingsModal.classList.remove('open');
     syncMode();
@@ -1156,52 +1096,6 @@ function renderStaffChatHtml(
       render(data.messages || []);
     }
   }
-
-  async function toggleReaction(id, emoji) {
-    const active = getActiveUser();
-    const cleanEmoji = String(emoji || '').trim().slice(0, 16);
-    if (!active || !id || !cleanEmoji) return;
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      credentials: 'same-origin',
-      body: JSON.stringify({ action: 'react', id, emoji: cleanEmoji, handle: active.handle }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      render(data.messages || []);
-    }
-  }
-
-  function openReactionPicker(id) {
-    reactingMsgId = id;
-    customEmojiInput.value = '';
-    reactModal.classList.add('open');
-    customEmojiInput.focus();
-  }
-
-  document.querySelectorAll('.emoji-opt[data-emoji]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const emoji = btn.getAttribute('data-emoji') || '';
-      const id = reactingMsgId;
-      reactModal.classList.remove('open');
-      reactingMsgId = null;
-      if (id && emoji) await toggleReaction(id, emoji);
-    });
-  });
-
-  closeReactBtn.addEventListener('click', () => {
-    reactModal.classList.remove('open');
-    reactingMsgId = null;
-  });
-
-  applyReactBtn.addEventListener('click', async () => {
-    const emoji = customEmojiInput.value.trim();
-    const id = reactingMsgId;
-    reactModal.classList.remove('open');
-    reactingMsgId = null;
-    if (id && emoji) await toggleReaction(id, emoji);
-  });
 
   function updateCropTransform() {
     if (!cropState.loaded) return;
@@ -1329,6 +1223,7 @@ function renderStaffChatHtml(
     card.addEventListener('click', () => {
       const picked = card.getAttribute('data-pick-handle') || '';
       if (!defaultsMap[picked]) return;
+      loggedOut = false;
       persistHandle(picked);
       syncMode();
     });
@@ -1378,21 +1273,6 @@ function renderStaffChatHtml(
   });
 
   box.addEventListener('click', async (e) => {
-    const reactPill = e.target.closest('[data-react-id]');
-    if (reactPill) {
-      const id = reactPill.getAttribute('data-react-id') || '';
-      const emoji = reactPill.getAttribute('data-react-emoji') || '';
-      if (id && emoji) await toggleReaction(id, emoji);
-      return;
-    }
-
-    const openReact = e.target.closest('[data-open-react]');
-    if (openReact) {
-      const id = openReact.getAttribute('data-open-react') || '';
-      if (id) openReactionPicker(id);
-      return;
-    }
-
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
       const id = replyBtn.getAttribute('data-reply-id');
@@ -1804,134 +1684,6 @@ async function proxyToUnch(
     }
 }
 
-const LEVEL_SEARCHES = [
-    {
-        type: 'advanced',
-        title: '#ADVANCED',
-        icon: 'advanced',
-        requireConfirmation: false,
-        options: [
-            {
-                query: 'keywords',
-                name: '#KEYWORDS',
-                required: false,
-                type: 'text',
-                def: '',
-                placeholder: '#KEYWORDS',
-                limit: 0,
-                shortcuts: [],
-            },
-            {
-                query: 'minRating',
-                name: 'Min level',
-                required: false,
-                type: 'slider',
-                def: 0,
-                min: 0,
-                max: 40,
-                step: 1,
-            },
-            {
-                query: 'maxRating',
-                name: 'Max level',
-                required: false,
-                type: 'slider',
-                def: 40,
-                min: 0,
-                max: 40,
-                step: 1,
-            },
-            {
-                query: 'sort',
-                name: 'Sort by',
-                required: false,
-                type: 'select',
-                def: 'newest',
-                values: [
-                    { name: 'newest', title: 'Newest' },
-                    { name: 'ratingDesc', title: 'Level (high to low)' },
-                    { name: 'ratingAsc', title: 'Level (low to high)' },
-                    { name: 'title', title: 'Title' },
-                ],
-            },
-        ],
-    },
-]
-
-let levelIndex: { at: number; entries: { chart: SheetChart; item: RemoteLevelItem }[] } | null = null
-
-async function allLevelEntries(env: Env) {
-    if (levelIndex && Date.now() - levelIndex.at < 15 * 60_000) return levelIndex.entries
-
-    const entries = await loadLevelItems(await getCustomLevels(env))
-    levelIndex = { at: Date.now(), entries }
-    return entries
-}
-
-function hasLevelFilters(url: URL) {
-    const keywords = (url.searchParams.get('keywords') ?? '').trim()
-    const min = Number(url.searchParams.get('minRating') ?? '0')
-    const max = Number(url.searchParams.get('maxRating') ?? '40')
-    const sort = url.searchParams.get('sort') ?? 'newest'
-
-    return !!keywords || min > 0 || (Number.isFinite(max) && max < 40) || sort !== 'newest'
-}
-
-function sortLevelEntries(
-    entries: { chart: SheetChart; item: RemoteLevelItem }[],
-    sort: string,
-) {
-    if (sort === 'ratingDesc') {
-        return [...entries].sort((a, b) => Number(b.item.rating) - Number(a.item.rating))
-    }
-    if (sort === 'ratingAsc') {
-        return [...entries].sort((a, b) => Number(a.item.rating) - Number(b.item.rating))
-    }
-    if (sort === 'title') {
-        return [...entries].sort((a, b) =>
-            localizedTitle(a.item.title).localeCompare(localizedTitle(b.item.title)))
-    }
-    return entries
-}
-
-async function searchLevels(url: URL, page: number, env: Env) {
-    const keywords = (url.searchParams.get('keywords') ?? '').trim().toLowerCase()
-    const min = Number(url.searchParams.get('minRating') ?? '0')
-    const max = Number(url.searchParams.get('maxRating') ?? '40')
-    const sort = url.searchParams.get('sort') ?? 'newest'
-
-    const haystack = (item: RemoteLevelItem) =>
-        [
-            localizedTitle(item.title),
-            localizedTitle(item.artists),
-            localizedTitle(item.author),
-            String(item.name ?? ''),
-        ].join(' ').toLowerCase()
-
-    const filtered = (await allLevelEntries(env)).filter(({ item }) => {
-        const rating = Number(item.rating)
-
-        if (Number.isFinite(rating)) {
-            if (Number.isFinite(min) && rating < min) return false
-            if (Number.isFinite(max) && rating > max) return false
-        }
-
-        return keywords
-            .split(/\s+/)
-            .filter(Boolean)
-            .every((word) => haystack(item).includes(word))
-    })
-
-    const sorted = sortLevelEntries(filtered, sort)
-    const pageCount = Math.max(1, Math.ceil(sorted.length / 10))
-    const start = page * 10
-
-    return {
-        pageCount,
-        items: page >= pageCount ? [] : sorted.slice(start, start + 10).map((entry) => entry.item),
-    }
-}
-
 export default {
     async scheduled(
         _event: ScheduledEvent,
@@ -2057,7 +1809,6 @@ self.addEventListener('fetch', (event) => {
 
             const summary = await refreshDailyAssets(env)
             await lobby(env).syncAllToR2().catch(() => {})
-            levelIndex = null
             return json({
                 ok: summary.errors.length === 0,
                 ...summary,
@@ -2198,15 +1949,6 @@ self.addEventListener('fetch', (event) => {
                     const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
                     if (!targetId) return message(400, 'Missing message id.')
                     await lobby(env).toggleChatLike(targetId, resolved.user.handle)
-                    const updated = await lobby(env).listChatMessages().catch(() => [])
-                    return json({ ok: true, messages: updated, prefs: prefsMap })
-                }
-
-                if (body?.action === 'react') {
-                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
-                    const emoji = typeof body?.emoji === 'string' ? body.emoji.trim().slice(0, 16) : ''
-                    if (!targetId || !emoji) return message(400, 'Missing message id or emoji.')
-                    await lobby(env).toggleChatReaction(targetId, resolved.user.handle, emoji)
                     const updated = await lobby(env).listChatMessages().catch(() => [])
                     return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
@@ -2401,6 +2143,7 @@ self.addEventListener('fetch', (event) => {
                             title: 'Chat',
                             itemType: 'post',
                             items: [buildChatPostItem(messages, pinnedId)],
+                            searchValues: new URLSearchParams({ category: 'chat' }).toString(),
                         },
                     ],
                 })
@@ -2422,18 +2165,17 @@ self.addEventListener('fetch', (event) => {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         items: posts.map(buildPostItemWithBadges),
+                        searchValues: new URLSearchParams({ category: kind }).toString(),
                     }
                 }),
             )
-
-            const activeCategory: PostCategory = explicit ?? 'posts'
 
             return json({
                 title: explicit ? POST_LABELS[explicit].section : 'Posts',
                 creates: canManagePosts(session) && explicit
                     ? [postForm(explicit)]
                     : [],
-                searches: makePostSearches(activeCategory),
+                searches: [],
                 sections,
             })
         }
@@ -2491,7 +2233,7 @@ self.addEventListener('fetch', (event) => {
                 title: POST_LABELS[kind].section,
                 pageCount,
                 items: slice.map(buildPostItemWithBadges),
-                searches: makePostSearches(kind),
+                searches: [],
             })
         }
 
@@ -2965,7 +2707,7 @@ self.addEventListener('fetch', (event) => {
                     lobby(env).listChatMessages().catch(() => []),
                     lobby(env).getPinnedChatId().catch(() => null),
                 ])
-                const extUrl = externalChatUrl(req, env, url)
+                const extUrl = externalChatUrl(req, env)
 
                 return json({
                     item: buildChatPostItem(messages, pinnedId),
@@ -3001,7 +2743,7 @@ self.addEventListener('fetch', (event) => {
 
                 return json({
                     creates: [],
-                    searches: LEVEL_SEARCHES,
+                    searches: [],
                     sections: [
                         {
                             title: 'Custom Levels',
@@ -3023,23 +2765,13 @@ self.addEventListener('fetch', (event) => {
                     ? requestedPage
                     : 0
 
-                if (hasLevelFilters(url)) {
-                    const found = await searchLevels(url, page, env)
-
-                    return json({
-                        pageCount: found.pageCount,
-                        items: found.items,
-                        searches: LEVEL_SEARCHES,
-                    })
-                }
-
                 const { charts, pageCount } = await getCustomLevelPage(page, env)
 
                 if (page >= pageCount) {
                     return json({
                         pageCount,
                         items: [],
-                        searches: LEVEL_SEARCHES,
+                        searches: [],
                     })
                 }
 
@@ -3048,7 +2780,7 @@ self.addEventListener('fetch', (event) => {
                 return json({
                     pageCount,
                     items: loaded.map((entry) => entry.item),
-                    searches: LEVEL_SEARCHES,
+                    searches: [],
                 })
             } catch (error) {
                 console.error('Could not read custom levels sheet:', error)
