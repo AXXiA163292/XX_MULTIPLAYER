@@ -97,7 +97,7 @@ export const DEFAULT_SCORING: ScoringMode = 'pp'
 export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 
 export const SERVER_TITLE = 'XX!'
-export const SERVER_DESCRIPTION = "AXX!A's server!\n\nhttps://discord.gg/xxsrG9G6f"
+export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\n\nAXX!A's server!"
 
 /** Maximum room lifespan is 3 minutes. */
 export const MAX_ROOM_LIFESPAN_MS = 3 * 60 * 1000
