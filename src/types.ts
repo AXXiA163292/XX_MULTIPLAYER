@@ -60,4 +60,5 @@ export interface Env {
     DEV_SKIP_SIGNATURE?: string
     RESEND_API_KEY?: string
     CHAT_EMAIL_FROM?: string
+    CHAT_WEBHOOK_SECRET?: string
 }
