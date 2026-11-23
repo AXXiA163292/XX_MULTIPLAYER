@@ -552,30 +552,84 @@ export const RANKED_TIERS = {
 
 export type RankedTier = keyof typeof RANKED_TIERS
 
+/** Only inspect HR, EX, MS, and AP columns — never EZ or NM. */
 const OFFICIAL_DIFFS = ['hr', 'ex', 'ms', 'ap'] as const
+type OfficialDiff = typeof OFFICIAL_DIFFS[number]
+
+const OFFICIAL_DIFF_ALIASES: Record<OfficialDiff, readonly string[]> = {
+    hr: ['hr', 'hard'],
+    ex: ['ex', 'expert'],
+    ms: ['ms', 'master'],
+    ap: ['ap', 'append'],
+}
 
 function inRange(level: number, range: readonly [number, number] | null): boolean {
     return !!range && level >= Math.max(18, range[0]) && level <= Math.min(39, range[1])
+}
+
+function resolveOfficialColumns(headers: string[]): Record<OfficialDiff, { levelCol: number; linkCol: number }> {
+    const resolved = {} as Record<OfficialDiff, { levelCol: number; linkCol: number }>
+
+    for (const diff of OFFICIAL_DIFFS) {
+        const aliases = OFFICIAL_DIFF_ALIASES[diff]
+
+        const levelCol = headers.findIndex((h) =>
+            aliases.some((alias) =>
+                h === `${alias}playlevel` ||
+                h === `${alias}_playlevel` ||
+                h === `${alias}level` ||
+                h === `${alias}_level` ||
+                h === `${alias}lvl` ||
+                h === `${alias}_lvl`,
+            ),
+        )
+
+        const linkCol = headers.findIndex((h) =>
+            aliases.some((alias) =>
+                h === alias ||
+                h === `${alias}levellinksbuga` ||
+                h === `${alias}_levellinksbuga` ||
+                h === `${alias}link` ||
+                h === `${alias}_link` ||
+                h === `${alias}url` ||
+                h === `${alias}_url`,
+            ),
+        )
+
+        resolved[diff] = { levelCol, linkCol }
+    }
+
+    return resolved
 }
 
 function officialRankedPoolFromSheet(
     values: string[][],
     tier: RankedTier,
 ): SheetChart[] {
-    const headerIndex = values.findIndex((row) =>
-        row.some((cell) => normalizeId(cell).toLowerCase() === 'hrlevellinksbuga'),
-    )
+    const headerIndex = values.findIndex((row) => {
+        const lower = row.map((cell) => normalizeId(cell).toLowerCase())
+        return (
+            lower.includes('hrlevellinksbuga') ||
+            lower.includes('hr') ||
+            lower.includes('hrplaylevel')
+        )
+    })
     if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
 
     const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const idCol = headers.indexOf('id')
+    const cols = resolveOfficialColumns(headers)
     const rules = RANKED_TIERS[tier]
     const pool: SheetChart[] = []
 
-    for (const cells of values.slice(headerIndex + 1)) {
+    for (let rowIdx = headerIndex + 1; rowIdx < values.length; rowIdx++) {
+        const cells = values[rowIdx]!
+        const rowId = idCol >= 0 && normalizeId(cells[idCol])
+            ? normalizeId(cells[idCol])
+            : String(rowIdx)
+
         for (const diff of OFFICIAL_DIFFS) {
-            const levelCol = headers.indexOf(`${diff}playlevel`)
-            const linkCol = headers.indexOf(`${diff}levellinksbuga`)
+            const { levelCol, linkCol } = cols[diff]
             if (levelCol < 0 || linkCol < 0) continue
 
             const level = Number(normalizeId(cells[levelCol]))
@@ -587,7 +641,7 @@ function officialRankedPoolFromSheet(
                 : inRange(level, rules.main)
             if (!fits) continue
 
-            const chart = chartFromUrl(`${normalizeId(cells[idCol])}-${diff}`, link)
+            const chart = chartFromUrl(`${rowId}-${diff}`, link)
             if (chart) pool.push(chart)
         }
     }
@@ -596,12 +650,16 @@ function officialRankedPoolFromSheet(
 }
 
 function buildAllCustomRanked(rows: Row[]): RankedCustomChart[] {
+    const ALLOWED_CUSTOM_DIFFS = new Set(['hr', 'hard', 'ex', 'expert', 'ms', 'master', 'ap', 'append'])
     const pool: RankedCustomChart[] = []
 
     for (const row of rows) {
         if (!isCustomLevelId(row.id)) continue
         if (row.ranked.toLowerCase() !== 'true') continue
         if (!isPublicLevel(row)) continue
+
+        const diffLower = row.difficulty.trim().toLowerCase()
+        if (diffLower && !ALLOWED_CUSTOM_DIFFS.has(diffLower)) continue
 
         const playLevel = Number(row.playLevel)
         if (!Number.isFinite(playLevel) || playLevel < 18 || playLevel > 39) continue
@@ -612,7 +670,7 @@ function buildAllCustomRanked(rows: Row[]): RankedCustomChart[] {
         pool.push({
             ...chart,
             playLevel,
-            isAppend: row.difficulty.toLowerCase() === 'append',
+            isAppend: diffLower === 'append' || diffLower === 'ap',
         })
     }
 
