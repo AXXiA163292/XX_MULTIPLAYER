@@ -167,10 +167,18 @@ const isChatCategory = (url: URL) => {
 const isChatItemName = (name: string) =>
     name === 'chat' || name === 'staff-chat'
 
+function escapeAttr(str: string): string {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+}
+
 function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
         (tag) =>
-            `<button type="button" class="chip" onclick="insertShortcut(${JSON.stringify(tag)})">${tag}</button>`,
+            `<button type="button" class="chip" data-shortcut="${escapeAttr(tag)}">${escapeAttr(tag)}</button>`,
     ).join('')
 
     return `<!doctype html>
@@ -178,7 +186,7 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<title>${SERVER_TITLE} · #chat</title>
+<title>${escapeAttr(SERVER_TITLE)} · chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
@@ -201,8 +209,8 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
 </head>
 <body>
   <header>
-    <span>💬 ${SERVER_TITLE} #chat</span>
-    <span class="badge">${user.name || user.handle} (${user.handle})</span>
+    <span>${escapeAttr(SERVER_TITLE)} chat</span>
+    <span class="badge">${escapeAttr(user.name || user.handle)} (${escapeAttr(user.handle)})</span>
   </header>
   <div id="messages"></div>
   <div class="bottom-bar">
@@ -230,6 +238,13 @@ function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     input.value = current + spacer + tag + ' ';
     input.focus();
   }
+
+  document.querySelectorAll('.chip[data-shortcut]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const tag = btn.getAttribute('data-shortcut') || '';
+      if (tag) insertShortcut(tag);
+    });
+  });
 
   function escapeHtml(str) {
     return String(str).replace(/[<>&"]/g, (ch) => ({
@@ -1081,13 +1096,13 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
-                if (actionType !== 'chatComment') {
-                    return message(400, 'Unknown chat action.')
-                }
-
                 const text = (values.get('text') ?? '').trim()
                 if (!text) {
                     return message(400, 'Message cannot be empty.')
+                }
+
+                if (actionType && actionType !== 'chatComment') {
+                    return message(400, 'Unknown chat action.')
                 }
 
                 await lobby(env).addChatMessage({
@@ -1096,7 +1111,7 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                return json({ shouldUpdatePosts: true })
+                return json({})
             }
 
             if (!canManagePosts(session)) {
