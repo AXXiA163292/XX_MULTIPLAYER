@@ -41,10 +41,23 @@ export type StoredPost = {
     pinned?: boolean
 }
 
+export type ChatReplyRef = {
+    id: string
+    author: string
+    handle: string
+    text: string
+}
+
+export type StoredChatMessage = ChatMessage & {
+    replyTo?: ChatReplyRef
+    likes?: string[]
+    reactions?: Record<string, string[]>
+}
+
 type LobbyState = {
     rooms: Record<string, LobbyRoom>
     posts: Record<string, StoredPost>
-    chat: ChatMessage[]
+    chat: StoredChatMessage[]
     pinnedChatId: string | null
 }
 
@@ -107,6 +120,30 @@ function normalizePost(post: StoredPost): StoredPost {
     }
 }
 
+function normalizeChatMessage(msg: StoredChatMessage): StoredChatMessage {
+    const likes = Array.isArray(msg.likes)
+        ? [...new Set(msg.likes.map((h) => String(h).trim()).filter(Boolean))]
+        : []
+
+    const rawReactions =
+        msg.reactions && typeof msg.reactions === 'object' ? msg.reactions : {}
+    const reactions: Record<string, string[]> = {}
+    for (const [emoji, handles] of Object.entries(rawReactions)) {
+        const cleanEmoji = String(emoji).trim()
+        if (!cleanEmoji || !Array.isArray(handles)) continue
+        const deduped = [...new Set(handles.map((h) => String(h).trim()).filter(Boolean))]
+        if (deduped.length > 0) {
+            reactions[cleanEmoji] = deduped
+        }
+    }
+
+    return {
+        ...msg,
+        likes,
+        reactions,
+    }
+}
+
 export class Lobby extends DurableObject<Env> {
     st: LobbyState = freshLobby()
 
@@ -137,7 +174,7 @@ export class Lobby extends DurableObject<Env> {
                         : {},
                 posts,
                 chat: Array.isArray(saved?.chat)
-                    ? saved.chat.slice(-200)
+                    ? saved.chat.slice(-200).map((m) => normalizeChatMessage(m as StoredChatMessage))
                     : [],
                 pinnedChatId:
                     typeof saved?.pinnedChatId === 'string'
@@ -157,11 +194,13 @@ export class Lobby extends DurableObject<Env> {
             const obj = await bucket.get(CHAT_INDEX_KEY).catch(() => null)
             if (obj) {
                 const parsed = (await obj.json().catch(() => null)) as {
-                    messages?: ChatMessage[]
+                    messages?: StoredChatMessage[]
                     pinnedChatId?: string | null
                 } | null
                 if (parsed && Array.isArray(parsed.messages)) {
-                    this.st.chat = parsed.messages.slice(-200)
+                    this.st.chat = parsed.messages
+                        .slice(-200)
+                        .map((m) => normalizeChatMessage(m))
                     if (typeof parsed.pinnedChatId === 'string') {
                         this.st.pinnedChatId = parsed.pinnedChatId
                     }
@@ -339,7 +378,7 @@ export class Lobby extends DurableObject<Env> {
         return normalized
     }
 
-    async listChatMessages(): Promise<ChatMessage[]> {
+    async listChatMessages(): Promise<StoredChatMessage[]> {
         return this.st.chat
     }
 
@@ -368,8 +407,9 @@ export class Lobby extends DurableObject<Env> {
         handle: string
         author: string
         text: string
-    }): Promise<ChatMessage> {
-        const message: ChatMessage = {
+        replyTo?: ChatReplyRef
+    }): Promise<StoredChatMessage> {
+        const message: StoredChatMessage = normalizeChatMessage({
             id: `${Date.now().toString(36)}-${Math.random()
                 .toString(36)
                 .slice(2, 7)}`,
@@ -377,13 +417,70 @@ export class Lobby extends DurableObject<Env> {
             author: input.author || input.handle,
             text: input.text,
             time: Date.now(),
-        }
+            ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+            likes: [],
+            reactions: {},
+        })
 
         this.st.chat = [...this.st.chat.slice(-199), message]
         await Promise.all([this.persist(), this.syncChatToR2()])
 
         this.ctx.waitUntil(this.sendEmailAlert(message))
         return message
+    }
+
+    async toggleChatLike(id: string, handle: string): Promise<StoredChatMessage | null> {
+        const cleanHandle = String(handle ?? '').trim()
+        if (!cleanHandle) return null
+
+        let updated: StoredChatMessage | null = null
+        this.st.chat = this.st.chat.map((msg) => {
+            if (msg.id !== id) return msg
+            const normalized = normalizeChatMessage(msg)
+            const set = new Set(normalized.likes ?? [])
+            if (set.has(cleanHandle)) set.delete(cleanHandle)
+            else set.add(cleanHandle)
+            updated = normalizeChatMessage({
+                ...normalized,
+                likes: [...set],
+            })
+            return updated
+        })
+
+        if (!updated) return null
+        await Promise.all([this.persist(), this.syncChatToR2()])
+        return updated
+    }
+
+    async toggleChatReaction(
+        id: string,
+        handle: string,
+        emoji: string,
+    ): Promise<StoredChatMessage | null> {
+        const cleanHandle = String(handle ?? '').trim()
+        const cleanEmoji = String(emoji ?? '').trim().slice(0, 16)
+        if (!cleanHandle || !cleanEmoji) return null
+
+        let updated: StoredChatMessage | null = null
+        this.st.chat = this.st.chat.map((msg) => {
+            if (msg.id !== id) return msg
+            const normalized = normalizeChatMessage(msg)
+            const reactions: Record<string, string[]> = { ...(normalized.reactions ?? {}) }
+            const set = new Set(reactions[cleanEmoji] ?? [])
+            if (set.has(cleanHandle)) set.delete(cleanHandle)
+            else set.add(cleanHandle)
+            if (set.size === 0) delete reactions[cleanEmoji]
+            else reactions[cleanEmoji] = [...set]
+            updated = normalizeChatMessage({
+                ...normalized,
+                reactions,
+            })
+            return updated
+        })
+
+        if (!updated) return null
+        await Promise.all([this.persist(), this.syncChatToR2()])
+        return updated
     }
 
     async deleteChatMessage(id?: string): Promise<boolean> {
@@ -431,7 +528,7 @@ export class Lobby extends DurableObject<Env> {
                     body: JSON.stringify({
                         from,
                         to: [STAFF_CHAT_ALERT_EMAIL],
-                        subject: `New ${msg.author} (${msg.handle}) message in XX! Chat`,
+                        subject: `New ${msg.author} (${msg.handle}) message in XX!`,
                         text: `${msg.author} (${msg.handle}):\n${msg.text}`,
                     }),
                     signal: AbortSignal.timeout(8000),
