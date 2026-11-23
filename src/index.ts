@@ -120,6 +120,14 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
+function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
+    return [...posts].sort((a, b) => {
+        const pinDiff = (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
+        if (pinDiff !== 0) return pinDiff
+        return Number(b.item?.time ?? 0) - Number(a.item?.time ?? 0)
+    })
+}
+
 const chatCommentForm = {
     type: 'chatComment',
     title: 'Comment',
@@ -1177,6 +1185,7 @@ export default {
                         {
                             title: 'Chat',
                             itemType: 'post',
+                            hasMore: false,
                             items: [buildChatPostItem(messages, pinnedId)],
                         },
                     ],
@@ -1188,11 +1197,15 @@ export default {
                 : ['announcements', 'posts', 'results']
 
             const sections = await Promise.all(
-                kinds.map(async (kind) => ({
-                    title: POST_LABELS[kind].section,
-                    itemType: 'post',
-                    items: (await lobby(env).listPosts(kind)).map((post) => post.item),
-                })),
+                kinds.map(async (kind) => {
+                    const sorted = sortPostsPinnedFirst(await lobby(env).listPosts(kind))
+                    return {
+                        title: POST_LABELS[kind].section,
+                        itemType: 'post',
+                        hasMore: true,
+                        items: sorted.map((post) => post.item),
+                    }
+                }),
             )
 
             return json({
@@ -1224,11 +1237,11 @@ export default {
                 })
             }
 
-            const posts = await lobby(env).listPosts(postCategory(url))
+            const sorted = sortPostsPinnedFirst(await lobby(env).listPosts(postCategory(url)))
 
             return json({
                 pageCount: 1,
-                items: posts.map((post) => post.item),
+                items: sorted.map((post) => post.item),
                 searches: [],
             })
         }
@@ -1505,7 +1518,11 @@ export default {
                     text: text.slice(0, 500),
                 })
 
-                return json({ shouldUpdatePosts: true })
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateItem: true,
+                })
             }
 
             const post = await lobby(env).getPost(postName)
@@ -1513,17 +1530,27 @@ export default {
 
             if (actionType === 'likePost') {
                 await lobby(env).togglePostLike(postName, session.user.handle)
-                return json({ shouldUpdateItem: true, shouldUpdatePosts: true })
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateItem: true,
+                })
             }
 
             if (actionType === 'pinPost') {
                 await lobby(env).togglePostPin(postName)
-                return json({ shouldUpdateItem: true, shouldUpdatePosts: true })
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateItem: true,
+                })
             }
 
             if (actionType === 'sharePost') {
                 const shareUrl = `${addressOf(req, env)}/sonolus/posts/${encodeURIComponent(postName)}`
                 return json({
+                    key: '',
+                    hashes: [],
                     message: shareUrl,
                     shouldUpdateItem: true,
                 })
@@ -1540,7 +1567,11 @@ export default {
             await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
             await lobby(env).removePost(postName)
 
-            return json({ shouldRemoveItem: true })
+            return json({
+                key: '',
+                hashes: [],
+                shouldRemoveItem: true,
+            })
         }
 
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
