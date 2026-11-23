@@ -15,17 +15,10 @@ import {
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
 import type { AuthSession, ChatMessage, Env, JoinSession, UserProfile } from './types.ts'
-import type { PostComment, StoredPost } from './lobby.ts'
+import type { PostCategory, PostComment, StoredPost } from './lobby.ts'
 
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
-
-type EnvWithCommunity = Env & {
-    COMMUNITY_BUCKET?: R2Bucket
-}
-
-const communityBucket = (env: Env) =>
-    (env as EnvWithCommunity).COMMUNITY_BUCKET ?? env.POSTS_BUCKET
 
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
@@ -127,9 +120,7 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-type PostKind = 'announcements' | 'posts' | 'results'
-
-const POST_LABELS: Record<PostKind, {
+const POST_LABELS: Record<PostCategory, {
     section: string
     create: string
     titlePlaceholder: string
@@ -153,6 +144,67 @@ const POST_LABELS: Record<PostKind, {
         titlePlaceholder: 'Result title',
         bodyPlaceholder: 'Write the results...',
     },
+}
+
+function parseCategoryString(raw: string | null | undefined): PostCategory | null {
+    if (!raw) return null
+    const clean = raw.trim().toLowerCase()
+    if (clean === 'announcements' || clean === 'announcement') return 'announcements'
+    if (clean === 'results' || clean === 'result') return 'results'
+    if (clean === 'posts' || clean === 'post') return 'posts'
+    return null
+}
+
+function resolveCategoryFromUrlAndHeaders(
+    url: URL,
+    req?: Request,
+    body?: any,
+    values?: URLSearchParams,
+): PostCategory | null {
+    const fromParams =
+        url.searchParams.get('type') ??
+        url.searchParams.get('infoType') ??
+        url.searchParams.get('category') ??
+        url.searchParams.get('postType')
+    const p1 = parseCategoryString(fromParams)
+    if (p1) return p1
+
+    const fromBody =
+        body?.type ??
+        body?.infoType ??
+        body?.category ??
+        body?.postType ??
+        values?.get('type') ??
+        values?.get('infoType') ??
+        values?.get('category')
+    const p2 = parseCategoryString(fromBody)
+    if (p2) return p2
+
+    const referer = req?.headers.get('Referer')
+    if (referer) {
+        try {
+            const refUrl = new URL(referer)
+            const fromRef =
+                refUrl.searchParams.get('type') ??
+                refUrl.searchParams.get('infoType') ??
+                refUrl.searchParams.get('category') ??
+                refUrl.searchParams.get('postType')
+            const p3 = parseCategoryString(fromRef)
+            if (p3) return p3
+        } catch {
+            // ignore invalid referer
+        }
+    }
+
+    return null
+}
+
+function hasExplicitCategory(url: URL, req?: Request): boolean {
+    return resolveCategoryFromUrlAndHeaders(url, req) !== null
+}
+
+function postCategory(url: URL, req?: Request, body?: any, values?: URLSearchParams): PostCategory {
+    return resolveCategoryFromUrlAndHeaders(url, req, body, values) ?? 'posts'
 }
 
 function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
@@ -182,88 +234,16 @@ function buildPostItemWithBadges(post: StoredPost) {
     }
 }
 
-function rawPostCategory(url: URL): string | null {
-    const val =
-        url.searchParams.get('type') ??
-        url.searchParams.get('infoType') ??
-        url.searchParams.get('category') ??
-        url.searchParams.get('postType')
-    return val ? val.trim().toLowerCase() : null
-}
-
-const isChatCategory = (url: URL) => {
-    const raw = rawPostCategory(url)
-    return raw === 'chat' || raw === 'staff-chat'
-}
-
-const isChatItemName = (name: string) =>
-    name === 'chat' || name === 'staff-chat'
-
-function postCategory(url: URL): PostKind {
-    const type = rawPostCategory(url)
-    if (type === 'announcements' || type === 'announcement') return 'announcements'
-    if (type === 'results' || type === 'result') return 'results'
-    return 'posts'
-}
-
-const hasPostCategory = (url: URL) =>
-    ['type', 'infoType', 'category', 'postType'].some((key) => url.searchParams.has(key))
-
-async function getPostsByKind(env: Env, kind: PostKind): Promise<StoredPost[]> {
-    const fromLobby = await lobby(env).listPosts(kind).catch(() => [])
-    if (fromLobby.length > 0) {
-        return sortPostsPinnedFirst(fromLobby.filter((p) => p.category === kind))
-    }
-
-    const bucket = communityBucket(env)
-    if (bucket) {
-        try {
-            const obj = await bucket.get(`${kind}/index.json`)
-            if (obj) {
-                const parsed = (await obj.json()) as StoredPost[]
-                if (Array.isArray(parsed)) {
-                    return sortPostsPinnedFirst(
-                        parsed.filter((p) => (p.category ?? kind) === kind),
-                    )
-                }
-            }
-        } catch {
-            // ignore
-        }
-    }
-    return []
-}
-
-async function getPostByName(env: Env, name: string): Promise<StoredPost | null> {
-    const fromLobby = await lobby(env).getPost(name).catch(() => null)
-    if (fromLobby) return fromLobby
-
-    const bucket = communityBucket(env)
-    if (bucket) {
-        for (const cat of ['announcements', 'posts', 'results'] as const) {
-            try {
-                const obj = await bucket.get(`${cat}/${name}/post.json`)
-                if (obj) {
-                    const parsed = (await obj.json()) as StoredPost
-                    return { ...parsed, category: parsed.category ?? cat }
-                }
-            } catch {
-                // ignore
-            }
-        }
-    }
-    return null
-}
-
 const chatCommentForm = {
+    name: 'Comment',
     type: 'chatComment',
     title: 'Comment',
     icon: 'comment',
     requireConfirmation: false,
     options: [
         {
-            query: 'text',
             name: 'Comment',
+            query: 'text',
             required: true,
             type: 'text',
             def: '',
@@ -314,11 +294,43 @@ function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
     }
 }
 
+function extractCommentText(values: URLSearchParams): string {
+    const direct =
+        values.get('text') ??
+        values.get('Comment') ??
+        values.get('comment') ??
+        values.get('message') ??
+        ''
+    if (direct.trim()) return direct.trim()
+
+    for (const [key, val] of values.entries()) {
+        if (key !== 'type' && val.trim()) return val.trim()
+    }
+    return ''
+}
+
 function externalChatUrl(req: Request, env: Env, url: URL): string | null {
     const token = extractSessionToken(req, url)
     if (!token) return null
     return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
 }
+
+function rawPostCategory(url: URL): string | null {
+    const val =
+        url.searchParams.get('type') ??
+        url.searchParams.get('infoType') ??
+        url.searchParams.get('category') ??
+        url.searchParams.get('postType')
+    return val ? val.trim().toLowerCase() : null
+}
+
+const isChatCategory = (url: URL) => {
+    const raw = rawPostCategory(url)
+    return raw === 'chat' || raw === 'staff-chat'
+}
+
+const isChatItemName = (name: string) =>
+    name === 'chat' || name === 'staff-chat'
 
 function escapeAttr(str: string): string {
     return String(str)
@@ -499,17 +511,30 @@ async function roomItems(env: Env, _session: AuthSession | null) {
 const canManagePosts = (session: AuthSession | null) =>
     session?.user.handle === TOURNAMENT_HOST_HANDLE
 
-function postForm(category: PostKind) {
+function postForm(category: PostCategory) {
     const label = POST_LABELS[category]
 
     return {
+        name: label.create,
         type: 'post',
         title: label.create,
         requireConfirmation: false,
         options: [
             {
+                name: 'category',
+                query: 'category',
+                required: false,
+                type: 'select',
+                def: category,
+                values: [
+                    { name: 'announcements', title: 'Announcements' },
+                    { name: 'posts', title: 'Posts' },
+                    { name: 'results', title: 'Results' },
+                ],
+            },
+            {
+                name: 'title',
                 query: 'title',
-                name: 'Title',
                 required: true,
                 type: 'text',
                 def: '',
@@ -518,8 +543,8 @@ function postForm(category: PostKind) {
                 shortcuts: [],
             },
             {
+                name: 'description',
                 query: 'description',
-                name: 'Content',
                 required: true,
                 type: 'textArea',
                 def: '',
@@ -528,8 +553,8 @@ function postForm(category: PostKind) {
                 shortcuts: [],
             },
             {
+                name: 'thumbnail',
                 query: 'thumbnail',
-                name: 'Thumbnail',
                 description: 'Optional image.',
                 required: false,
                 type: 'file',
@@ -546,14 +571,15 @@ function postForm(category: PostKind) {
 }
 
 const postCommentForm = {
+    name: 'Comment',
     type: 'postComment',
     title: 'Comment',
     icon: 'comment',
     requireConfirmation: false,
     options: [
         {
-            query: 'text',
             name: 'Comment',
+            query: 'text',
             required: true,
             type: 'text',
             def: '',
@@ -566,8 +592,10 @@ const postCommentForm = {
 
 function makeLikePostForm(liked: boolean) {
     return {
+        name: liked ? 'Unlike' : 'Like',
         type: 'likePost',
         title: liked ? 'Unlike' : 'Like',
+        icon: 'heart',
         requireConfirmation: false,
         options: [],
     }
@@ -575,14 +603,17 @@ function makeLikePostForm(liked: boolean) {
 
 function makePinPostForm(pinned: boolean) {
     return {
+        name: pinned ? 'Unpin' : 'Pin',
         type: 'pinPost',
         title: pinned ? 'Unpin' : 'Pin',
+        icon: 'pin',
         requireConfirmation: false,
         options: [],
     }
 }
 
 const deletePostForm = {
+    name: 'Delete',
     type: 'deletePost',
     title: 'Delete',
     icon: 'delete',
@@ -1154,7 +1185,6 @@ export default {
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
-            await lobby(env).syncAllToR2().catch(() => {})
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -1180,25 +1210,30 @@ export default {
                 })
             }
 
-            const kinds: PostKind[] = hasPostCategory(url)
-                ? [postCategory(url)]
+            const explicit = resolveCategoryFromUrlAndHeaders(url, req)
+            const kinds: PostCategory[] = explicit
+                ? [explicit]
                 : ['announcements', 'posts', 'results']
 
             const sections = await Promise.all(
                 kinds.map(async (kind) => {
-                    const sorted = await getPostsByKind(env, kind)
+                    const posts = sortPostsPinnedFirst(
+                        (await lobby(env).listPosts(kind).catch(() => [])).filter(
+                            (p) => p.category === kind,
+                        ),
+                    )
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
-                        hasMore: true,
-                        items: sorted.map(buildPostItemWithBadges),
+                        hasMore: posts.length > 0,
+                        items: posts.map(buildPostItemWithBadges),
                     }
                 }),
             )
 
             return json({
                 creates: canManagePosts(session)
-                    ? [postForm(kinds.length === 1 ? kinds[0]! : 'posts')]
+                    ? [postForm(explicit ?? 'posts')]
                     : [],
                 searches: [],
                 sections,
@@ -1228,10 +1263,14 @@ export default {
                 })
             }
 
-            const kind = postCategory(url)
-            const sorted = await getPostsByKind(env, kind)
-            const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize))
-            const slice = sorted.slice(page * pageSize, page * pageSize + pageSize)
+            const kind = postCategory(url, req)
+            const posts = sortPostsPinnedFirst(
+                (await lobby(env).listPosts(kind).catch(() => [])).filter(
+                    (p) => p.category === kind,
+                ),
+            )
+            const pageCount = Math.max(1, Math.ceil(posts.length / pageSize))
+            const slice = posts.slice(page * pageSize, page * pageSize + pageSize)
 
             return json({
                 title: POST_LABELS[kind].section,
@@ -1257,7 +1296,7 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            const category = postCategory(url)
+            const category = postCategory(url, req, body, values)
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
             const thumbnailHash = (values.get('thumbnail') ?? '').trim()
@@ -1317,7 +1356,7 @@ export default {
                 })
             }
 
-            const post = await getPostByName(env, itemName)
+            const post = await lobby(env).getPost(itemName).catch(() => null)
             if (!post) {
                 return json({ creates: [], actions: [], topComments: [] })
             }
@@ -1351,7 +1390,7 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
-                const text = (values.get('text') ?? '').trim()
+                const text = extractCommentText(values)
                 if (!text) {
                     return message(400, 'Comment cannot be empty.')
                 }
@@ -1370,7 +1409,7 @@ export default {
                 })
             }
 
-            const post = await getPostByName(env, itemName)
+            const post = await lobby(env).getPost(itemName).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
             if (actionType === 'likePost') {
@@ -1393,7 +1432,7 @@ export default {
                 })
             }
 
-            const text = (values.get('text') ?? '').trim()
+            const text = extractCommentText(values)
             if (!text) {
                 return message(400, 'Comment cannot be empty.')
             }
@@ -1428,7 +1467,7 @@ export default {
                 return json(formatChatCommunityComments(messages, page))
             }
 
-            const post = await getPostByName(env, itemName)
+            const post = await lobby(env).getPost(itemName).catch(() => null)
             if (!post) {
                 return json({ pageCount: 1, comments: [] })
             }
@@ -1461,7 +1500,7 @@ export default {
                 })
             }
 
-            const post = await getPostByName(env, itemName)
+            const post = await lobby(env).getPost(itemName).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
             await lobby(env).deletePostComment(itemName, commentName)
@@ -1496,7 +1535,7 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
-                const text = (values.get('text') ?? '').trim()
+                const text = extractCommentText(values)
                 if (!text) {
                     return message(400, 'Message cannot be empty.')
                 }
@@ -1514,7 +1553,7 @@ export default {
                 })
             }
 
-            const post = await getPostByName(env, postName)
+            const post = await lobby(env).getPost(postName).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
             if (actionType === 'likePost') {
@@ -1543,10 +1582,11 @@ export default {
                 return message(400, 'Unknown post action.')
             }
 
-            const bucket = communityBucket(env)
-            await bucket.delete(`${post.category}/${postName}/thumbnail`).catch(() => {})
-            await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`).catch(() => {})
-            await lobby(env).removePost(postName)
+            await Promise.all([
+                env.COMMUNITY_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
+                env.POSTS_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
+                lobby(env).removePost(postName),
+            ])
 
             return json({
                 key: '',
@@ -1632,8 +1672,7 @@ export default {
                 return message(400, 'Image hash does not match.')
             }
 
-            const bucket = communityBucket(env)
-            await bucket.put(
+            await (env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET).put(
                 `${post.category}/${post.item.name}/thumbnail`,
                 bytes,
                 { httpMetadata: { contentType } },
@@ -1652,13 +1691,16 @@ export default {
 
         if (thumbnailPath && req.method === 'GET') {
             const name = thumbnailPath[1]!
-            const post = await getPostByName(env, name).catch(() => null)
-            const bucket = communityBucket(env)
+            const post = await lobby(env).getPost(name).catch(() => null)
 
             const object =
-                (post ? await bucket.get(`${post.category}/${name}/thumbnail`).catch(() => null) : null) ??
-                (await bucket.get(`posts/${name}/thumbnail`).catch(() => null)) ??
-                (await env.POSTS_BUCKET.get(`posts/${name}/thumbnail`).catch(() => null))
+                (post && env.COMMUNITY_BUCKET
+                    ? await env.COMMUNITY_BUCKET.get(`${post.category}/${name}/thumbnail`).catch(() => null)
+                    : null) ??
+                (env.COMMUNITY_BUCKET
+                    ? await env.COMMUNITY_BUCKET.get(`posts/${name}/thumbnail`).catch(() => null)
+                    : null) ??
+                (await env.POSTS_BUCKET?.get(`posts/${name}/thumbnail`).catch(() => null))
 
             if (!object) return new Response(null, { status: 404 })
 
@@ -1696,7 +1738,7 @@ export default {
                 })
             }
 
-            const post = await getPostByName(env, postPath[1]!)
+            const post = await lobby(env).getPost(postPath[1]!).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
             return json({
