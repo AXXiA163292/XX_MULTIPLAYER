@@ -466,8 +466,6 @@ export default {
             return Response.json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
-                hasAuthentication: true,
-                hasMultiplayer: true,
                 configuration: {
                     options: [],
                 },
