@@ -20,6 +20,13 @@ import type { PostComment, StoredPost } from './lobby.ts'
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
 
+type EnvWithCommunity = Env & {
+    COMMUNITY_BUCKET?: R2Bucket
+}
+
+const communityBucket = (env: Env) =>
+    (env as EnvWithCommunity).COMMUNITY_BUCKET ?? env.POSTS_BUCKET
+
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
         status,
@@ -204,17 +211,19 @@ const hasPostCategory = (url: URL) =>
 
 async function getPostsByKind(env: Env, kind: PostKind): Promise<StoredPost[]> {
     const fromLobby = await lobby(env).listPosts(kind).catch(() => [])
-    if (fromLobby.length > 0) return sortPostsListByKind(fromLobby, kind)
+    if (fromLobby.length > 0) {
+        return sortPostsPinnedFirst(fromLobby.filter((p) => p.category === kind))
+    }
 
-    if (env.POSTS_BUCKET) {
+    const bucket = communityBucket(env)
+    if (bucket) {
         try {
-            const obj = await env.POSTS_BUCKET.get(`community/posts/${kind}.json`)
+            const obj = await bucket.get(`${kind}/index.json`)
             if (obj) {
                 const parsed = (await obj.json()) as StoredPost[]
                 if (Array.isArray(parsed)) {
-                    return sortPostsListByKind(
-                        parsed.filter((p) => p.category === kind),
-                        kind,
+                    return sortPostsPinnedFirst(
+                        parsed.filter((p) => (p.category ?? kind) === kind),
                     )
                 }
             }
@@ -225,20 +234,22 @@ async function getPostsByKind(env: Env, kind: PostKind): Promise<StoredPost[]> {
     return []
 }
 
-function sortPostsListByKind(posts: StoredPost[], kind: PostKind): StoredPost[] {
-    return sortPostsPinnedFirst(posts.filter((p) => p.category === kind))
-}
-
 async function getPostByName(env: Env, name: string): Promise<StoredPost | null> {
     const fromLobby = await lobby(env).getPost(name).catch(() => null)
     if (fromLobby) return fromLobby
 
-    if (env.POSTS_BUCKET) {
-        try {
-            const obj = await env.POSTS_BUCKET.get(`community/post/${name}.json`)
-            if (obj) return (await obj.json()) as StoredPost
-        } catch {
-            // ignore
+    const bucket = communityBucket(env)
+    if (bucket) {
+        for (const cat of ['announcements', 'posts', 'results'] as const) {
+            try {
+                const obj = await bucket.get(`${cat}/${name}/post.json`)
+                if (obj) {
+                    const parsed = (await obj.json()) as StoredPost
+                    return { ...parsed, category: parsed.category ?? cat }
+                }
+            } catch {
+                // ignore
+            }
         }
     }
     return null
@@ -1196,6 +1207,8 @@ export default {
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
+            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+            const pageSize = 10
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -1210,18 +1223,20 @@ export default {
                 return json({
                     title: 'Chat',
                     pageCount: 1,
-                    items: [buildChatPostItem(messages, pinnedId)],
+                    items: page === 0 ? [buildChatPostItem(messages, pinnedId)] : [],
                     searches: [],
                 })
             }
 
             const kind = postCategory(url)
             const sorted = await getPostsByKind(env, kind)
+            const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize))
+            const slice = sorted.slice(page * pageSize, page * pageSize + pageSize)
 
             return json({
                 title: POST_LABELS[kind].section,
-                pageCount: 1,
-                items: sorted.map(buildPostItemWithBadges),
+                pageCount,
+                items: slice.map(buildPostItemWithBadges),
                 searches: [],
             })
         }
@@ -1292,23 +1307,25 @@ export default {
 
             if (isChatItemName(itemName)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ creates: [], actions: [] })
+                    return json({ creates: [], actions: [], topComments: [] })
                 }
 
                 return json({
                     creates: [chatCommentForm],
                     actions: [],
+                    topComments: [],
                 })
             }
 
             const post = await getPostByName(env, itemName)
             if (!post) {
-                return json({ creates: [], actions: [] })
+                return json({ creates: [], actions: [], topComments: [] })
             }
 
             return json({
                 creates: [postCommentForm],
                 actions: [],
+                topComments: [],
             })
         }
 
@@ -1526,7 +1543,9 @@ export default {
                 return message(400, 'Unknown post action.')
             }
 
-            await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
+            const bucket = communityBucket(env)
+            await bucket.delete(`${post.category}/${postName}/thumbnail`).catch(() => {})
+            await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`).catch(() => {})
             await lobby(env).removePost(postName)
 
             return json({
@@ -1613,8 +1632,9 @@ export default {
                 return message(400, 'Image hash does not match.')
             }
 
-            await env.POSTS_BUCKET.put(
-                `posts/${post.item.name}/thumbnail`,
+            const bucket = communityBucket(env)
+            await bucket.put(
+                `${post.category}/${post.item.name}/thumbnail`,
                 bytes,
                 { httpMetadata: { contentType } },
             )
@@ -1631,7 +1651,15 @@ export default {
         const thumbnailPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/thumbnail$/)
 
         if (thumbnailPath && req.method === 'GET') {
-            const object = await env.POSTS_BUCKET.get(`posts/${thumbnailPath[1]}/thumbnail`)
+            const name = thumbnailPath[1]!
+            const post = await getPostByName(env, name).catch(() => null)
+            const bucket = communityBucket(env)
+
+            const object =
+                (post ? await bucket.get(`${post.category}/${name}/thumbnail`).catch(() => null) : null) ??
+                (await bucket.get(`posts/${name}/thumbnail`).catch(() => null)) ??
+                (await env.POSTS_BUCKET.get(`posts/${name}/thumbnail`).catch(() => null))
+
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
