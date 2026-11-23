@@ -114,15 +114,15 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-const sendChatCommentForm = {
-    type: 'sendChatComment',
-    title: 'Send comment',
+const chatCommentForm = {
+    type: 'chatComment',
+    title: 'Chat',
     icon: 'comment',
     requireConfirmation: false,
     options: [
         {
             query: 'text',
-            name: 'Comment',
+            name: 'Chat',
             required: true,
             type: 'textArea',
             def: '',
@@ -133,19 +133,28 @@ const sendChatCommentForm = {
     ],
 }
 
-function buildStaffChatPostItem(latestMessage?: { text?: string } | null) {
+function buildChatPostItem(latestMessage?: { text?: string } | null) {
     const newestText = latestMessage?.text?.trim() || 'No messages yet.'
 
     return {
-        name: 'staff-chat',
+        name: 'chat',
         version: 1 as const,
         title: 'Chat',
         subtitle: newestText,
         time: 0,
         author: SERVER_TITLE,
         tags: [],
+        actions: [chatCommentForm],
     }
 }
+
+const isChatCategory = (url: URL) => {
+    const raw = rawPostCategory(url)
+    return raw === 'chat' || raw === 'staff-chat'
+}
+
+const isChatItemName = (name: string) =>
+    name === 'chat' || name === 'staff-chat'
 
 function renderStaffChatHtml(user: UserProfile, sessionToken: string): string {
     const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
@@ -861,7 +870,7 @@ export default {
                                 type: 'post',
                                 title: 'Chat',
                                 icon: 'message',
-                                infoType: 'staff-chat',
+                                infoType: 'chat',
                             },
                         ]
                         : []),
@@ -909,7 +918,7 @@ export default {
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
 
-            if (rawPostCategory(url) === 'staff-chat') {
+            if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return message(403, 'Chat is restricted.')
                 }
@@ -927,7 +936,7 @@ export default {
                             title: 'Chat',
                             itemType: 'post',
                             hasMore: false,
-                            items: [buildStaffChatPostItem(latest)],
+                            items: [buildChatPostItem(latest)],
                         },
                     ],
                 })
@@ -957,7 +966,7 @@ export default {
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
 
-            if (rawPostCategory(url) === 'staff-chat') {
+            if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return json({ pageCount: 1, hasMore: false, items: [], searches: [] })
                 }
@@ -969,7 +978,7 @@ export default {
                     description: '',
                     pageCount: 1,
                     hasMore: false,
-                    items: [buildStaffChatPostItem(latest)],
+                    items: [buildChatPostItem(latest)],
                     searches: [],
                 })
             }
@@ -1056,12 +1065,12 @@ export default {
             const values = new URLSearchParams(String(body.values ?? ''))
             const actionType = values.get('type')
 
-            if (postName === 'staff-chat') {
+            if (isChatItemName(postName)) {
                 if (!isStaffChatHandle(session.user.handle)) {
                     return message(403, 'Chat is restricted.')
                 }
 
-                if (actionType !== 'sendChatComment') {
+                if (actionType !== 'chatComment') {
                     return message(400, 'Unknown chat action.')
                 }
 
@@ -1205,7 +1214,7 @@ export default {
         const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
 
         if (postPath && req.method === 'GET') {
-            if (postPath[1] === 'staff-chat') {
+            if (isChatItemName(postPath[1]!)) {
                 const session = await sessionOf(req, env, url)
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return message(403, 'Chat is restricted.')
@@ -1215,9 +1224,9 @@ export default {
                 const latest = messages[messages.length - 1] ?? null
 
                 return json({
-                    item: buildStaffChatPostItem(latest),
+                    item: buildChatPostItem(latest),
                     description: '',
-                    actions: [sendChatCommentForm],
+                    actions: [chatCommentForm],
                     hasCommunity: false,
                     leaderboards: [],
                     sections: [],
