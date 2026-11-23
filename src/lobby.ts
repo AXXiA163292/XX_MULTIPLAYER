@@ -154,7 +154,7 @@ export class Lobby extends DurableObject<Env> {
                 body: JSON.stringify({
                     from,
                     to: [STAFF_CHAT_ALERT_EMAIL],
-                    subject: `New XX! Staff Chat from ${msg.author} (${msg.handle})`,
+                    subject: `New XX! Chat from ${msg.author} (${msg.handle})`,
                     text: `${msg.author} (${msg.handle}):\n${msg.text}`,
                 }),
                 signal: AbortSignal.timeout(8000),
