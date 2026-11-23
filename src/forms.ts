@@ -226,9 +226,7 @@ export function parseSettings(
 
     const open = isOpenType(type as RoomType)
     const scoring = p.get('scoring') || existing?.scoring || (open ? DEFAULT_OPEN_SCORING : DEFAULT_SCORING)
-    const roundMode: RoundKind = !open
-        ? normalizeRoundMode(p.get('roundMode') ?? existing?.roundMode)
-        : 'tournament'
+    const roundMode: RoundKind = existing?.roundMode ?? 'tournament'
     const group = (p.get('group') ?? existing?.group ?? 'A').trim() || 'A'
     const rawTitle = p.has('title') ? (p.get('title') ?? '').trim() : (existing?.title ?? '').trim()
     const title = type === 'casualRoom'
