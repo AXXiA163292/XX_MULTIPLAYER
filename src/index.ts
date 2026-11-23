@@ -171,7 +171,9 @@ function resolveCategory(
     values?: URLSearchParams,
 ): PostCategory | null {
     const bodySearchParams = parseEncodedParams(body?.searchValues ?? body?.values)
-    const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues') ?? url.searchParams.get('values'))
+    const urlSearchParams = parseEncodedParams(
+        url.searchParams.get('searchValues') ?? url.searchParams.get('values'),
+    )
 
     const candidates: (string | null | undefined)[] = [
         url.searchParams.get('category'),
@@ -262,9 +264,29 @@ function buildPostItemWithBadges(post: StoredPost) {
     }
 }
 
-const chatCommentForm = {
-    name: 'Comment',
+const chatActionForm = {
+    name: 'Chat',
     type: 'chatComment',
+    title: 'Chat',
+    icon: 'comment',
+    requireConfirmation: false,
+    options: [
+        {
+            name: 'Chat',
+            query: 'text',
+            required: true,
+            type: 'text',
+            def: '',
+            placeholder: 'Write a message...',
+            limit: 500,
+            shortcuts: [...STAFF_CHAT_SHORTCUTS],
+        },
+    ],
+}
+
+const postCommentForm = {
+    name: 'Comment',
+    type: 'postComment',
     title: 'Comment',
     icon: 'comment',
     requireConfirmation: false,
@@ -277,9 +299,25 @@ const chatCommentForm = {
             def: '',
             placeholder: 'Write a comment...',
             limit: 500,
-            shortcuts: [...STAFF_CHAT_SHORTCUTS],
+            shortcuts: [],
         },
     ],
+}
+
+function makeDeleteCommentForm() {
+    return {
+        name: 'Delete',
+        type: 'deleteComment',
+        title: 'Delete',
+        icon: 'delete',
+        requireConfirmation: true,
+        options: [],
+    }
+}
+
+function canDeleteComment(session: AuthSession | null, authorHandle: string): boolean {
+    if (!session) return false
+    return session.user.handle === authorHandle || session.user.handle === TOURNAMENT_HOST_HANDLE
 }
 
 function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
@@ -305,7 +343,11 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
     }
 }
 
-function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
+function formatChatCommunityComments(
+    messages: ChatMessage[],
+    session: AuthSession | null,
+    page = 0,
+) {
     const ordered = [...messages].reverse()
     const pageSize = 10
     const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
@@ -319,7 +361,7 @@ function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
             time: m.time,
             content: m.text,
             message: m.text,
-            actions: [],
+            actions: canDeleteComment(session, m.handle) ? [makeDeleteCommentForm()] : [],
         })),
     }
 }
@@ -327,6 +369,7 @@ function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
 function extractCommentText(values: URLSearchParams): string {
     const direct =
         values.get('text') ??
+        values.get('Chat') ??
         values.get('Comment') ??
         values.get('comment') ??
         values.get('content') ??
@@ -552,18 +595,6 @@ function postForm(category: PostCategory) {
         requireConfirmation: false,
         options: [
             {
-                name: 'category',
-                query: 'category',
-                required: false,
-                type: 'select',
-                def: category,
-                values: [
-                    { name: 'announcements', title: 'Announcements' },
-                    { name: 'posts', title: 'Posts' },
-                    { name: 'results', title: 'Results' },
-                ],
-            },
-            {
                 name: 'title',
                 query: 'title',
                 required: true,
@@ -599,26 +630,6 @@ function postForm(category: PostCategory) {
             },
         ],
     }
-}
-
-const postCommentForm = {
-    name: 'Comment',
-    type: 'postComment',
-    title: 'Comment',
-    icon: 'comment',
-    requireConfirmation: false,
-    options: [
-        {
-            name: 'Comment',
-            query: 'text',
-            required: true,
-            type: 'text',
-            def: '',
-            placeholder: 'Write a comment...',
-            limit: 500,
-            shortcuts: [],
-        },
-    ],
 }
 
 function makeLikePostForm(liked: boolean) {
@@ -665,7 +676,11 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
     return actions
 }
 
-function formatPostComments(post: StoredPost, page = 0) {
+function formatPostComments(
+    post: StoredPost,
+    session: AuthSession | null,
+    page = 0,
+) {
     const comments: PostComment[] = post.comments ?? []
     const ordered = [...comments].reverse()
     const pageSize = 10
@@ -680,7 +695,7 @@ function formatPostComments(post: StoredPost, page = 0) {
             time: c.time,
             content: c.text,
             message: c.text,
-            actions: [],
+            actions: canDeleteComment(session, c.handle) ? [makeDeleteCommentForm()] : [],
         })),
     }
 }
@@ -1237,7 +1252,6 @@ export default {
                             title: 'Chat',
                             itemType: 'post',
                             hasMore: false,
-                            searchValues: new URLSearchParams({ category: 'chat' }).toString(),
                             items: [buildChatPostItem(messages, pinnedId)],
                         },
                     ],
@@ -1393,8 +1407,8 @@ export default {
                 const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({
                     creates: [],
-                    actions: [chatCommentForm],
-                    topComments: formatChatCommunityComments(messages, 0).comments.slice(0, 3),
+                    actions: [chatActionForm],
+                    topComments: formatChatCommunityComments(messages, session, 0).comments.slice(0, 3),
                 })
             }
 
@@ -1406,7 +1420,7 @@ export default {
             return json({
                 creates: [],
                 actions: [postCommentForm],
-                topComments: formatPostComments(post, 0).comments.slice(0, 3),
+                topComments: formatPostComments(post, session, 0).comments.slice(0, 3),
             })
         }
 
@@ -1434,7 +1448,7 @@ export default {
 
                 const text = extractCommentText(values)
                 if (!text) {
-                    return message(400, 'Comment cannot be empty.')
+                    return message(400, 'Message cannot be empty.')
                 }
 
                 await lobby(env).addChatMessage({
@@ -1506,7 +1520,7 @@ export default {
                 }
 
                 const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json(formatChatCommunityComments(messages, page))
+                return json(formatChatCommunityComments(messages, session, page))
             }
 
             const post = await lobby(env).getPost(itemName).catch(() => null)
@@ -1514,7 +1528,7 @@ export default {
                 return json({ pageCount: 1, comments: [] })
             }
 
-            return json(formatPostComments(post, page))
+            return json(formatPostComments(post, session, page))
         }
 
         const postCommentSubmit = path.match(
@@ -1533,6 +1547,12 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const target = messages.find((m) => m.id === commentName)
+                if (!target || !canDeleteComment(session, target.handle)) {
+                    return message(403, 'You cannot delete this comment.')
+                }
+
                 await lobby(env).deleteChatMessage(commentName)
                 return json({
                     key: '',
@@ -1544,6 +1564,11 @@ export default {
 
             const post = await lobby(env).getPost(itemName).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
+
+            const target = (post.comments ?? []).find((c) => c.id === commentName)
+            if (!target || !canDeleteComment(session, target.handle)) {
+                return message(403, 'You cannot delete this comment.')
+            }
 
             await lobby(env).deletePostComment(itemName, commentName)
             return json({
