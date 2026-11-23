@@ -102,35 +102,53 @@ export function compareResults(
     return (Number(b.combo) || 0) - (Number(a.combo) || 0)
 }
 
+export function songKeyOf(level: Sil | null | undefined): string {
+    if (!level?.address || !level?.name) return ''
+    return `${level.address.replace(/\/+$/, '').toLowerCase()}::${level.name.trim().toLowerCase()}`
+}
+
+export function unresolvedXUsersForSong(
+    level: Sil | null | undefined,
+    priorHistory: RoundRecord[],
+): Set<string> {
+    const targetKey = songKeyOf(level)
+    const hasUnresolvedX = new Map<string, boolean>()
+    if (!targetKey) return new Set()
+
+    for (const rec of priorHistory) {
+        if (songKeyOf(rec.level) !== targetKey) continue
+        const kind: RoundKind = rec.roundKind ?? 'tournament'
+        if (kind !== 'tournament' && kind !== 'rewind') continue
+
+        for (const [userId, res] of Object.entries(rec.results ?? {})) {
+            if (isPlayerX(res)) {
+                hasUnresolvedX.set(userId, true)
+            } else if (hasUnresolvedX.get(userId)) {
+                // Once a player gets a non-X play on this song, their X is resolved.
+                hasUnresolvedX.set(userId, false)
+            }
+        }
+    }
+
+    const eligible = new Set<string>()
+    for (const [userId, activeX] of hasUnresolvedX.entries()) {
+        if (activeX) eligible.add(userId)
+    }
+    return eligible
+}
+
 export function totals(
     history: RoundRecord[],
     mode: ScoringMode,
 ): { userId: string; score: number }[] {
     const map = new Map<string, number>()
-    const scoredRewindKeys = new Set<string>()
 
     for (let i = 0; i < history.length; i++) {
         const rec = history[i]!
         const kind: RoundKind = rec.roundKind ?? 'tournament'
-        const songKey = rec.level
-            ? `${rec.level.address.replace(/\/+$/, '').toLowerCase()}::${rec.level.name.trim().toLowerCase()}`
-            : ''
-
-        const priorEligible = new Set<string>(rec.rewindEligibleUserIds ?? [])
-        if (kind === 'rewind' && priorEligible.size === 0 && songKey) {
-            for (let j = i - 1; j >= 0; j--) {
-                const prev = history[j]!
-                const prevKey = prev.level
-                    ? `${prev.level.address.replace(/\/+$/, '').toLowerCase()}::${prev.level.name.trim().toLowerCase()}`
-                    : ''
-                if (prevKey === songKey) {
-                    for (const [uid, res] of Object.entries(prev.results ?? {})) {
-                        if (isPlayerX(res)) priorEligible.add(uid)
-                    }
-                    break
-                }
-            }
-        }
+        const prior = history.slice(0, i)
+        const eligibleForRewind =
+            kind === 'rewind' ? unresolvedXUsersForSong(rec.level, prior) : new Set<string>()
 
         for (const [userId, res] of Object.entries(rec.results ?? {})) {
             map.set(userId, map.get(userId) ?? 0)
@@ -145,9 +163,7 @@ export function totals(
             }
 
             if (kind === 'rewind') {
-                const claimKey = `${songKey}::${userId}`
-                if (priorEligible.has(userId) && !isPlayerX(res) && !scoredRewindKeys.has(claimKey)) {
-                    scoredRewindKeys.add(claimKey)
+                if (eligibleForRewind.has(userId) && !isPlayerX(res)) {
                     map.set(userId, (map.get(userId) ?? 0) + roundPoints(res, mode, rec))
                 }
             }
