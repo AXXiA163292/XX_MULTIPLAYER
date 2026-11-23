@@ -15,10 +15,40 @@ import {
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
 import type { AuthSession, ChatMessage, Env, JoinSession, UserProfile } from './types.ts'
-import type { PostComment, StoredPost } from './lobby.ts'
 
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
+
+type PostKind = 'posts' | 'announcements' | 'results'
+type BucketCategory = PostKind | 'chat'
+
+interface StoredComment {
+    id: string
+    handle: string
+    author: string
+    time: number
+    text: string
+}
+
+interface StoredPostRecord {
+    category: PostKind
+    name: string
+    title: string
+    author: string
+    time: number
+    description: string
+    pinned: boolean
+    likes: string[]
+    comments: StoredComment[]
+    uploadKey?: string
+    thumbnailHash?: string
+    thumbnailUrl?: string
+}
+
+interface StoredChatState {
+    pinnedId: string | null
+    messages: ChatMessage[]
+}
 
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
@@ -41,6 +71,9 @@ const html = (body: string, status = 200) =>
 
 const message = (status: number, text: string) =>
     json({ message: text }, status)
+
+const bucketOf = (env: Env): R2Bucket =>
+    env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET
 
 const addressOf = (req: Request, env: Env) =>
     (env.PUBLIC_ADDRESS ?? new URL(req.url).origin).replace(/\/+$/, '')
@@ -120,20 +153,159 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-function sortPostsPinnedFirst(posts: StoredPost[]): StoredPost[] {
-    return [...posts].sort((a, b) => {
-        const pinDiff = (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
-        if (pinDiff !== 0) return pinDiff
-        return Number(b.item?.time ?? 0) - Number(a.item?.time ?? 0)
+const POST_KINDS: PostKind[] = ['posts', 'announcements', 'results']
+
+const POST_LABELS: Record<PostKind, {
+    section: string
+    create: string
+    titlePlaceholder: string
+    bodyPlaceholder: string
+}> = {
+    announcements: {
+        section: 'Announcements',
+        create: 'Create announcement',
+        titlePlaceholder: 'Announcement title',
+        bodyPlaceholder: 'Write your announcement...',
+    },
+    posts: {
+        section: 'Posts',
+        create: 'Create post',
+        titlePlaceholder: 'Post title',
+        bodyPlaceholder: 'Write your post...',
+    },
+    results: {
+        section: 'Results',
+        create: 'Create result',
+        titlePlaceholder: 'Result title',
+        bodyPlaceholder: 'Write the results...',
+    },
+}
+
+function rawCategoryParam(url: URL): string | null {
+    const raw =
+        url.searchParams.get('type') ??
+        url.searchParams.get('infoType') ??
+        url.searchParams.get('category')
+    return raw ? raw.trim().toLowerCase() : null
+}
+
+function resolvePostKind(url: URL): PostKind {
+    const raw = rawCategoryParam(url)
+    if (raw === 'announcements' || raw === 'announcement') return 'announcements'
+    if (raw === 'results' || raw === 'result') return 'results'
+    return 'posts'
+}
+
+function isChatCategory(url: URL): boolean {
+    const raw = rawCategoryParam(url)
+    return raw === 'chat' || raw === 'staff-chat'
+}
+
+const isChatItemName = (name: string) =>
+    name === 'chat' || name === 'staff-chat'
+
+function postKey(category: PostKind, name: string): string {
+    return `${category}/${name}.json`
+}
+
+function chatStateKey(): string {
+    return 'chat/messages.json'
+}
+
+function thumbnailKey(name: string): string {
+    return `media/${name}/thumbnail`
+}
+
+async function readJsonFromBucket<T>(bucket: R2Bucket, key: string, fallback: T): Promise<T> {
+    const obj = await bucket.get(key)
+    if (!obj) return fallback
+    try {
+        const parsed = await obj.json<T>()
+        return parsed ?? fallback
+    } catch {
+        return fallback
+    }
+}
+
+async function writeJsonToBucket(bucket: R2Bucket, key: string, value: unknown): Promise<void> {
+    await bucket.put(key, JSON.stringify(value), {
+        httpMetadata: { contentType: 'application/json' },
     })
 }
 
-function buildPostItemWithBadges(post: StoredPost) {
-    const likesCount = (post.likes ?? []).length
-    const commentsCount = (post.comments ?? []).length
+async function listRecordsInCategory(env: Env, category: PostKind): Promise<StoredPostRecord[]> {
+    const bucket = bucketOf(env)
+    const prefix = `${category}/`
+    const keys: string[] = []
+    let cursor: string | undefined
+
+    do {
+        const page = await bucket.list({ prefix, cursor })
+        for (const obj of page.objects) {
+            if (obj.key.endsWith('.json')) {
+                keys.push(obj.key)
+            }
+        }
+        cursor = page.truncated ? page.cursor : undefined
+    } while (cursor)
+
+    const records = await Promise.all(
+        keys.map((key) => readJsonFromBucket<StoredPostRecord | null>(bucket, key, null)),
+    )
+
+    const valid = records.filter((r): r is StoredPostRecord => Boolean(r && r.name && r.title))
+
+    return valid.sort((a, b) => {
+        const pinDiff = (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
+        if (pinDiff !== 0) return pinDiff
+        return Number(b.time ?? 0) - Number(a.time ?? 0)
+    })
+}
+
+async function findPostRecordByName(
+    env: Env,
+    name: string,
+    preferredCategory?: PostKind,
+): Promise<{ category: PostKind; record: StoredPostRecord } | null> {
+    const bucket = bucketOf(env)
+    const order: PostKind[] = preferredCategory
+        ? [preferredCategory, ...POST_KINDS.filter((k) => k !== preferredCategory)]
+        : POST_KINDS
+
+    for (const category of order) {
+        const rec = await readJsonFromBucket<StoredPostRecord | null>(
+            bucket,
+            postKey(category, name),
+            null,
+        )
+        if (rec) {
+            return { category, record: rec }
+        }
+    }
+
+    return null
+}
+
+async function findPostRecordByUploadKey(
+    env: Env,
+    uploadKey: string,
+): Promise<{ category: PostKind; record: StoredPostRecord } | null> {
+    for (const category of POST_KINDS) {
+        const list = await listRecordsInCategory(env, category)
+        const match = list.find((rec) => rec.uploadKey === uploadKey)
+        if (match) {
+            return { category, record: match }
+        }
+    }
+    return null
+}
+
+function buildSonolusPostItem(rec: StoredPostRecord) {
+    const likesCount = (rec.likes ?? []).length
+    const commentsCount = (rec.comments ?? []).length
     const tags: { title: string; icon?: string }[] = []
 
-    if (post.pinned) {
+    if (rec.pinned) {
         tags.push({ title: 'Pinned', icon: 'pin' })
     }
     tags.push({ title: String(likesCount), icon: 'heart' })
@@ -142,34 +314,45 @@ function buildPostItemWithBadges(post: StoredPost) {
     }
 
     return {
-        ...post.item,
+        name: rec.name,
+        version: 1 as const,
+        title: rec.title,
+        time: rec.time,
+        author: rec.author,
         tags,
+        ...(rec.thumbnailUrl
+            ? {
+                thumbnail: {
+                    hash: rec.thumbnailHash ?? '',
+                    url: rec.thumbnailUrl,
+                },
+            }
+            : {}),
     }
 }
 
-const chatCommentForm = {
-    type: 'chatComment',
-    title: 'Comment',
-    icon: 'comment',
-    requireConfirmation: false,
-    options: [
-        {
-            query: 'text',
-            name: 'Comment',
-            required: true,
-            type: 'text',
-            def: '',
-            placeholder: 'Write a comment...',
-            limit: 500,
-            shortcuts: [...STAFF_CHAT_SHORTCUTS],
-        },
-    ],
+async function getChatState(env: Env): Promise<StoredChatState> {
+    const bucket = bucketOf(env)
+    const state = await readJsonFromBucket<StoredChatState>(bucket, chatStateKey(), {
+        pinnedId: null,
+        messages: [],
+    })
+    return {
+        pinnedId: state.pinnedId ?? null,
+        messages: Array.isArray(state.messages) ? state.messages : [],
+    }
 }
 
-function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
-    const latest = messages[messages.length - 1] ?? null
-    const pinnedMsg = pinnedId ? messages.find((m) => m.id === pinnedId) ?? null : null
-    const count = messages.length
+async function saveChatState(env: Env, state: StoredChatState): Promise<void> {
+    await writeJsonToBucket(bucketOf(env), chatStateKey(), state)
+}
+
+function buildChatPostItem(state: StoredChatState) {
+    const latest = state.messages[state.messages.length - 1] ?? null
+    const pinnedMsg = state.pinnedId
+        ? state.messages.find((m) => m.id === state.pinnedId) ?? null
+        : null
+    const count = state.messages.length
     const countLabel = `${count} ${count === 1 ? 'comment' : 'comments'}`
 
     const subtitle = pinnedMsg
@@ -189,19 +372,22 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
     }
 }
 
-function formatChatCommunityComments(messages: ChatMessage[], page = 0) {
-    const ordered = [...messages].reverse()
+function formatCommentsPage(
+    entries: { id: string; author: string; handle: string; time: number; text: string }[],
+    page = 0,
+) {
+    const ordered = [...entries].reverse()
     const pageSize = 10
     const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
     const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
         pageCount,
-        comments: slice.map((m) => ({
-            name: m.id,
-            author: `${m.author} (${m.handle})`,
-            time: m.time,
-            message: m.text,
+        comments: slice.map((c) => ({
+            name: c.id,
+            author: `${c.author} (${c.handle})`,
+            time: c.time,
+            message: c.text,
         })),
     }
 }
@@ -211,14 +397,6 @@ function externalChatUrl(req: Request, env: Env, url: URL): string | null {
     if (!token) return null
     return `${addressOf(req, env)}/chat?session=${encodeURIComponent(token)}`
 }
-
-const isChatCategory = (url: URL) => {
-    const raw = rawPostCategory(url)
-    return raw === 'chat' || raw === 'staff-chat'
-}
-
-const isChatItemName = (name: string) =>
-    name === 'chat' || name === 'staff-chat'
 
 function escapeAttr(str: string): string {
     return String(str)
@@ -399,34 +577,6 @@ async function roomItems(env: Env, _session: AuthSession | null) {
 const canManagePosts = (session: AuthSession | null) =>
     session?.user.handle === TOURNAMENT_HOST_HANDLE
 
-type PostKind = 'announcements' | 'posts' | 'results'
-
-const POST_LABELS: Record<PostKind, {
-    section: string
-    create: string
-    titlePlaceholder: string
-    bodyPlaceholder: string
-}> = {
-    announcements: {
-        section: 'Announcements',
-        create: 'Create announcement',
-        titlePlaceholder: 'Announcement title',
-        bodyPlaceholder: 'Write your announcement...',
-    },
-    posts: {
-        section: 'Posts',
-        create: 'Create post',
-        titlePlaceholder: 'Post title',
-        bodyPlaceholder: 'Write your post...',
-    },
-    results: {
-        section: 'Results',
-        create: 'Create result',
-        titlePlaceholder: 'Result title',
-        bodyPlaceholder: 'Write the results...',
-    },
-}
-
 function postForm(category: PostKind) {
     const label = POST_LABELS[category]
 
@@ -492,6 +642,25 @@ const postCommentForm = {
     ],
 }
 
+const chatCommentForm = {
+    type: 'chatComment',
+    title: 'Comment',
+    icon: 'comment',
+    requireConfirmation: false,
+    options: [
+        {
+            query: 'text',
+            name: 'Comment',
+            required: true,
+            type: 'text',
+            def: '',
+            placeholder: 'Write a comment...',
+            limit: 500,
+            shortcuts: [...STAFF_CHAT_SHORTCUTS],
+        },
+    ],
+}
+
 function makeLikePostForm(liked: boolean) {
     return {
         type: 'likePost',
@@ -520,52 +689,17 @@ const deletePostForm = {
     options: [],
 }
 
-function postActionsFor(post: StoredPost, session: AuthSession | null) {
-    const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
-    const pinned = Boolean(post.pinned)
+function postActionsFor(rec: StoredPostRecord, session: AuthSession | null) {
+    const liked = Boolean(session && (rec.likes ?? []).includes(session.user.handle))
     const actions = [
         makeLikePostForm(liked),
-        makePinPostForm(pinned),
+        makePinPostForm(Boolean(rec.pinned)),
     ]
     if (canManagePosts(session)) {
         actions.push(deletePostForm)
     }
     return actions
 }
-
-function formatPostComments(post: StoredPost, page = 0) {
-    const comments: PostComment[] = post.comments ?? []
-    const ordered = [...comments].reverse()
-    const pageSize = 10
-    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
-    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
-
-    return {
-        pageCount,
-        comments: slice.map((c) => ({
-            name: c.id,
-            author: `${c.author} (${c.handle})`,
-            time: c.time,
-            message: c.text,
-        })),
-    }
-}
-
-function rawPostCategory(url: URL): string | null {
-    return (
-        url.searchParams.get('type') ??
-        url.searchParams.get('infoType') ??
-        url.searchParams.get('category')
-    )
-}
-
-function postCategory(url: URL): PostKind {
-    const type = rawPostCategory(url)
-    return type === 'announcements' || type === 'results' ? type : 'posts'
-}
-
-const hasPostCategory = (url: URL) =>
-    ['type', 'infoType', 'category'].some((key) => url.searchParams.has(key))
 
 function playlistSlug(name: string): string {
     return name
@@ -890,6 +1024,7 @@ export default {
     async fetch(req: Request, env: Env): Promise<Response> {
         const url = new URL(req.url)
         const path = url.pathname.replace(/\/+$/, '') || '/'
+        const bucket = bucketOf(env)
 
         if (req.method === 'OPTIONS') {
             return new Response(null, {
@@ -930,8 +1065,8 @@ export default {
             }
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ messages })
+                const state = await getChatState(env)
+                return json({ messages: state.messages })
             }
 
             if (req.method === 'POST') {
@@ -942,32 +1077,45 @@ export default {
                     return message(400, 'Invalid JSON.')
                 }
 
+                const state = await getChatState(env)
+
                 if (body?.action === 'delete') {
-                    await lobby(env).deleteChatMessage(
-                        typeof body?.id === 'string' ? body.id : undefined,
-                    )
-                    const messages = await lobby(env).listChatMessages().catch(() => [])
-                    return json({ ok: true, messages })
+                    const targetId = typeof body?.id === 'string' ? body.id : undefined
+                    state.messages = targetId
+                        ? state.messages.filter((m) => m.id !== targetId)
+                        : state.messages.slice(0, -1)
+                    if (state.pinnedId && !state.messages.some((m) => m.id === state.pinnedId)) {
+                        state.pinnedId = null
+                    }
+                    await saveChatState(env, state)
+                    return json({ ok: true, messages: state.messages })
                 }
 
                 const text = typeof body?.text === 'string' ? body.text.trim() : ''
                 if (!text) return message(400, 'Message cannot be empty.')
 
-                await lobby(env).addChatMessage({
+                state.messages.push({
+                    id: randomId(12),
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
+                    time: Date.now(),
                 })
-
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages })
+                await saveChatState(env, state)
+                return json({ ok: true, messages: state.messages })
             }
 
             if (req.method === 'DELETE') {
                 const id = url.searchParams.get('id') ?? undefined
-                await lobby(env).deleteChatMessage(id)
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json({ ok: true, messages })
+                const state = await getChatState(env)
+                state.messages = id
+                    ? state.messages.filter((m) => m.id !== id)
+                    : state.messages.slice(0, -1)
+                if (state.pinnedId && !state.messages.some((m) => m.id === state.pinnedId)) {
+                    state.pinnedId = null
+                }
+                await saveChatState(env, state)
+                return json({ ok: true, messages: state.messages })
             }
         }
 
@@ -1004,7 +1152,7 @@ export default {
             const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
+            const bannerObject = await bucket.get('server/banner.png')
             let banner: { hash: string; url: string } | undefined
 
             if (bannerObject) {
@@ -1086,7 +1234,7 @@ export default {
         }
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object = await env.POSTS_BUCKET.get('server/banner.png')
+            const object = await bucket.get('server/banner.png')
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -1105,11 +1253,7 @@ export default {
                     return json({ creates: [], searches: [], sections: [] })
                 }
 
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-
+                const state = await getChatState(env)
                 return json({
                     creates: [],
                     searches: [],
@@ -1118,32 +1262,31 @@ export default {
                             title: 'Chat',
                             itemType: 'post',
                             hasMore: false,
-                            items: [buildChatPostItem(messages, pinnedId)],
+                            items: [buildChatPostItem(state)],
                         },
                     ],
                 })
             }
 
-            const kinds: PostKind[] = hasPostCategory(url)
-                ? [postCategory(url)]
-                : ['announcements', 'posts', 'results']
+            const specificCategory = rawCategoryParam(url)
+            const kinds: PostKind[] = specificCategory
+                ? [resolvePostKind(url)]
+                : POST_KINDS
 
             const sections = await Promise.all(
                 kinds.map(async (kind) => {
-                    const sorted = sortPostsPinnedFirst(await lobby(env).listPosts(kind))
+                    const records = await listRecordsInCategory(env, kind)
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         hasMore: true,
-                        items: sorted.map(buildPostItemWithBadges),
+                        items: records.map(buildSonolusPostItem),
                     }
                 }),
             )
 
             return json({
-                creates: canManagePosts(session)
-                    ? [postForm(kinds.length === 1 ? kinds[0]! : 'posts')]
-                    : [],
+                creates: canManagePosts(session) ? [postForm(kinds[0]!)] : [],
                 searches: [],
                 sections,
             })
@@ -1157,23 +1300,20 @@ export default {
                     return json({ pageCount: 1, items: [], searches: [] })
                 }
 
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
-
+                const state = await getChatState(env)
                 return json({
                     pageCount: 1,
-                    items: [buildChatPostItem(messages, pinnedId)],
+                    items: [buildChatPostItem(state)],
                     searches: [],
                 })
             }
 
-            const sorted = sortPostsPinnedFirst(await lobby(env).listPosts(postCategory(url)))
+            const category = resolvePostKind(url)
+            const records = await listRecordsInCategory(env, category)
 
             return json({
                 pageCount: 1,
-                items: sorted.map(buildPostItemWithBadges),
+                items: records.map(buildSonolusPostItem),
                 searches: [],
             })
         }
@@ -1194,7 +1334,7 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            const category = postCategory(url)
+            const category = resolvePostKind(url)
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
             const thumbnailHash = (values.get('thumbnail') ?? '').trim()
@@ -1210,23 +1350,21 @@ export default {
             const name = randomId(12)
             const key = randomId(24)
 
-            await lobby(env).createPost({
+            const record: StoredPostRecord = {
                 category,
-                item: {
-                    name,
-                    version: 1,
-                    title,
-                    time: Date.now(),
-                    author: session.user.name || session.user.handle,
-                    tags: [],
-                },
+                name,
+                title,
+                author: session.user.name || session.user.handle,
+                time: Date.now(),
                 description,
-                uploadKey: key,
-                thumbnailHash,
+                pinned: false,
                 likes: [],
                 comments: [],
-                pinned: false,
-            })
+                uploadKey: key,
+                thumbnailHash: thumbnailHash || undefined,
+            }
+
+            await writeJsonToBucket(bucket, postKey(category, name), record)
 
             return json({
                 key,
@@ -1253,19 +1391,20 @@ export default {
                 })
             }
 
-            const post = await lobby(env).getPost(itemName)
-            if (!post) {
+            const found = await findPostRecordByName(env, itemName)
+            if (!found) {
                 return json({ creates: [], actions: [] })
             }
 
-            const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
-            const pinned = Boolean(post.pinned)
+            const liked = Boolean(
+                session && (found.record.likes ?? []).includes(session.user.handle),
+            )
 
             return json({
                 creates: [postCommentForm],
                 actions: [
                     makeLikePostForm(liked),
-                    makePinPostForm(pinned),
+                    makePinPostForm(Boolean(found.record.pinned)),
                 ],
             })
         }
@@ -1297,11 +1436,15 @@ export default {
                     return message(400, 'Comment cannot be empty.')
                 }
 
-                await lobby(env).addChatMessage({
+                const state = await getChatState(env)
+                state.messages.push({
+                    id: randomId(12),
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
+                    time: Date.now(),
                 })
+                await saveChatState(env, state)
 
                 return json({
                     key: '',
@@ -1312,11 +1455,21 @@ export default {
                 })
             }
 
-            const post = await lobby(env).getPost(itemName)
-            if (!post) return new Response(null, { status: 404 })
+            const found = await findPostRecordByName(env, itemName)
+            if (!found) return new Response(null, { status: 404 })
+
+            const { category, record } = found
 
             if (actionType === 'likePost') {
-                await lobby(env).togglePostLike(itemName, session.user.handle)
+                const likes = new Set(record.likes ?? [])
+                if (likes.has(session.user.handle)) {
+                    likes.delete(session.user.handle)
+                } else {
+                    likes.add(session.user.handle)
+                }
+                record.likes = Array.from(likes)
+                await writeJsonToBucket(bucket, postKey(category, itemName), record)
+
                 return json({
                     key: '',
                     hashes: [],
@@ -1326,7 +1479,9 @@ export default {
             }
 
             if (actionType === 'pinPost') {
-                await lobby(env).togglePostPin(itemName)
+                record.pinned = !record.pinned
+                await writeJsonToBucket(bucket, postKey(category, itemName), record)
+
                 return json({
                     key: '',
                     hashes: [],
@@ -1340,11 +1495,17 @@ export default {
                 return message(400, 'Comment cannot be empty.')
             }
 
-            await lobby(env).addPostComment(itemName, {
-                handle: session.user.handle,
-                author: session.user.name || session.user.handle,
-                text: text.slice(0, 500),
-            })
+            record.comments = [
+                ...(record.comments ?? []),
+                {
+                    id: randomId(12),
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    time: Date.now(),
+                    text: text.slice(0, 500),
+                },
+            ]
+            await writeJsonToBucket(bucket, postKey(category, itemName), record)
 
             return json({
                 key: '',
@@ -1367,16 +1528,16 @@ export default {
                     return json({ pageCount: 1, comments: [] })
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
-                return json(formatChatCommunityComments(messages, page))
+                const state = await getChatState(env)
+                return json(formatCommentsPage(state.messages, page))
             }
 
-            const post = await lobby(env).getPost(itemName)
-            if (!post) {
+            const found = await findPostRecordByName(env, itemName)
+            if (!found) {
                 return json({ pageCount: 1, comments: [] })
             }
 
-            return json(formatPostComments(post, page))
+            return json(formatCommentsPage(found.record.comments ?? [], page))
         }
 
         const postCommentSubmit = path.match(
@@ -1395,7 +1556,13 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
-                await lobby(env).deleteChatMessage(commentName)
+                const state = await getChatState(env)
+                state.messages = state.messages.filter((m) => m.id !== commentName)
+                if (state.pinnedId === commentName) {
+                    state.pinnedId = null
+                }
+                await saveChatState(env, state)
+
                 return json({
                     key: '',
                     hashes: [],
@@ -1404,10 +1571,14 @@ export default {
                 })
             }
 
-            const post = await lobby(env).getPost(itemName)
-            if (!post) return new Response(null, { status: 404 })
+            const found = await findPostRecordByName(env, itemName)
+            if (!found) return new Response(null, { status: 404 })
 
-            await lobby(env).deletePostComment(itemName, commentName)
+            found.record.comments = (found.record.comments ?? []).filter(
+                (c) => c.id !== commentName,
+            )
+            await writeJsonToBucket(bucket, postKey(found.category, itemName), found.record)
+
             return json({
                 key: '',
                 hashes: [],
@@ -1444,11 +1615,15 @@ export default {
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await lobby(env).addChatMessage({
+                const state = await getChatState(env)
+                state.messages.push({
+                    id: randomId(12),
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
+                    time: Date.now(),
                 })
+                await saveChatState(env, state)
 
                 return json({
                     key: '',
@@ -1457,11 +1632,21 @@ export default {
                 })
             }
 
-            const post = await lobby(env).getPost(postName)
-            if (!post) return new Response(null, { status: 404 })
+            const found = await findPostRecordByName(env, postName)
+            if (!found) return new Response(null, { status: 404 })
+
+            const { category, record } = found
 
             if (actionType === 'likePost') {
-                await lobby(env).togglePostLike(postName, session.user.handle)
+                const likes = new Set(record.likes ?? [])
+                if (likes.has(session.user.handle)) {
+                    likes.delete(session.user.handle)
+                } else {
+                    likes.add(session.user.handle)
+                }
+                record.likes = Array.from(likes)
+                await writeJsonToBucket(bucket, postKey(category, postName), record)
+
                 return json({
                     key: '',
                     hashes: [],
@@ -1470,7 +1655,9 @@ export default {
             }
 
             if (actionType === 'pinPost') {
-                await lobby(env).togglePostPin(postName)
+                record.pinned = !record.pinned
+                await writeJsonToBucket(bucket, postKey(category, postName), record)
+
                 return json({
                     key: '',
                     hashes: [],
@@ -1486,8 +1673,8 @@ export default {
                 return message(400, 'Unknown post action.')
             }
 
-            await env.POSTS_BUCKET.delete(`posts/${postName}/thumbnail`)
-            await lobby(env).removePost(postName)
+            await bucket.delete(thumbnailKey(postName))
+            await bucket.delete(postKey(category, postName))
 
             return json({
                 key: '',
@@ -1507,8 +1694,8 @@ export default {
             const key = req.headers.get('Sonolus-Upload-Key')
             if (!key) return message(400, 'Missing upload key.')
 
-            const post = await lobby(env).findPostByUploadKey(key)
-            if (!post || !post.thumbnailHash) {
+            const found = await findPostRecordByUploadKey(env, key)
+            if (!found || !found.record.thumbnailHash) {
                 return message(403, 'Invalid upload key.')
             }
 
@@ -1569,21 +1756,17 @@ export default {
                 (byte) => byte.toString(16).padStart(2, '0'),
             ).join('')
 
-            if (hash.toLowerCase() !== post.thumbnailHash.toLowerCase()) {
+            if (hash.toLowerCase() !== found.record.thumbnailHash.toLowerCase()) {
                 return message(400, 'Image hash does not match.')
             }
 
-            await env.POSTS_BUCKET.put(
-                `posts/${post.item.name}/thumbnail`,
-                bytes,
-                { httpMetadata: { contentType } },
-            )
+            await bucket.put(thumbnailKey(found.record.name), bytes, {
+                httpMetadata: { contentType },
+            })
 
-            await lobby(env).setPostThumbnail(
-                post.item.name,
-                hash,
-                `/sonolus/posts/${post.item.name}/thumbnail`,
-            )
+            found.record.thumbnailHash = hash
+            found.record.thumbnailUrl = `/sonolus/posts/${found.record.name}/thumbnail`
+            await writeJsonToBucket(bucket, postKey(found.category, found.record.name), found.record)
 
             return json({})
         }
@@ -1591,7 +1774,7 @@ export default {
         const thumbnailPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/thumbnail$/)
 
         if (thumbnailPath && req.method === 'GET') {
-            const object = await env.POSTS_BUCKET.get(`posts/${thumbnailPath[1]}/thumbnail`)
+            const object = await bucket.get(thumbnailKey(thumbnailPath[1]!))
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -1612,14 +1795,11 @@ export default {
                     return message(403, 'Chat is restricted.')
                 }
 
-                const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
-                ])
+                const state = await getChatState(env)
                 const extUrl = externalChatUrl(req, env, url)
 
                 return json({
-                    item: buildChatPostItem(messages, pinnedId),
+                    item: buildChatPostItem(state),
                     description: extUrl ? `External chat:\n${extUrl}` : '',
                     actions: [],
                     hasCommunity: true,
@@ -1628,13 +1808,13 @@ export default {
                 })
             }
 
-            const post = await lobby(env).getPost(postPath[1]!)
-            if (!post) return new Response(null, { status: 404 })
+            const found = await findPostRecordByName(env, postPath[1]!)
+            if (!found) return new Response(null, { status: 404 })
 
             return json({
-                item: buildPostItemWithBadges(post),
-                description: post.description,
-                actions: postActionsFor(post, session),
+                item: buildSonolusPostItem(found.record),
+                description: found.record.description,
+                actions: postActionsFor(found.record, session),
                 hasCommunity: true,
                 leaderboards: [],
                 sections: [],
@@ -1988,4 +2168,3 @@ export default {
         return new Response('Not found', { status: 404 })
     },
 } satisfies ExportedHandler<Env>
-
