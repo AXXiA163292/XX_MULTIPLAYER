@@ -139,6 +139,11 @@ export const roomForms = (isTournamentHost = false) =>
                         : [tournamentScoringOption, tournamentVisibilityOption],
         }))
 
+export const roomFormsForType = (
+    type: RoomType,
+    isTournamentHost = false,
+) => roomForms(isTournamentHost).filter((form) => form.type === type)
+
 export type RoomSettings = {
     type: RoomType
     scoring: ScoringMode
