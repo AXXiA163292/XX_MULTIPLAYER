@@ -1,4 +1,3 @@
-
 import {
     DEFAULT_OPEN_SCORING,
     DEFAULT_SCORING,
@@ -20,7 +19,7 @@ export const CUSTOM_SONGS_MODES: Record<CustomSongsMode, string> = {
 }
 
 export const ROUND_MODES: Record<RoundKind, string> = {
-    tournament: 'Normal (Round)',
+    tournament: 'Round',
     warmup: 'Warmup',
     rewind: 'Rewind',
     freeplay: 'Freeplay',
@@ -38,18 +37,6 @@ const tournamentScoringOption = {
     type: 'select' as const,
     def: DEFAULT_SCORING,
     values: Object.entries(SCORING_MODES).map(([name, title]) => ({ name, title })),
-}
-
-const roundModeOption = {
-    query: 'roundMode',
-    name: 'Round type',
-    required: false,
-    type: 'select' as const,
-    def: 'tournament' as RoundKind,
-    values: (Object.keys(ROUND_MODES) as RoundKind[]).map((name) => ({
-        name,
-        title: ROUND_MODES[name],
-    })),
 }
 
 const customScoringOption = {
@@ -157,12 +144,12 @@ export const roomForms = (isTournamentHost = false) =>
             title: ROOM_TYPES[type],
             requireConfirmation: false,
             options: type === 'groupStage'
-                ? [groupOption, roundModeOption, tournamentScoringOption, tournamentVisibilityOption]
+                ? [groupOption, tournamentScoringOption, tournamentVisibilityOption]
                 : type === 'casualRoom'
                     ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
                     : type === 'rankedRoom'
                         ? [tierOption, customSongsOption]
-                        : [roundModeOption, tournamentScoringOption, tournamentVisibilityOption],
+                        : [tournamentScoringOption, tournamentVisibilityOption],
         }))
 
 export const roomFormsForType = (
@@ -191,10 +178,6 @@ export const serializeSettings = (s: RoomSettings) => {
 
     if (s.type === 'groupStage') {
         values.push(`group=${encodeURIComponent(s.group || 'A')}`)
-        values.push(`roundMode=${encodeURIComponent(s.roundMode || 'tournament')}`)
-    }
-    if (s.type === 'final') {
-        values.push(`roundMode=${encodeURIComponent(s.roundMode || 'tournament')}`)
     }
     if (s.type === 'casualRoom') {
         values.push(`title=${encodeURIComponent(s.title || '')}`)
