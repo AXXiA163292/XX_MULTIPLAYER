@@ -595,15 +595,6 @@ export class Room extends DurableObject<Env> {
         })
     }
 
-    /**
-     * Automatically classifies a round for Group Stage & Final rooms:
-     * - If `freeplayLocked` is true (or a pool chart was already finished and a subsequent
-     *   chart is played out-of-sequence/after pool completion), it is `freeplay` forever.
-     * - If no pool chart has ever been played yet (`highestPoolIndexReached < 0`),
-     *   any chart played before the pool begins is `warmup`.
-     * - If the chart was already played in a prior round, it is `rewind` (`Rewind`, `Rewind 2`, ...).
-     * - Otherwise it is a normal `tournament` round (`Round <N>`).
-     */
     private resolveRoundClassification(
         level: Sil | null,
         roundNumber: number,
@@ -1887,7 +1878,6 @@ export class Room extends DurableObject<Env> {
         try {
             const state = this.st
             const mode = state.settings.scoring
-            const open = isOpenType(state.settings.type)
 
             const presentMembers = state.members.filter(
                 (member) => this.socketsOf(member.id).length > 0,
