@@ -504,7 +504,13 @@ export default {
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
                 ...(banner ? { banner } : {}),
-                buttons: [],
+                buttons: [
+                    { type: 'authentication' },
+                    { type: 'multiplayer' },
+                    { type: 'level' },
+                    { type: 'playlist' },
+                    { type: 'post' },
+                ],
                 configuration: {
                     options: [],
                 },
