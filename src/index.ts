@@ -124,13 +124,15 @@ async function getAllCatalogLevels(env: Env): Promise<LevelItem[]> {
         try {
             const charts = await getCustomLevels(env)
             if (Array.isArray(charts) && charts.length > 0) {
-                return charts.map((c) => ({
-                    id: c.id,
-                    name: c.name,
-                    url: stripTrailingSlash(c.url),
-                    address: stripTrailingSlash(c.address),
-                    title: c.name,
-                }))
+                return charts
+                    .filter((c) => c && typeof c.name === 'string' && c.name.trim().length > 0)
+                    .map((c) => ({
+                        id: c.id,
+                        name: c.name.trim(),
+                        url: c.url ? stripTrailingSlash(c.url) : undefined,
+                        address: c.address ? stripTrailingSlash(c.address) : undefined,
+                        title: c.name.trim(),
+                    }))
             }
         } catch (err) {
             console.warn('[Catalog] Failed reading custom levels from POSTS_BUCKET:', err)
@@ -468,6 +470,13 @@ export default {
 
             const chatItem = canSeeChat ? buildStaffChatPostItem(unread) : null
 
+            let previewLevels: LevelItem[] = []
+            try {
+                previewLevels = (await getAllCatalogLevels(env)).slice(0, 5)
+            } catch {
+                previewLevels = []
+            }
+
             return Response.json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
@@ -476,8 +485,38 @@ export default {
                     options: [],
                 },
                 levels: {
-                    items: [],
-                    searches: [],
+                    items: previewLevels,
+                    searches: [
+                        {
+                            title: 'Search',
+                            options: [
+                                {
+                                    query: 'keywords',
+                                    name: 'Keywords',
+                                    required: false,
+                                    type: 'text',
+                                    def: '',
+                                    placeholder: 'Song, artist, charter...',
+                                    limit: 100,
+                                    shortcuts: [],
+                                },
+                                {
+                                    query: 'difficulty',
+                                    name: 'Difficulty',
+                                    required: false,
+                                    type: 'select',
+                                    def: 'ALL',
+                                    values: [
+                                        { name: 'ALL', title: 'All' },
+                                        { name: 'HARD', title: 'HARD' },
+                                        { name: 'EXPERT', title: 'EXPERT' },
+                                        { name: 'MASTER', title: 'MASTER' },
+                                        { name: 'APPEND', title: 'APPEND' },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
                 },
                 rooms: {
                     items: [],
