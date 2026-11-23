@@ -2,6 +2,7 @@ import {
     SERVER_DESCRIPTION,
     SERVER_TITLE,
     STAFF_CHAT_HANDLES,
+    STAFF_CHAT_SHORTCUTS,
     STAFF_CHAT_URL,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
@@ -40,6 +41,9 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         handle &&
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
+
+const externalChatDescription = () =>
+    `External chat:\n${STAFF_CHAT_URL}\n\nShortcuts: ${STAFF_CHAT_SHORTCUTS.join(' · ')}`
 
 async function verifySigned(
     req: Request,
@@ -729,24 +733,10 @@ export default {
                 }
 
                 return json({
+                    description: externalChatDescription(),
                     creates: [],
                     searches: [],
-                    sections: [
-                        {
-                            title: 'External Chat',
-                            itemType: 'post',
-                            items: [
-                                {
-                                    name: 'open-external-chat',
-                                    version: 1 as const,
-                                    title: STAFF_CHAT_URL,
-                                    time: Date.now(),
-                                    author: 'Chat Link',
-                                    tags: [],
-                                },
-                            ],
-                        },
-                    ],
+                    sections: [],
                 })
             }
 
@@ -779,17 +769,9 @@ export default {
                 }
 
                 return json({
+                    description: externalChatDescription(),
                     pageCount: 1,
-                    items: [
-                        {
-                            name: 'open-external-chat',
-                            version: 1 as const,
-                            title: STAFF_CHAT_URL,
-                            time: Date.now(),
-                            author: 'Chat Link',
-                            tags: [],
-                        },
-                    ],
+                    items: [],
                     searches: [],
                 })
             }
@@ -999,29 +981,6 @@ export default {
         const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
 
         if (postPath && req.method === 'GET') {
-            if (postPath[1] === 'open-external-chat') {
-                const session = await sessionOf(req, env)
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return new Response(null, { status: 404 })
-                }
-
-                return json({
-                    item: {
-                        name: 'open-external-chat',
-                        version: 1 as const,
-                        title: 'External Chat',
-                        time: Date.now(),
-                        author: 'XX!',
-                        tags: [],
-                    },
-                    description: STAFF_CHAT_URL,
-                    actions: [],
-                    hasCommunity: false,
-                    leaderboards: [],
-                    sections: [],
-                })
-            }
-
             const post = await lobby(env).getPost(postPath[1]!)
             if (!post) return new Response(null, { status: 404 })
 
