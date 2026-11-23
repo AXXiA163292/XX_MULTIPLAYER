@@ -710,12 +710,16 @@ function renderStaffChatHtml(
   .row.me .msg{background:#1d2b45;border-color:#3b82f6}
   .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
   .meta-actions{display:flex;align-items:center;gap:6px}
+  .copy-btn{background:transparent;color:#cbd5e1;border:1px solid rgba(203,213,225,.28);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .copy-btn:hover{background:rgba(203,213,225,.14)}
   .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .reply-btn:hover{background:rgba(59,130,246,.18)}
   .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
   .del-btn:hover{background:rgba(248,113,113,.15)}
   .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+  .msg-link{color:#60a5fa;text-decoration:underline;word-break:break-all}
+  .msg-link:hover{color:#93c5fd}
   .msg-footer{margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:6px}
   .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 6px;color:#fda4af}
   .like-avatars{display:inline-flex;align-items:center;gap:3px}
@@ -897,7 +901,7 @@ function renderStaffChatHtml(
         name: displayNameFor(saved, defaultsMap[saved].name),
       };
     }
-    return null;
+    return null
   }
 
   function authHeaders(extra = {}) {
@@ -969,6 +973,63 @@ function renderStaffChatHtml(
     }[ch] ?? ch));
   }
 
+  function formatMessageTextHtml(rawText) {
+    const text = String(rawText ?? '');
+    const urlRegex = /https?:\/\/[^\s<]+/g;
+    let lastIndex = 0;
+    let out = '';
+    let match;
+
+    while ((match = urlRegex.exec(text)) !== null) {
+      const start = match.index;
+      const rawMatch = match[0];
+      const cleanUrl = rawMatch.replace(/[.,!?;:)\]]+$/, '');
+      const trailing = rawMatch.slice(cleanUrl.length);
+
+      out += escapeHtml(text.slice(lastIndex, start));
+
+      if (cleanUrl) {
+        out += '<a class="msg-link" href="' + escapeAttr(cleanUrl) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(cleanUrl) + '</a>';
+      } else {
+        out += escapeHtml(rawMatch);
+      }
+
+      if (trailing) {
+        out += escapeHtml(trailing);
+      }
+
+      lastIndex = start + rawMatch.length;
+    }
+
+    out += escapeHtml(text.slice(lastIndex));
+    return out;
+  }
+
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {}
+    }
+
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
   function formatTag(author, handle) {
     const h = String(handle || '').trim();
     const a = displayNameFor(h, author);
@@ -993,6 +1054,7 @@ function renderStaffChatHtml(
       const replyHtml = m.replyTo
         ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.author || m.replyTo.handle || '') + ': ' + escapeHtml(m.replyTo.text || '') + '</div>'
         : '';
+      const copyHtml = '<button type="button" class="copy-btn" data-copy-id="' + escapeHtml(m.id) + '">Copy</button>';
       const delHtml = canDelete
         ? '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>'
         : '';
@@ -1010,11 +1072,12 @@ function renderStaffChatHtml(
         '<div class="msg" data-msg-id="' + escapeHtml(m.id) + '">' +
           '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
+            copyHtml +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
             delHtml +
           '</span></div>' +
           replyHtml +
-          '<div class="text">' + escapeHtml(m.text) + '</div>' +
+          '<div class="text">' + formatMessageTextHtml(m.text) + '</div>' +
           (likeBadgeHtml ? '<div class="msg-footer">' + likeBadgeHtml + '</div>' : '') +
         '</div>' +
       '</div>';
@@ -1268,6 +1331,7 @@ function renderStaffChatHtml(
   });
 
   box.addEventListener('dblclick', async (e) => {
+    if (e.target.closest('a.msg-link')) return;
     const msgEl = e.target.closest('[data-msg-id]');
     if (!msgEl) return;
     const id = msgEl.getAttribute('data-msg-id');
@@ -1275,6 +1339,27 @@ function renderStaffChatHtml(
   });
 
   box.addEventListener('click', async (e) => {
+    const linkEl = e.target.closest('a.msg-link');
+    if (linkEl) {
+      e.stopPropagation();
+      return;
+    }
+
+    const copyBtn = e.target.closest('[data-copy-id]');
+    if (copyBtn) {
+      const id = copyBtn.getAttribute('data-copy-id');
+      const target = currentMessages.find((m) => m.id === id);
+      if (target) {
+        const ok = await copyTextToClipboard(target.text || '');
+        const prevLabel = copyBtn.textContent;
+        copyBtn.textContent = ok ? 'Copied' : 'Failed';
+        setTimeout(() => {
+          copyBtn.textContent = prevLabel || 'Copy';
+        }, 1200);
+      }
+      return;
+    }
+
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
       const id = replyBtn.getAttribute('data-reply-id');
