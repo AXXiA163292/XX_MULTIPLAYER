@@ -2,7 +2,6 @@ import {
     SERVER_DESCRIPTION,
     SERVER_TITLE,
     STAFF_CHAT_HANDLES,
-    STAFF_CHAT_SHORTCUTS,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import {
@@ -22,6 +21,7 @@ export { Lobby } from './lobby.ts'
 
 const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
 const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
+const CHAT_HANDLE_COOKIE = 'xx_chat_handle'
 
 const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = {
     '163292': { handle: '163292', name: 'AXX!A' },
@@ -78,6 +78,19 @@ function formatAuthorTag(author: string | undefined, handle: string | undefined)
     const cleanAuthor = String(author ?? '').trim() || cleanHandle
     if (!cleanHandle) return cleanAuthor
     return `${cleanAuthor}#${cleanHandle}`
+}
+
+function parseCookie(req: Request, name: string): string | null {
+    const cookieHeader = req.headers.get('Cookie') ?? ''
+    for (const part of cookieHeader.split(';')) {
+        const idx = part.indexOf('=')
+        if (idx === -1) continue
+        const key = part.slice(0, idx).trim()
+        if (key === name) {
+            return decodeURIComponent(part.slice(idx + 1).trim())
+        }
+    }
+    return null
 }
 
 async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs> {
@@ -233,6 +246,7 @@ async function resolveChatUser(
         url.searchParams.get('handle') ??
         req.headers.get('X-Chat-Handle') ??
         body?.handle ??
+        parseCookie(req, CHAT_HANDLE_COOKIE) ??
         null
 
     const picked = pickedProfile(pickedHandle)
@@ -283,38 +297,40 @@ const POST_LABELS: Record<PostCategory, {
     },
 }
 
-const POST_SEARCHES = [
-    {
-        type: 'search',
-        title: 'Search',
-        icon: 'search',
-        requireConfirmation: false,
-        options: [
-            {
-                query: 'category',
-                name: 'Category',
-                required: false,
-                type: 'select',
-                def: 'posts',
-                values: [
-                    { name: 'announcements', title: 'Announcements' },
-                    { name: 'posts', title: 'Posts' },
-                    { name: 'results', title: 'Results' },
-                ],
-            },
-            {
-                query: 'keywords',
-                name: 'Keywords',
-                required: false,
-                type: 'text',
-                def: '',
-                placeholder: 'Search title, body, or author...',
-                limit: 100,
-                shortcuts: [],
-            },
-        ],
-    },
-]
+function makePostSearches(defaultCategory: PostCategory) {
+    return [
+        {
+            type: 'search',
+            title: 'Search',
+            icon: 'search',
+            requireConfirmation: false,
+            options: [
+                {
+                    query: 'category',
+                    name: 'Category',
+                    required: false,
+                    type: 'select',
+                    def: defaultCategory,
+                    values: [
+                        { name: 'announcements', title: 'Announcements' },
+                        { name: 'posts', title: 'Posts' },
+                        { name: 'results', title: 'Results' },
+                    ],
+                },
+                {
+                    query: 'keywords',
+                    name: 'Keywords',
+                    required: false,
+                    type: 'text',
+                    def: '',
+                    placeholder: 'Search title, body, or author...',
+                    limit: 100,
+                    shortcuts: [],
+                },
+            ],
+        },
+    ]
+}
 
 function parseCategoryString(raw: string | null | undefined): PostCategory | null {
     if (!raw) return null
@@ -344,6 +360,7 @@ function resolveCategory(
     const bodyValueParams = parseEncodedParams(body?.values)
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
+    // Prioritize explicit category / infoType before generic type so "post" doesn't override them.
     const candidates: (string | null | undefined)[] = [
         urlSearchParams?.get('category'),
         bodySearchParams?.get('category'),
@@ -351,20 +368,20 @@ function resolveCategory(
         values?.get('category'),
         bodyValueParams?.get('category'),
         body?.category,
-        urlSearchParams?.get('type'),
         urlSearchParams?.get('infoType'),
-        bodySearchParams?.get('type'),
         bodySearchParams?.get('infoType'),
-        url.searchParams.get('type'),
         url.searchParams.get('infoType'),
-        url.searchParams.get('postType'),
-        values?.get('type'),
         values?.get('infoType'),
-        bodyValueParams?.get('type'),
         bodyValueParams?.get('infoType'),
-        body?.type,
         body?.infoType,
+        url.searchParams.get('postType'),
         body?.postType,
+        urlSearchParams?.get('type'),
+        bodySearchParams?.get('type'),
+        url.searchParams.get('type'),
+        values?.get('type'),
+        bodyValueParams?.get('type'),
+        body?.type,
     ]
 
     for (const c of candidates) {
@@ -380,11 +397,11 @@ function resolveCategory(
             const refCandidates: (string | null | undefined)[] = [
                 refSearchParams?.get('category'),
                 refUrl.searchParams.get('category'),
-                refSearchParams?.get('type'),
                 refSearchParams?.get('infoType'),
-                refUrl.searchParams.get('type'),
                 refUrl.searchParams.get('infoType'),
                 refUrl.searchParams.get('postType'),
+                refSearchParams?.get('type'),
+                refUrl.searchParams.get('type'),
             ]
             for (const c of refCandidates) {
                 const parsed = parseCategoryString(c)
@@ -468,7 +485,7 @@ const chatActionForm = {
             def: '',
             placeholder: 'Write a message...',
             limit: 500,
-            shortcuts: [...STAFF_CHAT_SHORTCUTS],
+            shortcuts: [],
         },
     ],
 }
@@ -581,21 +598,26 @@ function externalChatUrl(req: Request, env: Env, url: URL): string {
 
 function rawPostCategory(url: URL, req?: Request): string | null {
     const searchParams = parseEncodedParams(url.searchParams.get('searchValues'))
-    const fromSearch =
-        searchParams?.get('category') ??
-        searchParams?.get('type') ??
-        searchParams?.get('infoType')
 
-    if (fromSearch) {
-        return String(fromSearch).trim().toLowerCase()
+    // Check category and infoType before generic type so chat/announcements/results aren't misread as posts.
+    const fromCategory =
+        searchParams?.get('category') ??
+        url.searchParams.get('category')
+    if (fromCategory) {
+        return String(fromCategory).trim().toLowerCase()
+    }
+
+    const fromInfoType =
+        searchParams?.get('infoType') ??
+        url.searchParams.get('infoType')
+    if (fromInfoType) {
+        return String(fromInfoType).trim().toLowerCase()
     }
 
     const fromDirect =
-        url.searchParams.get('category') ??
-        url.searchParams.get('type') ??
-        url.searchParams.get('infoType') ??
-        url.searchParams.get('postType')
-
+        url.searchParams.get('postType') ??
+        searchParams?.get('type') ??
+        url.searchParams.get('type')
     if (fromDirect) {
         return String(fromDirect).trim().toLowerCase()
     }
@@ -607,12 +629,12 @@ function rawPostCategory(url: URL, req?: Request): string | null {
             const refSearch = parseEncodedParams(refUrl.searchParams.get('searchValues'))
             const fromRef =
                 refSearch?.get('category') ??
-                refSearch?.get('type') ??
-                refSearch?.get('infoType') ??
                 refUrl.searchParams.get('category') ??
-                refUrl.searchParams.get('type') ??
+                refSearch?.get('infoType') ??
                 refUrl.searchParams.get('infoType') ??
-                refUrl.searchParams.get('postType')
+                refUrl.searchParams.get('postType') ??
+                refSearch?.get('type') ??
+                refUrl.searchParams.get('type')
             if (fromRef) return String(fromRef).trim().toLowerCase()
         } catch {
             // ignore invalid referer
@@ -644,11 +666,6 @@ function renderStaffChatHtml(
     fromSonolus: boolean,
     prefsMap: Record<string, UserChatPrefs>,
 ): string {
-    const shortcutsHtml = STAFF_CHAT_SHORTCUTS.map(
-        (tag) =>
-            `<button type="button" class="chip" data-shortcut="${escapeAttr(tag)}">${escapeAttr(tag)}</button>`,
-    ).join('')
-
     const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
         const pref = prefsMap[handle]
         const name = pref?.displayName || DEFAULT_CHAT_PROFILES[handle]?.name || handle
@@ -664,11 +681,17 @@ function renderStaffChatHtml(
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<meta name="theme-color" content="#0d0f14"/>
+<link rel="manifest" href="/manifest.webmanifest"/>
+<link rel="icon" type="image/png" href="/app-icon.png"/>
+<link rel="apple-touch-icon" href="/app-icon.png"/>
 <title>${escapeAttr(SERVER_TITLE)} · Chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
   header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .header-brand{display:flex;align-items:center;gap:8px}
+  .app-logo{width:24px;height:24px;border-radius:6px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
   .header-right{display:flex;align-items:center;gap:8px}
   .badge{font-size:12px;color:#9ca3af;font-weight:500}
   .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}
@@ -721,7 +744,10 @@ function renderStaffChatHtml(
 </head>
 <body>
   <header>
-    <span>${escapeAttr(SERVER_TITLE)} · Chat</span>
+    <div class="header-brand">
+      <img class="app-logo" src="/app-icon.png" alt="XX!"/>
+      <span>${escapeAttr(SERVER_TITLE)} · Chat</span>
+    </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
       <button id="settingsBtn" type="button" class="btn-sm" style="display:none">Settings</button>
@@ -739,7 +765,7 @@ function renderStaffChatHtml(
         <span id="replyText"></span>
         <button id="cancelReplyBtn" type="button" class="btn-sm">Cancel</button>
       </div>
-      <div id="shortcutsBar" class="shortcuts">${shortcutsHtml}</div>
+      <div id="shortcutsBar" class="shortcuts"></div>
       <form id="chatForm">
         <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
         <button type="submit">Send</button>
@@ -772,6 +798,8 @@ function renderStaffChatHtml(
   </div>
 <script>
   const STORAGE_KEY = 'xx_chat_handle';
+  const COOKIE_NAME = ${JSON.stringify(CHAT_HANDLE_COOKIE)};
+  const knownHandles = ${JSON.stringify([...CHAT_PFP_HANDLES])};
   const sonolusUser = ${JSON.stringify(fromSonolus && user ? user : null)};
   const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
   const prefsMap = ${JSON.stringify(prefsMap)};
@@ -800,6 +828,35 @@ function renderStaffChatHtml(
   let activeReply = null;
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
 
+  function readSavedHandle() {
+    try {
+      const ls = (localStorage.getItem(STORAGE_KEY) || '').trim();
+      if (ls && defaultsMap[ls]) return ls;
+    } catch {}
+    const parts = document.cookie.split(';');
+    for (const p of parts) {
+      const eq = p.indexOf('=');
+      if (eq === -1) continue;
+      if (p.slice(0, eq).trim() === COOKIE_NAME) {
+        const val = decodeURIComponent(p.slice(eq + 1).trim());
+        if (val && defaultsMap[val]) return val;
+      }
+    }
+    return '';
+  }
+
+  function persistHandle(handle) {
+    try {
+      if (handle) localStorage.setItem(STORAGE_KEY, handle);
+      else localStorage.removeItem(STORAGE_KEY);
+    } catch {}
+    if (handle) {
+      document.cookie = COOKIE_NAME + '=' + encodeURIComponent(handle) + ';path=/;max-age=31536000;SameSite=Lax';
+    } else {
+      document.cookie = COOKIE_NAME + '=;path=/;max-age=0;SameSite=Lax';
+    }
+  }
+
   function pfpUrlFor(handle) {
     const h = String(handle || '').trim();
     const ver = prefsMap[h]?.updatedAt || 0;
@@ -815,7 +872,7 @@ function renderStaffChatHtml(
     if (sonolusUser) {
       return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
     }
-    const saved = (localStorage.getItem(STORAGE_KEY) || '').trim();
+    const saved = readSavedHandle();
     if (saved && defaultsMap[saved]) {
       return {
         id: saved,
@@ -850,26 +907,19 @@ function renderStaffChatHtml(
     input.setSelectionRange(nextPos, nextPos);
   }
 
-  function renderMentionShortcut() {
-    const active = getActiveUser();
-    const existing = shortcutsBar.querySelector('[data-mention]');
-    if (existing) existing.remove();
-    if (!active) return;
-    const mentionBtn = document.createElement('button');
-    mentionBtn.type = 'button';
-    mentionBtn.className = 'chip';
-    mentionBtn.setAttribute('data-mention', '@' + active.name);
-    mentionBtn.textContent = '@' + active.name;
-    mentionBtn.addEventListener('click', () => insertTextAtCursor('@' + active.name));
-    shortcutsBar.prepend(mentionBtn);
-  }
-
-  document.querySelectorAll('.chip[data-shortcut]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const tag = btn.getAttribute('data-shortcut') || '';
-      if (tag) insertTextAtCursor(tag);
+  function renderKnownUserChips() {
+    shortcutsBar.innerHTML = knownHandles.map((h) => {
+      const label = '@' + displayNameFor(h, defaultsMap[h]?.name || h);
+      return '<button type="button" class="chip" data-mention-handle="' + escapeAttr(h) + '">' + escapeHtml(label) + '</button>';
+    }).join('');
+    shortcutsBar.querySelectorAll('[data-mention-handle]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const h = btn.getAttribute('data-mention-handle') || '';
+        const mention = '@' + displayNameFor(h, defaultsMap[h]?.name || h);
+        if (mention.length > 1) insertTextAtCursor(mention);
+      });
     });
-  });
+  }
 
   function setReplyTarget(msg) {
     activeReply = msg ? {
@@ -941,7 +991,7 @@ function renderStaffChatHtml(
       const data = await res.json();
       if (data.prefs) {
         Object.assign(prefsMap, data.prefs);
-        renderMentionShortcut();
+        renderKnownUserChips();
       }
       render(data.messages || []);
     }
@@ -963,7 +1013,7 @@ function renderStaffChatHtml(
     switchBtn.style.display = sonolusUser ? 'none' : 'inline-block';
     pickerEl.classList.remove('open');
     chatViewEl.classList.add('open');
-    renderMentionShortcut();
+    renderKnownUserChips();
     loadMessages();
   }
 
@@ -1034,7 +1084,7 @@ function renderStaffChatHtml(
 
   async function buildCroppedSquareDataUrl() {
     if (!cropState.loaded) return null;
-    const outSize = 256;
+    const outSize = 512;
     const boxSize = 180;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
@@ -1092,13 +1142,13 @@ function renderStaffChatHtml(
     card.addEventListener('click', () => {
       const picked = card.getAttribute('data-pick-handle') || '';
       if (!defaultsMap[picked]) return;
-      localStorage.setItem(STORAGE_KEY, picked);
+      persistHandle(picked);
       syncMode();
     });
   });
 
   switchBtn.addEventListener('click', () => {
-    localStorage.removeItem(STORAGE_KEY);
+    persistHandle('');
     setReplyTarget(null);
     syncMode();
   });
@@ -1146,6 +1196,10 @@ function renderStaffChatHtml(
       render(data.messages || []);
     }
   });
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+  }
 
   syncMode();
   setInterval(loadMessages, 3500);
@@ -1633,6 +1687,93 @@ export default {
             })
         }
 
+        if (path === '/manifest.webmanifest' && req.method === 'GET') {
+            return new Response(JSON.stringify({
+                name: `${SERVER_TITLE} Chat`,
+                short_name: 'XX! Chat',
+                start_url: '/chat',
+                scope: '/',
+                display: 'standalone',
+                background_color: '#0d0f14',
+                theme_color: '#0d0f14',
+                icons: [
+                    {
+                        src: '/app-icon.png',
+                        sizes: '192x192',
+                        type: 'image/png',
+                        purpose: 'any maskable',
+                    },
+                    {
+                        src: '/app-icon.png',
+                        sizes: '512x512',
+                        type: 'image/png',
+                        purpose: 'any maskable',
+                    },
+                ],
+            }), {
+                headers: {
+                    'Content-Type': 'application/manifest+json; charset=utf-8',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
+        if (path === '/sw.js' && req.method === 'GET') {
+            const swCode = `
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+});
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+  const u = new URL(req.url);
+  if (u.pathname === '/app-icon.png' || u.pathname.startsWith('/api/chat/pfp/')) {
+    event.respondWith(
+      caches.open('xx-chat-media-v1').then(async (cache) => {
+        const cached = await cache.match(req);
+        if (cached) return cached;
+        const fresh = await fetch(req);
+        if (fresh.ok) cache.put(req, fresh.clone());
+        return fresh;
+      })
+    );
+  }
+});
+`
+            return new Response(swCode.trim(), {
+                headers: {
+                    'Content-Type': 'application/javascript; charset=utf-8',
+                    'Service-Worker-Allowed': '/',
+                    'Cache-Control': 'no-store',
+                },
+            })
+        }
+
+        if (path === '/app-icon.png' && req.method === 'GET') {
+            if (!env.COMMUNITY_BUCKET) {
+                return new Response(null, { status: 404 })
+            }
+
+            const keys = ['chat/XX!.png', 'chat/pfp/163292.png', 'chat/163292.png']
+            for (const key of keys) {
+                const obj = await env.COMMUNITY_BUCKET.get(key).catch(() => null)
+                if (obj) {
+                    return new Response(obj.body, {
+                        headers: {
+                            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                            'Access-Control-Allow-Origin': '*',
+                            'Cache-Control': 'public, max-age=3600',
+                        },
+                    })
+                }
+            }
+
+            return new Response(null, { status: 404 })
+        }
+
         if (path === '/refresh' || path === '/admin/refresh') {
             const session = await sessionOf(req, env, url)
             const authHeader = req.headers.get('Authorization') ?? ''
@@ -1999,12 +2140,14 @@ export default {
                 }),
             )
 
+            const activeCategory: PostCategory = explicit ?? 'posts'
+
             return json({
                 title: explicit ? POST_LABELS[explicit].section : 'Posts',
                 creates: canManagePosts(session) && explicit
                     ? [postForm(explicit)]
                     : [],
-                searches: POST_SEARCHES,
+                searches: makePostSearches(activeCategory),
                 sections,
             })
         }
@@ -2062,7 +2205,7 @@ export default {
                 title: POST_LABELS[kind].section,
                 pageCount,
                 items: slice.map(buildPostItemWithBadges),
-                searches: POST_SEARCHES,
+                searches: makePostSearches(kind),
             })
         }
 
