@@ -55,6 +55,7 @@ export interface Env {
     LOBBY: DurableObjectNamespace<Lobby>
     ROOM: DurableObjectNamespace<Room>
     POSTS_BUCKET: R2Bucket
+    COMMUNITY_BUCKET: R2Bucket
     SESSION_SECRET: string
     PUBLIC_ADDRESS?: string
     DEV_SKIP_SIGNATURE?: string
