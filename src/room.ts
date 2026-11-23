@@ -205,6 +205,7 @@ function sanitizeWireResult(result: GameplayResult): GameplayResult {
 
     return {
         grade: wireGrade,
+        ...(result.disqualified ? { disqualified: true } : {}),
         arcadeScore: Number(result.arcadeScore) || 0,
         accuracyScore: Number(result.accuracyScore) || 0,
         combo: Number(result.combo) || 0,
@@ -626,7 +627,6 @@ export class Room extends DurableObject<Env> {
 
             if (this.st.status === 'playing' && !this.st.round) {
                 this.st.status = 'selecting'
-                this.st.results = {}
                 for (const member of this.st.members) {
                     this.st.statuses[member.id] = 'waiting'
                 }
@@ -838,7 +838,9 @@ export class Room extends DurableObject<Env> {
         this.st.level = firstPoolChart
             ? { address: firstPoolChart.address, name: firstPoolChart.name }
             : null
-        this.st.levelInfo = null
+        this.st.levelInfo = this.st.level
+            ? await fetchLevelInfo(this.st.level)
+            : null
         this.st.levelOptions = []
         this.st.round = null
         this.st.results = {}
@@ -1200,10 +1202,17 @@ export class Room extends DurableObject<Env> {
                 return
             }
 
-            case 'updateStatus':
+            case 'updateStatus': {
+                this.diag('updateStatus-command', {
+                    userId: uid,
+                    requested: cmd.status,
+                    current: state.status,
+                    isHost,
+                })
                 return isHost
                     ? this.changeStatus(uid, cmd.status)
                     : this.resync(uid)
+            }
 
             case 'removeUser': {
                 if (
@@ -1556,7 +1565,7 @@ export class Room extends DurableObject<Env> {
                 }
 
                 state.level = { address: pick.address, name: pick.name }
-                state.levelInfo = null
+                state.levelInfo = await fetchLevelInfo(state.level)
                 state.levelOptions = []
 
                 this.sendAll({ type: 'updateLevel', level: state.level })
@@ -1571,14 +1580,6 @@ export class Room extends DurableObject<Env> {
         }
 
         if (current === 'selecting' && next === 'preparing' && state.level) {
-            if (!state.levelInfo) {
-                state.levelInfo = await fetchLevelInfo(state.level)
-            }
-
-            if (state.status !== 'selecting' || !state.level) {
-                return this.resync(uid)
-            }
-
             state.status = 'preparing'
             waitAll()
 
@@ -1664,7 +1665,6 @@ export class Room extends DurableObject<Env> {
                 state.history.push(this.makeRoundRecord(state.history))
             }
 
-            state.results = {}
             state.round = null
             state.status = 'selecting'
             waitAll()
@@ -1842,7 +1842,6 @@ export class Room extends DurableObject<Env> {
         const activeMembers = state.members.filter(
             (member) => this.socketsOf(member.id).length > 0,
         )
-        const activeIds = new Set(activeMembers.map((member) => member.id))
         const canEditLevelOptions = state.settings.type === 'casualRoom' && state.status === 'selecting'
 
         return {
@@ -1875,7 +1874,7 @@ export class Room extends DurableObject<Env> {
             scoreboardDescription: '',
             scoreboardSections: this.canSee(uid) ? this.sections() : [],
             results: Object.entries(state.results)
-                .filter(([id]) => activeIds.has(id) && (this.canSee(uid) || id === uid))
+                .filter(([id]) => this.canSee(uid) || id === uid)
                 .map(([userId, result]) => ({
                     userId,
                     result: sanitizeWireResult(result),
@@ -2008,7 +2007,6 @@ export class Room extends DurableObject<Env> {
                     : label
 
                 const scores = Object.entries(round.results)
-                    .filter(([id]) => present.has(id))
                     .sort(([, a], [, b]) => compareResults(a, b, mode, round))
                     .map(([userId, result]) => ({
                         userId,
@@ -2124,7 +2122,7 @@ export class Room extends DurableObject<Env> {
         if (retain) {
             if (
                 state.status === 'playing' &&
-                state.statuses[uid] === 'playing' &&
+                (state.statuses[uid] === 'playing' || state.statuses[uid] === 'ready') &&
                 !state.results[uid]
             ) {
                 const result: GameplayResult = {
