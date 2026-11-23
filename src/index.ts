@@ -2,7 +2,7 @@ import {
     SERVER_DESCRIPTION,
     SERVER_TITLE,
     STAFF_CHAT_HANDLES,
-    STAFF_CHAT_SHORTCUTS,
+    STAFF_CHAT_URL,
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import {
@@ -100,63 +100,6 @@ const roomStub = (env: Env, name: string) =>
 
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
-
-function staffChatCreateForm() {
-    return {
-        type: 'staffChatMessage',
-        title: 'Send Message',
-        requireConfirmation: false,
-        options: [
-            {
-                query: 'mention',
-                name: 'Mention',
-                required: false,
-                type: 'select',
-                def: '',
-                values: [
-                    { name: '', title: 'None' },
-                    ...STAFF_CHAT_SHORTCUTS.map((tag) => ({
-                        name: tag,
-                        title: tag,
-                    })),
-                ],
-            },
-            {
-                query: 'text',
-                name: 'Message',
-                required: true,
-                type: 'text',
-                def: '',
-                placeholder: 'Type a message...',
-                limit: 400,
-                shortcuts: [...STAFF_CHAT_SHORTCUTS],
-            },
-        ],
-    }
-}
-
-async function buildStaffChatPostItems(env: Env, handle: string, markRead = false) {
-    const mainLobby = lobby(env)
-    const messages = await mainLobby.listChatMessages().catch(() => [])
-    if (markRead) {
-        await mainLobby.markChatRead(handle).catch(() => {})
-    }
-
-    return [...messages].reverse().map((m, idx) => {
-        const timeStr = new Date(m.time).toLocaleTimeString([], {
-            hour: '2-digit',
-            minute: '2-digit',
-        })
-        return {
-            name: `chat-${m.id || idx}`,
-            version: 1 as const,
-            title: `${m.author || m.handle} (${m.handle}) · ${timeStr}`,
-            time: m.time,
-            author: m.text,
-            tags: [{ title: m.handle }],
-        }
-    })
-}
 
 async function roomItems(env: Env, _session: AuthSession | null) {
     const rooms = await lobby(env).list()
@@ -662,13 +605,6 @@ export default {
             const session = await sessionOf(req, env)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            let unread = 0
-            if (canChat) {
-                unread = await lobby(env)
-                    .getChatUnreadCount(session!.user.handle)
-                    .catch(() => 0)
-            }
-
             const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
             let banner: { hash: string; url: string } | undefined
 
@@ -715,7 +651,7 @@ export default {
                         ? [
                             {
                                 type: 'post',
-                                title: unread > 0 ? `Chat (${unread})` : 'Chat',
+                                title: 'Chat',
                                 icon: 'message',
                                 infoType: 'staff-chat',
                             },
@@ -771,16 +707,34 @@ export default {
                     return message(403, 'Staff chat is restricted.')
                 }
 
-                const items = await buildStaffChatPostItems(env, session.user.handle, true)
+                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const recent = [...messages].reverse().slice(0, 25)
 
                 return json({
-                    creates: [staffChatCreateForm()],
+                    creates: [],
                     searches: [],
                     sections: [
                         {
-                            title: 'Staff Chat',
+                            title: 'External Chat',
                             itemType: 'post',
-                            items,
+                            items: [
+                                {
+                                    name: 'open-external-chat',
+                                    version: 1 as const,
+                                    title: `Open Chat (${STAFF_CHAT_URL})`,
+                                    time: Date.now(),
+                                    author: 'External Chat Link',
+                                    tags: [],
+                                },
+                                ...recent.map((m) => ({
+                                    name: `msg-${m.id}`,
+                                    version: 1 as const,
+                                    title: `${m.author} (${m.handle})`,
+                                    time: m.time,
+                                    author: m.text,
+                                    tags: [{ title: m.handle }],
+                                })),
+                            ],
                         },
                     ],
                 })
@@ -814,10 +768,17 @@ export default {
                     return json({ pageCount: 1, items: [], searches: [] })
                 }
 
-                const items = await buildStaffChatPostItems(env, session.user.handle, true)
+                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({
                     pageCount: 1,
-                    items,
+                    items: [...messages].reverse().slice(0, 25).map((m) => ({
+                        name: `msg-${m.id}`,
+                        version: 1 as const,
+                        title: `${m.author} (${m.handle})`,
+                        time: m.time,
+                        author: m.text,
+                        tags: [{ title: m.handle }],
+                    })),
                     searches: [],
                 })
             }
@@ -835,6 +796,10 @@ export default {
             const session = await sessionOf(req, env)
             if (!session) return new Response(null, { status: 401 })
 
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can publish posts.')
+            }
+
             let body: any
             try {
                 body = await req.json()
@@ -843,37 +808,6 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-
-            if (rawPostCategory(url) === 'staff-chat' || values.get('type') === 'staffChatMessage') {
-                if (!isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted.')
-                }
-
-                const mention = (values.get('mention') ?? '').trim()
-                const rawText = (values.get('text') ?? '').trim()
-                const text = [mention, rawText].filter(Boolean).join(' ').trim()
-
-                if (!text) {
-                    return message(400, 'Message cannot be empty.')
-                }
-
-                await lobby(env).addChatMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text,
-                })
-
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateInfo: true,
-                })
-            }
-
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can publish posts.')
-            }
-
             const category = postCategory(url)
             const title = (values.get('title') ?? '').trim()
             const description = (values.get('description') ?? '').trim()
@@ -1054,23 +988,46 @@ export default {
         const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
 
         if (postPath && req.method === 'GET') {
-            if (postPath[1]!.startsWith('chat-')) {
+            if (postPath[1] === 'open-external-chat') {
+                const session = await sessionOf(req, env)
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return new Response(null, { status: 404 })
+                }
+
+                return json({
+                    item: {
+                        name: 'open-external-chat',
+                        version: 1 as const,
+                        title: 'External Chat',
+                        time: Date.now(),
+                        author: 'XX!',
+                        tags: [],
+                    },
+                    description: `Open external chat:\n${STAFF_CHAT_URL}`,
+                    actions: [],
+                    hasCommunity: false,
+                    leaderboards: [],
+                    sections: [],
+                })
+            }
+
+            if (postPath[1]!.startsWith('msg-')) {
                 const session = await sessionOf(req, env)
                 if (!session || !isStaffChatHandle(session.user.handle)) {
                     return new Response(null, { status: 404 })
                 }
 
                 const messages = await lobby(env).listChatMessages().catch(() => [])
-                const target = messages.find((m) => `chat-${m.id}` === postPath[1])
+                const target = messages.find((m) => `msg-${m.id}` === postPath[1])
                 if (!target) return new Response(null, { status: 404 })
 
                 return json({
                     item: {
-                        name: `chat-${target.id}`,
+                        name: `msg-${target.id}`,
                         version: 1 as const,
-                        title: `${target.author || target.handle} (${target.handle})`,
+                        title: `${target.author} (${target.handle})`,
                         time: target.time,
-                        author: target.author || target.handle,
+                        author: target.author,
                         tags: [{ title: target.handle }],
                     },
                     description: target.text,
