@@ -109,18 +109,15 @@ function buildRoomUser(user: SonolusUser, request: Request): RoomUser {
 }
 
 function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: string) {
-    const chatUrl = sessionToken
-        ? `${origin}/chat?session=${encodeURIComponent(sessionToken)}`
-        : `${origin}/chat`
-
+    const chatQuery = sessionToken ? `?session=${encodeURIComponent(sessionToken)}` : ''
     return {
         name: 'staff-chat',
         version: 1,
         title: unread > 0 ? `🔴 Chat (${unread})` : 'Chat',
-        time: Date.now(),
+        subtitle: '@Bell · @Noct · @Ʌstra',
         author: SERVER_TITLE,
         tags: [{ title: 'Chat' }],
-        url: chatUrl,
+        url: `${origin}/chat${chatQuery}`,
     }
 }
 
@@ -508,7 +505,6 @@ export default {
                                     min: 0,
                                     max: 50,
                                     step: 0.1,
-                                    unit: '',
                                 },
                                 {
                                     query: 'maxRating',
@@ -519,7 +515,6 @@ export default {
                                     min: 0,
                                     max: 50,
                                     step: 0.1,
-                                    unit: '',
                                 },
                             ],
                         },
