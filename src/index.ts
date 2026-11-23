@@ -114,6 +114,25 @@ const roomStub = (env: Env, name: string) =>
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
+const sendChatCommentForm = {
+    type: 'sendChatComment',
+    title: 'Send comment',
+    icon: 'comment',
+    requireConfirmation: false,
+    options: [
+        {
+            query: 'text',
+            name: 'Comment',
+            required: true,
+            type: 'textArea',
+            def: '',
+            placeholder: 'Write a message...',
+            limit: 500,
+            shortcuts: [...STAFF_CHAT_SHORTCUTS],
+        },
+    ],
+}
+
 function buildStaffChatPostItem(latestMessage?: { text?: string } | null) {
     const newestText = latestMessage?.text?.trim() || 'No messages yet.'
 
@@ -125,15 +144,6 @@ function buildStaffChatPostItem(latestMessage?: { text?: string } | null) {
         time: 0,
         author: SERVER_TITLE,
         tags: [],
-        hasCommunity: true,
-        actions: [
-            {
-                type: 'chat',
-                title: 'Chat',
-                requireConfirmation: false,
-                options: [],
-            },
-        ],
     }
 }
 
@@ -800,14 +810,8 @@ export default {
         }
 
         if (path === '/sonolus/info' && req.method === 'GET') {
-            const rawSession = req.headers.get('Sonolus-Session') ?? ''
-            const session = rawSession
-                ? await verifyToken<AuthSession>(env.SESSION_SECRET, rawSession)
-                : null
+            const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
-            const chatUrl = canChat
-                ? `${addressOf(req, env)}/chat?session=${encodeURIComponent(rawSession)}`
-                : ''
 
             const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
             let banner: { hash: string; url: string } | undefined
@@ -828,9 +832,7 @@ export default {
 
             return json({
                 title: SERVER_TITLE,
-                description: canChat
-                    ? `${SERVER_DESCRIPTION}\n\n#chat (${STAFF_CHAT_SHORTCUTS.join(' · ')}):\n${chatUrl}`
-                    : SERVER_DESCRIPTION,
+                description: SERVER_DESCRIPTION,
                 ...(banner ? { banner } : {}),
                 buttons: [
                     { type: 'authentication' },
@@ -905,7 +907,7 @@ export default {
         }
 
         if (path === '/sonolus/posts/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
 
             if (rawPostCategory(url) === 'staff-chat') {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -953,7 +955,7 @@ export default {
         }
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
 
             if (rawPostCategory(url) === 'staff-chat') {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -982,7 +984,7 @@ export default {
         }
 
         if (path === '/sonolus/posts/create' && req.method === 'POST') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -1039,16 +1041,10 @@ export default {
         const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
 
         if (postSubmitPath && req.method === 'POST') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can delete posts.')
-            }
-
             const postName = postSubmitPath[1]!
-            const post = await lobby(env).getPost(postName)
-            if (!post) return new Response(null, { status: 404 })
 
             let body: any
             try {
@@ -1058,7 +1054,39 @@ export default {
             }
 
             const values = new URLSearchParams(String(body.values ?? ''))
-            if (values.get('type') !== 'deletePost') {
+            const actionType = values.get('type')
+
+            if (postName === 'staff-chat') {
+                if (!isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                if (actionType !== 'sendChatComment') {
+                    return message(400, 'Unknown chat action.')
+                }
+
+                const text = (values.get('text') ?? '').trim()
+                if (!text) {
+                    return message(400, 'Message cannot be empty.')
+                }
+
+                await lobby(env).addChatMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
+
+                return json({ shouldUpdateItem: true })
+            }
+
+            if (!canManagePosts(session)) {
+                return message(403, 'Only handle 163292 can delete posts.')
+            }
+
+            const post = await lobby(env).getPost(postName)
+            if (!post) return new Response(null, { status: 404 })
+
+            if (actionType !== 'deletePost') {
                 return message(400, 'Unknown post action.')
             }
 
@@ -1069,7 +1097,7 @@ export default {
         }
 
         if (path === '/sonolus/posts/upload' && req.method === 'POST') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
             if (!canManagePosts(session)) {
@@ -1189,8 +1217,8 @@ export default {
                 return json({
                     item: buildStaffChatPostItem(latest),
                     description: '',
-                    actions: [],
-                    hasCommunity: true,
+                    actions: [sendChatCommentForm],
+                    hasCommunity: false,
                     leaderboards: [],
                     sections: [],
                 })
@@ -1202,7 +1230,7 @@ export default {
             return json({
                 item: post.item,
                 description: post.description,
-                actions: canManagePosts(await sessionOf(req, env))
+                actions: canManagePosts(await sessionOf(req, env, url))
                     ? [deletePostForm]
                     : [],
                 hasCommunity: false,
@@ -1427,7 +1455,7 @@ export default {
         }
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
             const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
             return json({
@@ -1444,7 +1472,7 @@ export default {
         }
 
         if (path === '/sonolus/rooms/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
 
             return json({
                 pageCount: 1,
@@ -1454,7 +1482,7 @@ export default {
         }
 
         if (path === '/sonolus/rooms/create' && req.method === 'POST') {
-            const session = await sessionOf(req, env)
+            const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
             const name = randomId(8)
