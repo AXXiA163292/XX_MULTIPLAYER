@@ -1,5 +1,3 @@
-export { Room } from './room.ts'
-export { Lobby } from './lobby.ts'
 import {
     RANKED_ALLOWED_DIFFICULTIES,
     RANKED_MAX_RATING,
@@ -16,7 +14,15 @@ import {
     verifyToken,
 } from './crypto.ts'
 import { roomForms, parseSettings } from './forms.ts'
+import {
+    getCustomLevels,
+    refreshDailyAssets,
+    stripTrailingSlash,
+} from './sheets.ts'
 import type { Env, RoomUser } from './types.ts'
+
+export { Room } from './room.ts'
+export { Lobby } from './lobby.ts'
 
 type SonolusUser = {
     id: string
@@ -30,7 +36,10 @@ type SessionPayload = {
 }
 
 type LevelItem = {
+    id?: string
     name: string
+    url?: string
+    address?: string
     title?: string
     artists?: string
     author?: string
@@ -39,14 +48,7 @@ type LevelItem = {
     [key: string]: unknown
 }
 
-type ConstantRow = {
-    input: string
-    Constant: number
-    Difficulty?: string
-}
-
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000
-const stripTrailingSlash = (value: string) => value.trim().replace(/\/+$/, '')
 
 const getSessionSecret = (env: Env): string =>
     String((env as Record<string, unknown>).SESSION_SECRET ?? 'xx-championship-session-secret')
@@ -122,147 +124,22 @@ function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: s
     }
 }
 
-function normalizeConstantRows(raw: any): ConstantRow[] {
-    const rows = Array.isArray(raw)
-        ? raw
-        : Array.isArray(raw?.rows)
-            ? raw.rows
-            : Array.isArray(raw?.customSongs)
-                ? raw.customSongs
-                : []
-
-    const normalized: ConstantRow[] = []
-    for (const entry of rows) {
-        if (!entry || typeof entry !== 'object') continue
-        const rawInput = String(entry.input ?? entry.Input ?? entry.url ?? '').trim()
-        if (!rawInput) continue
-
-        const c = Number(entry.Constant ?? entry.constant)
-        if (!Number.isFinite(c) || c <= 0) continue
-
-        const diffRaw = String(entry.Difficulty ?? entry.difficulty ?? '').trim().toUpperCase()
-        normalized.push({
-            input: stripTrailingSlash(rawInput),
-            Constant: Math.round(c * 10) / 10,
-            ...(diffRaw ? { Difficulty: diffRaw } : {}),
-        })
-    }
-    return normalized
-}
-
-async function refreshR2FromSource(env: Env, url: URL): Promise<{
-    ok: boolean
-    constantsCount: number
-    levelsCount: number
-    sourceUsed: string | null
-}> {
-    if (!env.R2) {
-        return { ok: false, constantsCount: 0, levelsCount: 0, sourceUsed: null }
-    }
-
-    const envAny = env as Record<string, unknown>
-    const sourceUrl =
-        url.searchParams.get('source') ||
-        String(envAny.REFRESH_SOURCE_URL ?? envAny.SHEET_EXPORT_URL ?? '').trim()
-
-    let constantsRows: ConstantRow[] = []
-    let levelItems: LevelItem[] | null = null
-
-    if (sourceUrl) {
-        const res = await fetch(sourceUrl, {
-            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
-            cache: 'no-store',
-        })
-        if (res.ok) {
-            const payload = await res.json<any>().catch(() => null)
-            constantsRows = normalizeConstantRows(payload)
-            if (Array.isArray(payload?.levels)) {
-                levelItems = payload.levels
-            } else if (Array.isArray(payload?.items)) {
-                levelItems = payload.items
+async function getAllCatalogLevels(env: Env): Promise<LevelItem[]> {
+    if (env.POSTS_BUCKET) {
+        try {
+            const charts = await getCustomLevels(env)
+            if (Array.isArray(charts) && charts.length > 0) {
+                return charts.map((c) => ({
+                    id: c.id,
+                    name: c.name,
+                    url: stripTrailingSlash(c.url),
+                    address: stripTrailingSlash(c.address),
+                    title: c.name,
+                }))
             }
+        } catch (err) {
+            console.warn('[Catalog] Failed reading custom levels from POSTS_BUCKET:', err)
         }
-    }
-
-    if (constantsRows.length === 0) {
-        const existingConst = await env.R2.get('constants.json').catch(() => null)
-        if (existingConst) {
-            const existingJson = await existingConst.json<any>().catch(() => null)
-            constantsRows = normalizeConstantRows(existingJson)
-        }
-    }
-
-    await env.R2.put('constants.json', JSON.stringify(constantsRows), {
-        httpMetadata: { contentType: 'application/json' },
-    })
-
-    let levelsCount = 0
-    if (levelItems && levelItems.length > 0) {
-        await env.R2.put('levels/index.json', JSON.stringify({ items: levelItems }), {
-            httpMetadata: { contentType: 'application/json' },
-        })
-        levelsCount = levelItems.length
-    } else {
-        const currentLevels = await getAllCatalogLevels(env, url)
-        levelsCount = currentLevels.length
-    }
-
-    return {
-        ok: true,
-        constantsCount: constantsRows.length,
-        levelsCount,
-        sourceUsed: sourceUrl || 'existing-r2',
-    }
-}
-
-async function getAllCatalogLevels(env: Env, url: URL): Promise<LevelItem[]> {
-    if (env.R2) {
-        for (const indexKey of ['levels/index.json', 'catalog/levels.json']) {
-            const indexObj = await env.R2.get(indexKey).catch(() => null)
-            if (indexObj) {
-                const parsed = await indexObj.json<any>().catch(() => null)
-                if (Array.isArray(parsed?.items)) return parsed.items
-                if (Array.isArray(parsed)) return parsed
-            }
-        }
-
-        const listed = await env.R2.list({ prefix: 'levels/' })
-        const items: LevelItem[] = []
-
-        for (const obj of listed.objects) {
-            if (!obj.key.endsWith('.json') || obj.key.endsWith('index.json')) continue
-            const raw = await env.R2.get(obj.key)
-            if (!raw) continue
-            try {
-                const json = await raw.json<any>()
-                const item = json?.item ?? json
-                if (item && typeof item.name === 'string') {
-                    items.push({
-                        ...item,
-                        title: typeof item.title === 'string'
-                            ? item.title
-                            : item.title?.en ?? item.name,
-                        artists: typeof item.artists === 'string'
-                            ? item.artists
-                            : item.artists?.en ?? '',
-                        author: typeof item.author === 'string'
-                            ? item.author
-                            : item.author?.en ?? '',
-                    })
-                }
-            } catch {
-                // Skip malformed JSON entry.
-            }
-        }
-
-        if (items.length > 0) return items
-    }
-
-    const fallbackIndexUrl = new URL('/sonolus/levels/index.json', url.origin)
-    const res = await fetch(fallbackIndexUrl.toString()).catch(() => null)
-    if (res?.ok) {
-        const data = await res.json<any>().catch(() => null)
-        if (Array.isArray(data?.items)) return data.items
     }
 
     return []
@@ -306,10 +183,12 @@ function filterCatalogLevels(levels: LevelItem[], searchParams: URLSearchParams)
                 : []
 
             const haystack = [
+                lvl.id,
                 lvl.name,
                 lvl.title,
                 lvl.artists,
                 lvl.author,
+                lvl.url,
                 ...tagTitles,
             ]
                 .filter(Boolean)
@@ -467,8 +346,17 @@ export default {
         const url = new URL(request.url)
 
         if (url.pathname === '/refresh' || url.pathname === '/admin/refresh') {
-            const result = await refreshR2FromSource(env, url)
-            return Response.json(result, { status: result.ok ? 200 : 500 })
+            if (!env.POSTS_BUCKET) {
+                return Response.json(
+                    { ok: false, error: 'POSTS_BUCKET R2 binding is missing' },
+                    { status: 500 },
+                )
+            }
+            const summary = await refreshDailyAssets(env)
+            return Response.json({
+                ok: summary.errors.length === 0,
+                ...summary,
+            })
         }
 
         if (url.pathname === '/sonolus/authenticate' && request.method === 'POST') {
@@ -478,7 +366,8 @@ export default {
                 request.headers.get('sonolus-signature') ??
                 ''
 
-            const validSig = await verifySonolusSignature(rawBody, signature)
+            const skipSig = String((env as Record<string, unknown>).DEV_SKIP_SIGNATURE ?? '').toLowerCase() === 'true'
+            const validSig = skipSig ? true : await verifySonolusSignature(rawBody, signature)
             if (!validSig) {
                 return new Response('Invalid Sonolus signature', { status: 401 })
             }
@@ -559,10 +448,16 @@ export default {
         }
 
         if (url.pathname === '/sonolus/info') {
+            let unread = 0
             const canSeeChat = Boolean(user && isStaffChatUser(user.handle))
-            const unread = canSeeChat
-                ? await env.LOBBY.get(env.LOBBY.idFromName('main')).getChatUnreadCount(user!.handle)
-                : 0
+
+            if (canSeeChat && env.LOBBY) {
+                try {
+                    unread = await env.LOBBY.get(env.LOBBY.idFromName('main')).getChatUnreadCount(user!.handle)
+                } catch {
+                    unread = 0
+                }
+            }
 
             const chatItem = canSeeChat
                 ? buildStaffChatPostItem(unread, url.origin, sessionToken)
@@ -654,8 +549,13 @@ export default {
                 })
             }
 
-            const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
-            const unread = await lobby.getChatUnreadCount(user.handle)
+            let unread = 0
+            try {
+                unread = await env.LOBBY.get(env.LOBBY.idFromName('main')).getChatUnreadCount(user.handle)
+            } catch {
+                unread = 0
+            }
+
             return Response.json({
                 pageCount: 1,
                 items: [buildStaffChatPostItem(unread, url.origin, sessionToken)],
@@ -669,8 +569,8 @@ export default {
             }
 
             const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
-            const messages = await lobby.listChatMessages()
-            await lobby.markChatRead(user.handle)
+            const messages = await lobby.listChatMessages().catch(() => [])
+            await lobby.markChatRead(user.handle).catch(() => {})
 
             const chatUrl = sessionToken
                 ? `${url.origin}/chat?session=${encodeURIComponent(sessionToken)}`
@@ -695,7 +595,7 @@ export default {
         if (url.pathname === '/sonolus/levels/list') {
             const pageSize = 20
             const page = Math.max(0, Number(url.searchParams.get('page') ?? 0) || 0)
-            const allLevels = await getAllCatalogLevels(env, url)
+            const allLevels = await getAllCatalogLevels(env)
             const filtered = filterCatalogLevels(allLevels, url.searchParams)
             const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize))
             const items = filtered.slice(page * pageSize, (page + 1) * pageSize)
@@ -709,7 +609,7 @@ export default {
 
         if (url.pathname === '/sonolus/rooms/list') {
             const lobby = env.LOBBY.get(env.LOBBY.idFromName('main'))
-            const rooms = await lobby.list()
+            const rooms = await lobby.list().catch(() => [])
             const visibleRooms = rooms.filter((r) => {
                 if (r.visibility !== 'private') return true
                 return Boolean(user && (user.id === r.hostId || user.handle === TOURNAMENT_HOST_HANDLE))
