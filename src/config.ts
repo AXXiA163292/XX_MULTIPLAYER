@@ -81,6 +81,8 @@ export const STAFF_CHAT_SHORTCUTS = [
     '@Ʌstra',
 ] as const
 
+export const STAFF_CHAT_ALERT_EMAIL = 'axxia163292@gmail.com'
+
 export const SCOREBOARD_PUBLIC = true
 
 export type RoomType = keyof typeof ROOM_TYPES
