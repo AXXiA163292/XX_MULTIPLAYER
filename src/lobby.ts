@@ -28,7 +28,7 @@ export type StoredPost = {
         subtitle?: string
         time: number
         author: string
-        tags: { title: string }[]
+        tags: { title: string; icon?: string }[]
         thumbnail?: { hash: string; url: string }
     }
     description: string
@@ -46,6 +46,12 @@ type LobbyState = {
     pinnedChatId: string | null
 }
 
+const POST_CATEGORIES: readonly StoredPost['category'][] = [
+    'announcements',
+    'posts',
+    'results',
+]
+
 const freshLobby = (): LobbyState => ({
     rooms: {},
     posts: {},
@@ -53,7 +59,20 @@ const freshLobby = (): LobbyState => ({
     pinnedChatId: null,
 })
 
+function sortPostsList(posts: StoredPost[]): StoredPost[] {
+    return [...posts].sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+            return a.pinned ? -1 : 1
+        }
+        return b.item.time - a.item.time
+    })
+}
+
 function normalizePost(post: StoredPost): StoredPost {
+    const category: StoredPost['category'] =
+        post.category === 'announcements' || post.category === 'results'
+            ? post.category
+            : 'posts'
     const likes = Array.isArray(post.likes) ? post.likes : []
     const comments = Array.isArray(post.comments) ? post.comments : []
     const pinned = Boolean(post.pinned)
@@ -62,16 +81,17 @@ function normalizePost(post: StoredPost): StoredPost {
 
     const parts: string[] = []
     if (pinned) parts.push('Pinned')
-    parts.push(`${likeCount} ${likeCount === 1 ? 'like' : 'likes'}`)
-    parts.push(`${commentCount} ${commentCount === 1 ? 'comment' : 'comments'}`)
+    parts.push(`${likeCount}${likeCount === 1 ? 'like' : 'likes'}`)
+    parts.push(`${commentCount}${commentCount === 1 ? 'comment' : 'comments'}`)
 
-    const tags: { title: string }[] = []
-    if (pinned) tags.push({ title: 'Pinned' })
-    if (likeCount > 0) tags.push({ title: `${likeCount} ♥` })
-    if (commentCount > 0) tags.push({ title: `${commentCount} 💬` })
+    const tags: { title: string; icon?: string }[] = []
+    if (pinned) tags.push({ title: 'Pinned', icon: 'pin' })
+    tags.push({ title: String(likeCount), icon: 'heart' })
+    if (commentCount > 0) tags.push({ title: String(commentCount), icon: 'comment' })
 
     return {
         ...post,
+        category,
         likes,
         comments,
         pinned,
@@ -110,42 +130,50 @@ export class Lobby extends DurableObject<Env> {
                 chat: Array.isArray(saved?.chat) ? saved.chat.slice(-200) : [],
                 pinnedChatId: typeof saved?.pinnedChatId === 'string' ? saved.pinnedChatId : null,
             }
+
+            await this.syncAllToR2().catch(() => {})
         })
     }
 
-    private async persist(): Promise<void> {
-        await this.ctx.storage.put('st', this.st)
+    private async putJson(key: string, data: unknown): Promise<void> {
+        if (!this.env.POSTS_BUCKET) return
+        await this.env.POSTS_BUCKET.put(key, JSON.stringify(data, null, 2), {
+            httpMetadata: { contentType: 'application/json' },
+        })
     }
 
-    async upsert(room: LobbyRoom): Promise<void> {
-        this.st.rooms[room.name] = room
-        await this.persist()
-    }
-
-    async remove(name: string): Promise<void> {
-        delete this.st.rooms[name]
-        await this.persist()
-    }
-
-    async list(): Promise<LobbyRoom[]> {
-        return Object.values(this.st.rooms)
-    }
-
-    async listPosts(category?: StoredPost['category']): Promise<StoredPost[]> {
-        return Object.values(this.st.posts)
-            .filter((post) => !category || post.category === category)
+    private async syncCategoryToR2(category: StoredPost['category']): Promise<void> {
+        const items = Object.values(this.st.posts)
+            .filter((post) => post.category === category)
             .map(normalizePost)
-            .sort((a, b) => {
-                if (Boolean(a.pinned) !== Boolean(b.pinned)) {
-                    return a.pinned ? -1 : 1
-                }
-                return b.item.time - a.item.time
-            })
+        await this.putJson(`community/posts/${category}.json`, sortPostsList(items)) }  private async syncPostToR2(post: StoredPost): Promise<void> { const norm = normalizePost(post) await this.putJson(`community/post/${norm.item.name}.json`, norm)
+        await this.syncCategoryToR2(norm.category)
     }
 
-    async getPost(name: string): Promise<StoredPost | null> {
-        const post = this.st.posts[name]
-        return post ? normalizePost(post) : null
+    private async syncChatToR2(): Promise<void> {
+        await this.putJson('community/chat.json', {
+            messages: this.st.chat,
+            pinnedChatId: this.st.pinnedChatId,
+        })
+    }
+
+    async syncAllToR2(): Promise<void> {
+        for (const cat of POST_CATEGORIES) {
+            await this.syncCategoryToR2(cat)
+        }
+        for (const post of Object.values(this.st.posts)) {
+            await this.putJson(`community/post/${post.item.name}.json`, normalizePost(post)) } await this.syncChatToR2() }  private async persist(): Promise<void> { await this.ctx.storage.put('st', this.st) }  async upsert(room: LobbyRoom): Promise<void> { this.st.rooms[room.name] = room await this.persist() }  async remove(name: string): Promise<void> { delete this.st.rooms[name] await this.persist() }  async list(): Promise<LobbyRoom[]> { return Object.values(this.st.rooms) }  async listPosts(category?: StoredPost['category']): Promise<StoredPost[]> { const filtered = Object.values(this.st.posts) .filter((post) => !category \vert{}\vert{} post.category === category) .map(normalizePost) return sortPostsList(filtered) }  async getPost(name: string): Promise<StoredPost \vert{} null> { const post = this.st.posts[name] if (post) return normalizePost(post)  if (this.env.POSTS_BUCKET) { try { const obj = await this.env.POSTS_BUCKET.get(`community/post/${name}.json`)
+                if (obj) {
+                    const parsed = normalizePost((await obj.json()) as StoredPost)
+                    this.st.posts[name] = parsed
+                    await this.persist()
+                    return parsed
+                }
+            } catch {
+                // ignore
+            }
+        }
+        return null
     }
 
     async findPostByUploadKey(uploadKey: string): Promise<StoredPost | null> {
@@ -156,8 +184,10 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async createPost(post: StoredPost): Promise<void> {
-        this.st.posts[post.item.name] = normalizePost(post)
+        const norm = normalizePost(post)
+        this.st.posts[norm.item.name] = norm
         await this.persist()
+        await this.syncPostToR2(norm).catch(() => {})
     }
 
     async setPostThumbnail(name: string, hash: string, url: string): Promise<void> {
@@ -167,143 +197,19 @@ export class Lobby extends DurableObject<Env> {
         post.item.thumbnail = { hash, url }
         post.thumbnailHash = hash
         delete post.uploadKey
-        this.st.posts[name] = normalizePost(post)
+        const norm = normalizePost(post)
+        this.st.posts[name] = norm
         await this.persist()
+        await this.syncPostToR2(norm).catch(() => {})
     }
 
     async removePost(name: string): Promise<void> {
+        const existing = this.st.posts[name]
+        const category = existing?.category
         delete this.st.posts[name]
         await this.persist()
-    }
-
-    async togglePostLike(name: string, handle: string): Promise<StoredPost | null> {
-        const post = this.st.posts[name]
-        if (!post) return null
-
-        const current = new Set(post.likes ?? [])
-        if (current.has(handle)) {
-            current.delete(handle)
-        } else {
-            current.add(handle)
-        }
-        post.likes = [...current]
-        this.st.posts[name] = normalizePost(post)
-        await this.persist()
-        return this.st.posts[name]!
-    }
-
-    async togglePostPin(name: string): Promise<StoredPost | null> {
-        const post = this.st.posts[name]
-        if (!post) return null
-
-        post.pinned = !post.pinned
-        this.st.posts[name] = normalizePost(post)
-        await this.persist()
-        return this.st.posts[name]!
-    }
-
-    async addPostComment(
-        name: string,
-        input: { handle: string; author: string; text: string },
-    ): Promise<StoredPost | null> {
-        const post = this.st.posts[name]
-        if (!post) return null
-
-        const comment: PostComment = {
-            id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-            handle: input.handle,
-            author: input.author || input.handle,
-            text: input.text,
-            time: Date.now(),
-        }
-
-        post.comments = [...(post.comments ?? []).slice(-199), comment]
-        this.st.posts[name] = normalizePost(post)
-        await this.persist()
-        return this.st.posts[name]!
-    }
-
-    async deletePostComment(name: string, commentId: string): Promise<StoredPost | null> {
-        const post = this.st.posts[name]
-        if (!post) return null
-
-        post.comments = (post.comments ?? []).filter((c) => c.id !== commentId)
-        this.st.posts[name] = normalizePost(post)
-        await this.persist()
-        return this.st.posts[name]!
-    }
-
-    async listChatMessages(): Promise<ChatMessage[]> {
-        return this.st.chat
-    }
-
-    async getPinnedChatId(): Promise<string | null> {
-        return this.st.pinnedChatId
-    }
-
-    async pinChatMessage(id?: string): Promise<string | null> {
-        const targetId = id ?? this.st.chat[this.st.chat.length - 1]?.id ?? null
-        if (!targetId) {
-            this.st.pinnedChatId = null
-            await this.persist()
-            return null
-        }
-
-        this.st.pinnedChatId = this.st.pinnedChatId === targetId ? null : targetId
-        await this.persist()
-        return this.st.pinnedChatId
-    }
-
-    async addChatMessage(input: {
-        handle: string
-        author: string
-        text: string
-    }): Promise<ChatMessage> {
-        const msg: ChatMessage = {
-            id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-            handle: input.handle,
-            author: input.author || input.handle,
-            text: input.text,
-            time: Date.now(),
-        }
-
-        this.st.chat = [...this.st.chat.slice(-199), msg]
-        await this.persist()
-
-        this.ctx.waitUntil(this.sendEmailAlert(msg))
-        return msg
-    }
-
-    async deleteChatMessage(id?: string): Promise<boolean> {
-        if (!this.st.chat.length) return false
-
-        if (id) {
-            const before = this.st.chat.length
-            this.st.chat = this.st.chat.filter((m) => m.id !== id)
-            if (this.st.pinnedChatId === id) this.st.pinnedChatId = null
-            if (this.st.chat.length === before) return false
-        } else {
-            const removed = this.st.chat[this.st.chat.length - 1]
-            this.st.chat = this.st.chat.slice(0, -1)
-            if (removed && this.st.pinnedChatId === removed.id) {
-                this.st.pinnedChatId = null
-            }
-        }
-
-        await this.persist()
-        return true
-    }
-
-    private async sendEmailAlert(msg: ChatMessage): Promise<void> {
-        const apiKey = this.env.RESEND_API_KEY
-        const from = this.env.CHAT_EMAIL_FROM
-        if (!apiKey || !from) return
-
-        try {
-            const res = await fetch('https://api.resend.com/emails', {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
+        if (this.env.POSTS_BUCKET) {
+            await this.env.POSTS_BUCKET.delete(`community/post/${name}.json`).catch(() => {}) if (category) { await this.syncCategoryToR2(category).catch(() => {}) } else { for (const cat of POST_CATEGORIES) { await this.syncCategoryToR2(cat).catch(() => {}) } } } }  async togglePostLike(name: string, handle: string): Promise<StoredPost \vert{} null> { const post = this.st.posts[name] if (!post) return null  const current = new Set(post.likes ?? []) if (current.has(handle)) { current.delete(handle) } else { current.add(handle) } post.likes = [...current] const norm = normalizePost(post) this.st.posts[name] = norm await this.persist() await this.syncPostToR2(norm).catch(() => {}) return norm }  async togglePostPin(name: string): Promise<StoredPost \vert{} null> { const post = this.st.posts[name] if (!post) return null  post.pinned = !post.pinned const norm = normalizePost(post) this.st.posts[name] = norm await this.persist() await this.syncPostToR2(norm).catch(() => {}) return norm }  async addPostComment( name: string, input: { handle: string; author: string; text: string }, ): Promise<StoredPost \vert{} null> { const post = this.st.posts[name] if (!post) return null  const comment: PostComment = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, handle: input.handle, author: input.author \vert{}\vert{} input.handle, text: input.text, time: Date.now(), }  post.comments = [...(post.comments ?? []).slice(-199), comment] const norm = normalizePost(post) this.st.posts[name] = norm await this.persist() await this.syncPostToR2(norm).catch(() => {}) return norm }  async deletePostComment(name: string, commentId: string): Promise<StoredPost \vert{} null> { const post = this.st.posts[name] if (!post) return null  post.comments = (post.comments ?? []).filter((c) => c.id !== commentId) const norm = normalizePost(post) this.st.posts[name] = norm await this.persist() await this.syncPostToR2(norm).catch(() => {}) return norm }  async listChatMessages(): Promise<ChatMessage[]> { return this.st.chat }  async getPinnedChatId(): Promise<string \vert{} null> { return this.st.pinnedChatId }  async pinChatMessage(id?: string): Promise<string \vert{} null> { const targetId = id ?? this.st.chat[this.st.chat.length - 1]?.id ?? null if (!targetId) { this.st.pinnedChatId = null await this.persist() await this.syncChatToR2().catch(() => {}) return null }  this.st.pinnedChatId = this.st.pinnedChatId === targetId ? null : targetId await this.persist() await this.syncChatToR2().catch(() => {}) return this.st.pinnedChatId }  async addChatMessage(input: { handle: string author: string text: string }): Promise<ChatMessage> { const msg: ChatMessage = { id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`, handle: input.handle, author: input.author \vert{}\vert{} input.handle, text: input.text, time: Date.now(), }  this.st.chat = [...this.st.chat.slice(-199), msg] await this.persist() await this.syncChatToR2().catch(() => {})  this.ctx.waitUntil(this.sendEmailAlert(msg)) return msg }  async deleteChatMessage(id?: string): Promise<boolean> { if (!this.st.chat.length) return false  if (id) { const before = this.st.chat.length this.st.chat = this.st.chat.filter((m) => m.id !== id) if (this.st.pinnedChatId === id) this.st.pinnedChatId = null if (this.st.chat.length === before) return false } else { const removed = this.st.chat[this.st.chat.length - 1] this.st.chat = this.st.chat.slice(0, -1) if (removed && this.st.pinnedChatId === removed.id) { this.st.pinnedChatId = null } }  await this.persist() await this.syncChatToR2().catch(() => {}) return true }  private async sendEmailAlert(msg: ChatMessage): Promise<void> { const apiKey = this.env.RESEND_API_KEY const from = this.env.CHAT_EMAIL_FROM if (!apiKey \vert{}\vert{} !from) return  try { const res = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${apiKey}`,
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
