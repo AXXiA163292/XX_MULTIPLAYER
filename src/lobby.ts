@@ -483,28 +483,20 @@ export class Lobby extends DurableObject<Env> {
         return updated
     }
 
-    async deleteChatMessage(id?: string): Promise<boolean> {
-        if (!this.st.chat.length) return false
+    async deleteChatMessage(id: string): Promise<boolean> {
+        const cleanId = String(id ?? '').trim()
+        if (!cleanId || !this.st.chat.length) return false
 
-        if (id) {
-            const before = this.st.chat.length
-            this.st.chat = this.st.chat.filter(
-                (message) => message.id !== id,
-            )
+        const before = this.st.chat.length
+        this.st.chat = this.st.chat.filter(
+            (message) => message.id !== cleanId,
+        )
 
-            if (this.st.pinnedChatId === id) {
-                this.st.pinnedChatId = null
-            }
-
-            if (this.st.chat.length === before) return false
-        } else {
-            const removed = this.st.chat[this.st.chat.length - 1]
-            this.st.chat = this.st.chat.slice(0, -1)
-
-            if (removed && this.st.pinnedChatId === removed.id) {
-                this.st.pinnedChatId = null
-            }
+        if (this.st.pinnedChatId === cleanId) {
+            this.st.pinnedChatId = null
         }
+
+        if (this.st.chat.length === before) return false
 
         await Promise.all([this.persist(), this.syncChatToR2()])
         return true
