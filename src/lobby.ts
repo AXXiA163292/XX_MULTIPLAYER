@@ -54,6 +54,9 @@ const POST_CATEGORIES: readonly PostCategory[] = [
     'results',
 ]
 
+const CHAT_INDEX_KEY = 'chat/index.json'
+const LEGACY_CHAT_KEY = 'chat.json'
+
 const freshLobby = (): LobbyState => ({
     rooms: {},
     posts: {},
@@ -152,7 +155,7 @@ export class Lobby extends DurableObject<Env> {
 
     private async putJson(key: string, data: unknown): Promise<void> {
         if (!this.env.COMMUNITY_BUCKET) return
-        await this.env.COMMUNITY_BUCKET.put(key, JSON.stringify(data), {
+        await this.env.COMMUNITY_BUCKET.put(key, JSON.stringify(data, null, 2), {
             httpMetadata: {
                 contentType: 'application/json',
             },
@@ -173,6 +176,9 @@ export class Lobby extends DurableObject<Env> {
 
     private async initFromR2IfNeeded(): Promise<void> {
         if (!this.env.COMMUNITY_BUCKET) return
+
+        // Clean up legacy root chat.json if present
+        await this.env.COMMUNITY_BUCKET.delete(LEGACY_CHAT_KEY).catch(() => {})
 
         const hasAnySavedPosts = Object.keys(this.st.posts).length > 0
         if (hasAnySavedPosts) {
@@ -197,7 +203,7 @@ export class Lobby extends DurableObject<Env> {
         const storedChat = await this.getJson<{
             messages?: ChatMessage[]
             pinnedChatId?: string | null
-        }>('chat.json')
+        }>(CHAT_INDEX_KEY)
 
         if (storedChat && Array.isArray(storedChat.messages) && this.st.chat.length === 0) {
             this.st.chat = storedChat.messages.slice(-200)
@@ -232,7 +238,7 @@ export class Lobby extends DurableObject<Env> {
     }
 
     private async syncChatToR2(): Promise<void> {
-        await this.putJson('chat.json', {
+        await this.putJson(CHAT_INDEX_KEY, {
             messages: this.st.chat,
             pinnedChatId: this.st.pinnedChatId,
         })
