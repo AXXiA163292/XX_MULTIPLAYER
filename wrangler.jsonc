@@ -18,6 +18,10 @@
     {
       "binding": "POSTS_BUCKET",
       "bucket_name": "sonolus-assets"
+    },
+    {
+      "binding": "COMMUNITY_BUCKET",
+      "bucket_name": "community"
     }
   ],
   "triggers": {
