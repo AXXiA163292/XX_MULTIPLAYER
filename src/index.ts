@@ -108,8 +108,7 @@ function buildRoomUser(user: SonolusUser, request: Request): RoomUser {
     }
 }
 
-function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: string) {
-    const chatQuery = sessionToken ? `?session=${encodeURIComponent(sessionToken)}` : ''
+function buildStaffChatPostItem(unread: number) {
     return {
         name: 'staff-chat',
         version: 1,
@@ -117,7 +116,6 @@ function buildStaffChatPostItem(unread: number, origin: string, sessionToken?: s
         subtitle: '@Bell · @Noct · @Ʌstra',
         author: SERVER_TITLE,
         tags: [{ title: 'Chat' }],
-        url: `${origin}/chat${chatQuery}`,
     }
 }
 
@@ -456,9 +454,7 @@ export default {
                 }
             }
 
-            const chatItem = canSeeChat
-                ? buildStaffChatPostItem(unread, url.origin, sessionToken)
-                : null
+            const chatItem = canSeeChat ? buildStaffChatPostItem(unread) : null
 
             return Response.json({
                 title: SERVER_TITLE,
@@ -553,7 +549,7 @@ export default {
 
             return Response.json({
                 pageCount: 1,
-                items: [buildStaffChatPostItem(unread, url.origin, sessionToken)],
+                items: [buildStaffChatPostItem(unread)],
                 searches: [],
             })
         }
@@ -576,7 +572,7 @@ export default {
             )
 
             return Response.json({
-                item: buildStaffChatPostItem(0, url.origin, sessionToken),
+                item: buildStaffChatPostItem(0),
                 description: [
                     `Open chat: ${chatUrl}`,
                     'Shortcuts: @Bell, @Noct, @Ʌstra',
