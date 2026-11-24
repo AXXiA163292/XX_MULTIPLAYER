@@ -115,7 +115,8 @@ const fresh = (): RoomState => ({
         visibility: 'locked',
         random: false,
         tier: 'master',
-        customSongs: 'off',
+                customSongs: 'off',
+        vocalType: 'sekai',
     },
     status: 'selecting',
     level: null,
@@ -1566,10 +1567,10 @@ export class Room extends DurableObject<Env> {
             if (state.settings.type === 'rankedRoom') {
                 let pick: SheetChart | null = null
 
-                try {
-                    pick = await pickRankedLevel(
+                try {                    pick = await pickRankedLevel(
                         state.settings.tier as RankedTier,
                         state.settings.customSongs,
+                        state.settings.vocalType ?? 'virtualSinger',
                         this.env,
                     )
                 } catch (error) {
