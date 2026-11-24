@@ -107,7 +107,7 @@ export type RoomSummary = {
 export type Env = {
     ROOM: DurableObjectNamespace<import('./room.ts').Room>
     LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
-    POSTS_BUCKET: R2Bucket
+    SONOLUS_ASSETS_BUCKET: R2Bucket
     COMMUNITY_BUCKET?: R2Bucket
     SESSION_SECRET: string
     PUBLIC_ADDRESS?: string
