@@ -135,15 +135,6 @@ function normalizeResult(raw: any): GameplayResult {
     }
 }
 
-function sanitizeWireResult(result: GameplayResult): GameplayResult {
-    const wireGrade: Exclude<GameplayResult['grade'], 'X'> =
-        result.grade === 'X' ? 'fail' : result.grade
-    return {
-        ...result,
-        grade: wireGrade,
-    }
-}
-
 function formatGradeLabel(grade: GameplayResult['grade'] | undefined): string {
     if (grade === 'X') return 'X'
     if (grade === 'allPerfect') return 'AP'
@@ -429,10 +420,10 @@ export class Room extends DurableObject {
     private roomSnapshot() {
         if (!this.state) return null
         const s = this.state.settings
-        const masterIndex =
-            this.state.members.find((m) => m.user.handle === this.state!.hostHandle)?.index ??
-            this.state.members[0]?.index ??
-            0
+        const masterMember =
+            this.state.members.find((m) => m.user.handle === this.state!.hostHandle) ??
+            this.state.members[0]
+        const masterUserId = masterMember?.user.id ?? this.state.hostId
 
         const scores = [...this.state.leaderboard]
             .sort((a, b) => b.rating - a.rating || b.pp - a.pp)
@@ -447,38 +438,35 @@ export class Room extends DurableObject {
                 score: `${entry.rating} RP · ${entry.pp} PP`,
             }))
 
+        const users = this.state.members.map((m) => {
+            const roomUser = (m as any).roomUser
+            if (roomUser && typeof roomUser === 'object') {
+                return roomUser
+            }
+            return {
+                index: m.index,
+                userProfile: m.user,
+            }
+        })
+
         return {
             type: 'update',
             allowOtherServers: true,
             reportUserOptions: [],
             title: s.title,
             status: this.state.status,
-            master: masterIndex,
-            lead: masterIndex,
+            master: masterUserId,
+            lead: masterUserId,
             level: this.state.level,
             options: [],
             optionValues: [],
-            levelOptions: {
-                options: [],
-                values: [],
-            },
+            levelOptions: [],
             isSuggestionsLocked: false,
             suggestions: [],
-            autoExit: {
-                type: 'none',
-            },
-            users: this.state.members.map((m) => ({
-                index: m.index,
-                userProfile: m.user,
-                isMaster: m.index === masterIndex,
-                isLead: m.index === masterIndex,
-                roomUser: (m as any).roomUser ?? {
-                    authentication: '',
-                    signature: '',
-                },
-            })),
+            autoExit: 'off',
+            users,
             userStatuses: this.state.members.map((m) => ({
-                index: m.index,
+                userId: m.user.id,
                 status: this.userStatusOf(m),
             })),
             scoreboardDescription: fmtDetail(
@@ -924,7 +912,6 @@ export class Room extends DurableObject {
         if (snap) {
             this.send(server, snap)
         }
-        this.broadcastRoomState()
 
         return new Response(null, {
             status: 101,
