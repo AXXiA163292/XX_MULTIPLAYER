@@ -18,10 +18,13 @@ import type { PostCategory, PostComment, StoredPost } from './lobby.ts'
 
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
+export { Chat } from './chat.ts'
 
 const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
 const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
 const CHAT_HANDLE_COOKIE = 'xx_chat_handle'
+const PROTECTED_CHAT_HANDLE = '163292'
+const MEDIA_ADMIN_HANDLE = '163292'
 
 const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = {
     '163292': { handle: '163292', name: 'AXX!A' },
@@ -35,11 +38,30 @@ const HANDLE_TIMEZONES: Record<string, string> = {
     '3227470': 'Etc/GMT+6',
 }
 
+type EmailNotifyMode = 'mention' | 'all'
+
 type UserChatPrefs = {
     handle: string
     displayName: string
     pfpKey?: string
+    notifyEmail?: string
+    emailNotifyMode?: EmailNotifyMode
     updatedAt: number
+}
+
+type ChatMediaItem = {
+    id: string
+    imageKey: string
+    contentType: string
+    link?: string
+    caption?: string
+    createdAt: number
+    authorHandle: string
+}
+
+type WorkerEnv = Env & {
+    COMMUNITY_BUCKET?: R2Bucket
+    SONOLUS_ASSETS_BUCKET?: R2Bucket
 }
 
 const json = (data: unknown, status = 200) =>
@@ -64,10 +86,10 @@ const html = (body: string, status = 200) =>
 const message = (status: number, text: string) =>
     json({ message: text }, status)
 
-const addressOf = (req: Request, env: Env) =>
+const addressOf = (req: Request, env: WorkerEnv) =>
     (env.PUBLIC_ADDRESS ?? new URL(req.url).origin).replace(/\/+$/, '')
 
-const isDevSkipSignature = (env: Env): boolean =>
+const isDevSkipSignature = (env: WorkerEnv): boolean =>
     String(env.DEV_SKIP_SIGNATURE ?? '').trim().toLowerCase() === 'true'
 
 const isStaffChatHandle = (handle?: string | null): boolean =>
@@ -75,6 +97,19 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         handle &&
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
+
+const isMediaAdminHandle = (handle?: string | null): boolean =>
+    String(handle ?? '').trim() === MEDIA_ADMIN_HANDLE
+
+function requiresProfilePassword(handle?: string | null): boolean {
+    return String(handle ?? '').trim() === PROTECTED_CHAT_HANDLE
+}
+
+function matchesSessionSecretPassword(env: WorkerEnv, password?: unknown): boolean {
+    const secret = String(env.SESSION_SECRET ?? '')
+    const candidate = typeof password === 'string' ? password : ''
+    return Boolean(secret) && candidate.length > 0 && candidate === secret
+}
 
 function defaultDisplayName(handle: string, fallbackName?: string): string {
     const cleanHandle = String(handle ?? '').trim()
@@ -102,37 +137,84 @@ function parseCookie(req: Request, name: string): string | null {
     return null
 }
 
-async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs> {
+function communityBucket(env: WorkerEnv): R2Bucket | null {
+    return env.COMMUNITY_BUCKET ?? null
+}
+
+function assetsBucket(env: WorkerEnv): R2Bucket | null {
+    return env.SONOLUS_ASSETS_BUCKET ?? null
+}
+
+function bucketsForRead(env: WorkerEnv): R2Bucket[] {
+    return [env.COMMUNITY_BUCKET, env.SONOLUS_ASSETS_BUCKET].filter(
+        (b): b is R2Bucket => Boolean(b),
+    )
+}
+
+function sanitizeHttpLink(raw?: unknown): string {
+    const val = String(raw ?? '').trim()
+    if (!val) return ''
+    try {
+        const parsed = new URL(val)
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            return parsed.toString()
+        }
+    } catch {
+        // invalid link
+    }
+    return ''
+}
+
+async function getUserChatPrefs(env: WorkerEnv, handle: string): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
     const fallback: UserChatPrefs = {
         handle: clean,
         displayName: defaultDisplayName(clean),
+        notifyEmail: '',
+        emailNotifyMode: 'mention',
         updatedAt: 0,
     }
 
-    if (!clean || !env.COMMUNITY_BUCKET) return fallback
+    if (!clean) return fallback
 
-    try {
-        const obj = await env.COMMUNITY_BUCKET.get(`chat/users/${clean}.json`)
-        if (!obj) return fallback
-        const parsed = await obj.json() as Partial<UserChatPrefs>
-        const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
-        return {
-            handle: clean,
-            displayName: displayName || fallback.displayName,
-            pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
-            updatedAt: Number(parsed?.updatedAt) || 0,
+    const bucket = communityBucket(env)
+    if (!bucket) return fallback
+
+    const keys = [
+        `chat/users/${clean}.json`,
+        `${clean}.json`,
+    ]
+
+    for (const key of keys) {
+        try {
+            const obj = await bucket.get(key)
+            if (!obj) continue
+            const parsed = await obj.json() as Partial<UserChatPrefs>
+            const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
+            const mode: EmailNotifyMode = parsed?.emailNotifyMode === 'all' ? 'all' : 'mention'
+            return {
+                handle: clean,
+                displayName: displayName || fallback.displayName,
+                pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
+                notifyEmail: typeof parsed?.notifyEmail === 'string' ? parsed.notifyEmail.trim().slice(0, 120) : '',
+                emailNotifyMode: mode,
+                updatedAt: Number(parsed?.updatedAt) || 0,
+            }
+        } catch {
+            // try next key
         }
-    } catch {
-        return fallback
     }
+
+    return fallback
 }
 
 async function saveUserChatPrefs(
-    env: Env,
+    env: WorkerEnv,
     handle: string,
     displayName: string,
     pfpKey?: string,
+    notifyEmail?: string,
+    emailNotifyMode?: EmailNotifyMode,
 ): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
     const current = await getUserChatPrefs(env, clean)
@@ -140,23 +222,66 @@ async function saveUserChatPrefs(
         handle: clean,
         displayName: String(displayName ?? '').trim().slice(0, 40) || current.displayName,
         pfpKey: pfpKey ?? current.pfpKey,
+        notifyEmail: notifyEmail !== undefined ? notifyEmail.trim().slice(0, 120) : (current.notifyEmail ?? ''),
+        emailNotifyMode: emailNotifyMode ?? current.emailNotifyMode ?? 'mention',
         updatedAt: Date.now(),
     }
 
-    if (env.COMMUNITY_BUCKET) {
-        await env.COMMUNITY_BUCKET.put(
-            `chat/users/${clean}.json`,
-            JSON.stringify(next),
-            { httpMetadata: { contentType: 'application/json' } },
-        )
+    const bucket = communityBucket(env)
+    if (!bucket) {
+        throw new Error('COMMUNITY_BUCKET is not configured.')
     }
+
+    await bucket.put(
+        `chat/users/${clean}.json`,
+        JSON.stringify(next),
+        { httpMetadata: { contentType: 'application/json' } },
+    )
 
     return next
 }
 
+const MEDIA_INDEX_KEY = 'chat/media/index.json'
+
+async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
+    const bucket = communityBucket(env)
+    if (!bucket) return []
+
+    for (const key of [MEDIA_INDEX_KEY, 'media/index.json']) {
+        try {
+            const obj = await bucket.get(key)
+            if (!obj) continue
+            const parsed = await obj.json() as { items?: ChatMediaItem[] } | ChatMediaItem[]
+            const rawList = Array.isArray(parsed)
+                ? parsed
+                : Array.isArray(parsed?.items)
+                    ? parsed.items
+                    : []
+            return rawList
+                .filter((item): item is ChatMediaItem => Boolean(item && typeof item.id === 'string' && typeof item.imageKey === 'string'))
+                .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+        } catch {
+            // try next
+        }
+    }
+    return []
+}
+
+async function saveChatMediaIndex(env: WorkerEnv, items: ChatMediaItem[]): Promise<void> {
+    const bucket = communityBucket(env)
+    if (!bucket) {
+        throw new Error('COMMUNITY_BUCKET is not configured.')
+    }
+    await bucket.put(
+        MEDIA_INDEX_KEY,
+        JSON.stringify({ items }),
+        { httpMetadata: { contentType: 'application/json' } },
+    )
+}
+
 async function verifySigned(
     req: Request,
-    env: Env,
+    env: WorkerEnv,
     raw: Uint8Array,
     expectType: string,
 ) {
@@ -216,7 +341,7 @@ function extractSessionToken(req: Request, url?: URL): string | null {
 
 async function sessionOf(
     req: Request,
-    env: Env,
+    env: WorkerEnv,
     url?: URL,
 ): Promise<AuthSession | null> {
     const token = extractSessionToken(req, url)
@@ -236,7 +361,7 @@ function pickedProfile(handle?: string | null): UserProfile | null {
 
 async function resolveChatUser(
     req: Request,
-    env: Env,
+    env: WorkerEnv,
     url: URL,
     body?: any,
 ): Promise<{ user: UserProfile; fromSonolus: boolean; token: string } | null> {
@@ -280,11 +405,14 @@ async function resolveChatUser(
     return null
 }
 
-const roomStub = (env: Env, name: string) =>
+const roomStub = (env: WorkerEnv, name: string) =>
     env.ROOM.get(env.ROOM.idFromName(name))
 
-const lobby = (env: Env) =>
+const lobby = (env: WorkerEnv) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
+
+const chatStub = (env: WorkerEnv) =>
+    env.CHAT.get(env.CHAT.idFromName('staff'))
 
 const POST_LABELS: Record<PostCategory, {
     section: string
@@ -315,9 +443,9 @@ const POST_LABELS: Record<PostCategory, {
 function parseCategoryString(raw: string | null | undefined): PostCategory | null {
     if (!raw) return null
     const clean = raw.trim().toLowerCase()
-    if (clean === 'announcements' || clean === 'announcement') return 'announcements'
-    if (clean === 'results' || clean === 'result') return 'results'
-    if (clean === 'posts' || clean === 'post') return 'posts'
+    if (clean === 'announcements' || clean === 'announcement' || clean.includes('announce')) return 'announcements'
+    if (clean === 'results' || clean === 'result' || clean.includes('result')) return 'results'
+    if (clean === 'posts' || clean === 'post' || clean.includes('post')) return 'posts'
     return null
 }
 
@@ -347,8 +475,12 @@ function resolveCategory(
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
+        url.searchParams.get('section'),
+        url.searchParams.get('title'),
         body?.infoType,
         body?.postType,
+        body?.section,
+        body?.title,
         url.searchParams.get('category'),
         values?.get('category'),
         bodyValueParams?.get('category'),
@@ -359,6 +491,8 @@ function resolveCategory(
         bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
         bodySearchParams?.get('type'),
+        urlSearchParams?.get('section'),
+        urlSearchParams?.get('title'),
     ]
 
     for (const c of candidates) {
@@ -530,8 +664,13 @@ function extractCommentText(values: URLSearchParams): string {
     return ''
 }
 
-function externalChatUrl(req: Request, env: Env): string {
+function externalChatUrl(req: Request, env: WorkerEnv): string {
     return `${addressOf(req, env)}/chat`
+}
+
+function sonolusDeepLinkUrl(req: Request, env: WorkerEnv): string {
+    const serverUrl = `${addressOf(req, env)}/sonolus`
+    return `sonolus://external-server/${encodeURIComponent(serverUrl)}`
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -662,24 +801,20 @@ const RANKED_TIERS_UPPER = new Set([
     'MASTER',
 ])
 
-async function getBucketImage(
-    env: Env,
+async function getBucketObject(
+    bucket: R2Bucket | null,
     keys: string[],
 ): Promise<R2ObjectBody | null> {
-    const buckets = [env.COMMUNITY_BUCKET, env.POSTS_BUCKET].filter(
-        (b): b is R2Bucket => Boolean(b),
-    )
+    if (!bucket) return null
     for (const key of keys) {
-        for (const bucket of buckets) {
-            const obj = await bucket.get(key).catch(() => null)
-            if (obj) return obj
-        }
+        const obj = await bucket.get(key).catch(() => null)
+        if (obj) return obj
     }
     return null
 }
 
 async function resolveRoomCover(
-    env: Env,
+    env: WorkerEnv,
     summary: {
         type?: string
         tier?: string
@@ -738,6 +873,7 @@ async function resolveRoomCover(
         }
     }
 
+    void env
     return undefined
 }
 
@@ -746,151 +882,851 @@ function renderStaffChatHtml(
     sessionToken: string,
     fromSonolus: boolean,
     prefsMap: Record<string, UserChatPrefs>,
+    sonolusUrl: string,
+    initialMessages: ChatMessage[],
+    initialMedia: ChatMediaItem[],
 ): string {
     const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
         const pref = prefsMap[handle]
         const name = pref?.displayName || DEFAULT_CHAT_PROFILES[handle]?.name || handle
+        const lockBadge = handle === PROTECTED_CHAT_HANDLE ? `<span class="pick-lock">Password</span>` : ''
         return `<button type="button" class="pick-card" data-pick-handle="${escapeAttr(handle)}">
           <img class="pick-pfp" src="/api/chat/pfp/${escapeAttr(handle)}" alt="${escapeAttr(name)}"/>
           <span class="pick-name">${escapeAttr(name)}</span>
           <span class="pick-handle">#${escapeAttr(handle)}</span>
+          ${lockBadge}
         </button>`
     }).join('')
+
+    const safeInitialMessagesJson = JSON.stringify(initialMessages).replace(/</g, '\\u003c')
+    const safeInitialMediaJson = JSON.stringify(initialMedia).replace(/</g, '\\u003c')
 
     return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<meta name="theme-color" content="#0d0f14"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#9E4B76"/>
 <link rel="manifest" href="/manifest.webmanifest"/>
 <link rel="icon" type="image/png" href="/app-icon.png"/>
 <link rel="apple-touch-icon" href="/app-icon.png"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;600;700;800&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700;800&family=Red+Hat+Display:wght@500;600;700&display=swap" rel="stylesheet"/>
 <title>XX! Chat</title>
 <style>
+  :root{
+    --plum:#9E4B76;
+    --plum-dark:#833B61;
+    --plum-deep:#57233E;
+    --blush:#F4DCE6;
+    --blush-soft:#FBF2F6;
+    --blush-border:#E8C6D6;
+    --bg:#FAF7F9;
+    --surface:#FFFFFF;
+    --text:#2D1B25;
+    --muted:#7D5D6E;
+    --header-h:62px;
+  }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0d0f14;color:#f3f4f6;font-family:'Red Hat Display',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:28px;display:flex;flex-direction:column;height:100dvh}
-  header{padding:24px 32px;background:#151922;border-bottom:2px solid #242b3a;font-weight:700;font-size:30px;display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
-  .header-brand{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  .app-logo{width:48px;height:48px;border-radius:12px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
-  .header-right{display:flex;align-items:center;gap:16px}
-  .badge{font-size:24px;color:#9ca3af;font-weight:600}
-  .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:16px;padding:10px 18px;font-size:22px;font-weight:700;cursor:pointer;font-family:inherit}
-  .btn-sm:hover{border-color:#3b82f6}
-  .btn-danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
-  #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:48px 32px;gap:36px}
+  html,body{
+    height:100%;
+    overflow:hidden;
+    overscroll-behavior:none;
+    background:var(--bg);
+    color:var(--text);
+    font-family:'Red Hat Display',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    font-size:16px;
+  }
+  h1,h2,.title-font,.header-title,.picker-title,.pick-name,.modal-title,.btn-primary,.tab-btn{
+    font-family:'Montserrat',system-ui,-apple-system,sans-serif;
+    font-weight:800;
+    letter-spacing:-0.01em;
+  }
+  header{
+    position:fixed;
+    top:0;
+    left:0;
+    right:0;
+    height:calc(var(--header-h) + env(safe-area-inset-top));
+    padding:env(safe-area-inset-top) 18px 0;
+    background:var(--plum);
+    color:var(--blush);
+    border-bottom:3px solid var(--blush);
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    z-index:30;
+    box-shadow:0 4px 16px rgba(87,35,62,.16);
+  }
+  .header-brand{display:flex;align-items:center;gap:11px;min-width:0}
+  .app-logo{
+    width:34px;
+    height:34px;
+    border-radius:10px;
+    object-fit:cover;
+    image-rendering:pixelated;
+    border:2px solid var(--blush);
+    background:var(--plum-deep);
+    flex-shrink:0;
+  }
+  .header-title{
+    font-size:19px;
+    color:var(--blush);
+    text-transform:uppercase;
+    letter-spacing:.03em;
+    white-space:nowrap;
+  }
+  .header-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+  .badge{
+    background:rgba(244,220,230,.18);
+    color:var(--blush);
+    border:1px solid rgba(244,220,230,.4);
+    border-radius:999px;
+    padding:4px 11px;
+    font-size:13px;
+    font-weight:700;
+    white-space:nowrap;
+  }
+  .btn-header{
+    background:var(--blush);
+    color:var(--plum-dark);
+    border:none;
+    border-radius:10px;
+    padding:7px 12px;
+    font-family:'Montserrat',sans-serif;
+    font-size:12px;
+    font-weight:800;
+    text-transform:uppercase;
+    letter-spacing:.03em;
+    cursor:pointer;
+    transition:transform .12s ease,background .12s ease;
+  }
+  .btn-header:hover{background:#FFFFFF}
+  .btn-header:active{transform:scale(.97)}
+  .btn-sm{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1px solid var(--blush-border);
+    border-radius:10px;
+    padding:7px 13px;
+    font-family:'Montserrat',sans-serif;
+    font-size:12px;
+    font-weight:700;
+    cursor:pointer;
+    text-decoration:none;
+    display:inline-flex;
+    align-items:center;
+    transition:all .12s ease;
+  }
+  .btn-sm:hover{background:var(--blush);border-color:var(--plum)}
+  .btn-danger{
+    background:#FFF1F4;
+    color:#BE123C;
+    border-color:#FECDD3;
+  }
+  .btn-danger:hover{background:#FFE4E9;border-color:#F43F5E}
+  .btn-primary{
+    background:var(--plum);
+    color:var(--blush);
+    border:none;
+    border-radius:10px;
+    padding:8px 16px;
+    font-size:13px;
+    cursor:pointer;
+  }
+  .btn-primary:hover{background:var(--plum-dark);color:#FFFFFF}
+  .btn-primary:disabled{opacity:.6;cursor:not-allowed}
+
+  #picker{
+    position:fixed;
+    top:calc(var(--header-h) + env(safe-area-inset-top));
+    left:0;
+    right:0;
+    bottom:0;
+    display:none;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    padding:24px 16px;
+    gap:22px;
+    overflow-y:auto;
+    background:var(--bg);
+  }
   #picker.open{display:flex}
-  .picker-title{font-size:36px;font-weight:700;text-align:center}
-  .picker-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,260px));gap:28px}
-  .pick-card{background:#151922;border:1px solid #283042;border-radius:28px;padding:24px;display:flex;flex-direction:column;align-items:center;gap:16px;color:#f3f4f6;cursor:pointer;font-family:inherit}
-  .pick-card:hover{border-color:#3b82f6;background:#192131}
-  .pick-pfp{width:128px;height:128px;aspect-ratio:1/1;border-radius:20px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
-  .pick-name{font-size:26px;font-weight:700;text-align:center}
-  .pick-handle{font-size:22px;color:#9ca3af}
-  #chatView{flex:1;display:none;flex-direction:column;min-height:0}
-  #chatView.open{display:flex}
-  #messages{flex:1;overflow-y:auto;padding:28px 32px;display:flex;flex-direction:column;gap:24px}
-  .empty-state{color:#9ca3af;font-size:26px;text-align:center;margin:auto}
-  .row{display:flex;align-items:flex-start;gap:16px;max-width:94%;transition:transform .14s ease;touch-action:pan-y;cursor:pointer;user-select:none;-webkit-user-select:none}
+  .picker-header{
+    background:var(--plum);
+    color:var(--blush);
+    padding:12px 24px;
+    border-radius:14px;
+    box-shadow:0 8px 24px rgba(158,75,118,.2);
+    text-align:center;
+  }
+  .picker-title{
+    font-size:20px;
+    text-transform:uppercase;
+    letter-spacing:.03em;
+  }
+  .picker-sub{
+    display:inline-block;
+    margin-top:6px;
+    background:var(--blush);
+    color:var(--plum-dark);
+    font-size:13px;
+    font-weight:700;
+    padding:4px 12px;
+    border-radius:8px;
+  }
+  .picker-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(132px,164px));
+    gap:16px;
+    width:100%;
+    max-width:560px;
+    justify-content:center;
+  }
+  .pick-card{
+    background:var(--surface);
+    border:2px solid var(--blush-border);
+    border-radius:18px;
+    padding:16px 14px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:10px;
+    color:var(--text);
+    cursor:pointer;
+    box-shadow:0 4px 14px rgba(158,75,118,.07);
+    transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease;
+  }
+  .pick-card:hover{
+    border-color:var(--plum);
+    transform:translateY(-2px);
+    box-shadow:0 10px 22px rgba(158,75,118,.16);
+  }
+  .pick-pfp{
+    width:78px;
+    height:78px;
+    aspect-ratio:1/1;
+    border-radius:14px;
+    object-fit:cover;
+    image-rendering:pixelated;
+    border:2px solid var(--blush);
+    background:var(--blush-soft);
+  }
+  .pick-name{font-size:15px;color:var(--plum-dark);text-align:center}
+  .pick-handle{
+    font-size:12px;
+    font-weight:700;
+    color:var(--plum);
+    background:var(--blush-soft);
+    padding:2px 9px;
+    border-radius:999px;
+  }
+  .pick-lock{
+    font-size:11px;
+    font-weight:700;
+    color:#FFFFFF;
+    background:var(--plum);
+    padding:2px 8px;
+    border-radius:999px;
+  }
+
+  #appView{
+    position:fixed;
+    top:calc(var(--header-h) + env(safe-area-inset-top));
+    left:0;
+    right:0;
+    bottom:0;
+    display:none;
+    flex-direction:column;
+    overflow:hidden;
+    background:var(--bg);
+  }
+  #appView.open{display:flex}
+
+  .tab-bar{
+    flex:0 0 auto;
+    display:flex;
+    gap:8px;
+    padding:8px 16px;
+    background:var(--surface);
+    border-bottom:1.5px solid var(--blush-border);
+    align-items:center;
+    justify-content:space-between;
+  }
+  .tab-group{display:flex;gap:8px}
+  .tab-btn{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1.5px solid var(--blush-border);
+    border-radius:10px;
+    padding:7px 16px;
+    font-size:12.5px;
+    text-transform:uppercase;
+    letter-spacing:.03em;
+    cursor:pointer;
+    transition:all .12s ease;
+  }
+  .tab-btn.active{
+    background:var(--plum);
+    color:var(--blush);
+    border-color:var(--plum);
+  }
+
+  #chatTab{
+    flex:1 1 auto;
+    min-height:0;
+    display:none;
+    flex-direction:column;
+    overflow:hidden;
+  }
+  #chatTab.active{display:flex}
+
+  #messages{
+    flex:1 1 auto;
+    min-height:0;
+    overflow-y:auto;
+    overflow-x:hidden;
+    -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain;
+    padding:18px 18px 20px;
+    display:flex;
+    flex-direction:column;
+    gap:14px;
+  }
+  .empty-state{
+    color:var(--muted);
+    font-size:15px;
+    font-weight:600;
+    text-align:center;
+    margin:auto;
+    background:var(--surface);
+    border:1px dashed var(--blush-border);
+    padding:16px 24px;
+    border-radius:14px;
+  }
+
+  .row{
+    display:flex;
+    align-items:flex-start;
+    gap:11px;
+    max-width:min(92%,760px);
+    transition:transform .14s ease;
+    touch-action:pan-y;
+    cursor:pointer;
+    user-select:none;
+    -webkit-user-select:none;
+  }
   .row.me{align-self:flex-end;flex-direction:row-reverse}
   .row:not(.me){align-self:flex-start}
-  .pfp{width:88px;height:88px;min-width:88px;min-height:88px;aspect-ratio:1/1;flex-shrink:0;border-radius:20px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
-  .msg{background:#191e2a;border:1px solid #283042;border-radius:24px;padding:18px 24px;flex:1;min-width:0;user-select:none;-webkit-user-select:none}
-  .row.me .msg{background:#1d2b45;border-color:#3b82f6}
-  .meta{font-size:22px;color:#9ca3af;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:16px}
-  .meta-actions{display:flex;align-items:center;gap:12px}
-  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.35);border-radius:12px;padding:4px 12px;font-size:20px;font-weight:600;cursor:pointer;font-family:inherit}
-  .reply-btn:hover{background:rgba(59,130,246,.18)}
-  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:4px 12px;font-size:20px;font-weight:600;cursor:pointer;font-family:inherit}
-  .del-btn:hover{background:rgba(248,113,113,.15)}
-  .reply-quote{font-size:22px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:4px solid #60a5fa;padding:6px 14px;border-radius:8px;margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .text{font-size:28px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
-  .msg-footer{margin-top:12px;display:flex;align-items:center;flex-wrap:wrap;gap:12px}
-  .like-pill{display:inline-flex;align-items:center;gap:8px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:4px 14px;font-size:22px;color:#fda4af}
-  .like-avatars{display:inline-flex;align-items:center;gap:6px}
-  .like-pfp{width:28px;height:28px;aspect-ratio:1/1;border-radius:8px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
-  .reply-banner{display:none;align-items:center;justify-content:space-between;gap:16px;background:#1e293b;border:1px solid #3b82f6;border-radius:16px;padding:12px 20px;font-size:24px;color:#dbeafe}
+  .pfp{
+    width:46px;
+    height:46px;
+    min-width:46px;
+    min-height:46px;
+    aspect-ratio:1/1;
+    flex-shrink:0;
+    border-radius:13px;
+    object-fit:cover;
+    image-rendering:pixelated;
+    border:2px solid var(--blush-border);
+    background:var(--surface);
+    box-shadow:0 2px 8px rgba(158,75,118,.1);
+  }
+  .msg{
+    background:var(--surface);
+    border:1.5px solid var(--blush-border);
+    border-radius:16px;
+    border-top-left-radius:4px;
+    padding:11px 15px;
+    flex:1;
+    min-width:0;
+    box-shadow:0 2px 10px rgba(45,27,37,.04);
+    user-select:none;
+    -webkit-user-select:none;
+  }
+  .row.me .msg{
+    background:var(--plum);
+    border-color:var(--plum);
+    color:#FFFFFF;
+    border-top-left-radius:16px;
+    border-top-right-radius:4px;
+    box-shadow:0 4px 14px rgba(158,75,118,.22);
+  }
+  .meta{
+    font-size:12px;
+    font-weight:700;
+    color:var(--plum);
+    margin-bottom:5px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .row.me .meta{color:var(--blush)}
+  .meta-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
+  .reply-btn{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1px solid var(--blush-border);
+    border-radius:7px;
+    padding:2px 8px;
+    font-size:11.5px;
+    font-weight:700;
+    cursor:pointer;
+    font-family:inherit;
+  }
+  .reply-btn:hover{background:var(--blush)}
+  .row.me .reply-btn{
+    background:rgba(244,220,230,.18);
+    color:var(--blush);
+    border-color:rgba(244,220,230,.35);
+  }
+  .row.me .reply-btn:hover{background:rgba(244,220,230,.3)}
+  .del-btn{
+    background:#FFF1F4;
+    color:#BE123C;
+    border:1px solid #FECDD3;
+    border-radius:7px;
+    padding:2px 8px;
+    font-size:11.5px;
+    font-weight:700;
+    cursor:pointer;
+    font-family:inherit;
+  }
+  .del-btn:hover{background:#FFE4E9}
+  .row.me .del-btn{
+    background:rgba(255,255,255,.16);
+    color:#FFE4E9;
+    border-color:rgba(255,255,255,.32);
+  }
+  .reply-quote{
+    font-size:12.5px;
+    font-weight:600;
+    color:var(--plum-dark);
+    background:var(--blush-soft);
+    border-left:3px solid var(--plum);
+    padding:5px 10px;
+    border-radius:8px;
+    margin-bottom:7px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
+  .row.me .reply-quote{
+    color:var(--blush);
+    background:rgba(87,35,62,.38);
+    border-left-color:var(--blush);
+  }
+  .text{
+    font-size:16px;
+    font-weight:500;
+    line-height:1.45;
+    white-space:pre-wrap;
+    word-break:break-word;
+  }
+  .msg-footer{margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+  .like-pill{
+    display:inline-flex;
+    align-items:center;
+    gap:5px;
+    background:var(--blush-soft);
+    border:1px solid var(--blush-border);
+    border-radius:999px;
+    padding:2px 9px;
+    font-size:12.5px;
+    font-weight:700;
+    color:var(--plum-dark);
+  }
+  .row.me .like-pill{
+    background:rgba(244,220,230,.22);
+    border-color:rgba(244,220,230,.45);
+    color:var(--blush);
+  }
+  .like-avatars{display:inline-flex;align-items:center;gap:4px}
+  .like-pfp{
+    width:18px;
+    height:18px;
+    aspect-ratio:1/1;
+    border-radius:5px;
+    object-fit:cover;
+    image-rendering:pixelated;
+    border:1px solid rgba(158,75,118,.3);
+  }
+
+  #mediaTab{
+    flex:1 1 auto;
+    min-height:0;
+    width:100%;
+    display:none;
+    flex-direction:column;
+    overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain;
+    padding:12px 12px 32px;
+    gap:16px;
+  }
+  #mediaTab.active{display:flex}
+  .media-upload-card{
+    background:var(--surface);
+    border:1.5px solid var(--blush-border);
+    border-radius:16px;
+    padding:14px 16px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    box-shadow:0 4px 14px rgba(158,75,118,.08);
+  }
+  .media-feed{
+    display:flex;
+    flex-direction:column;
+    gap:20px;
+    width:100%;
+  }
+  .media-card{
+    background:var(--surface);
+    border:1.5px solid var(--blush-border);
+    border-radius:16px;
+    overflow:hidden;
+    width:100%;
+    box-shadow:0 4px 16px rgba(45,27,37,.06);
+  }
+  .media-frame{
+    width:100%;
+    aspect-ratio:16/9;
+    background:var(--plum-deep);
+    display:block;
+  }
+  .media-frame img{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+  }
+  .media-meta{
+    padding:10px 14px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .media-link{
+    color:var(--plum-dark);
+    font-size:13.5px;
+    font-weight:700;
+    text-decoration:none;
+    word-break:break-all;
+  }
+  .media-link:hover{text-decoration:underline;color:var(--plum)}
+  .media-caption{
+    font-size:14px;
+    font-weight:600;
+    color:var(--text);
+  }
+
+  .bottom-bar{
+    flex:0 0 auto;
+    position:relative;
+    z-index:25;
+    background:var(--surface);
+    border-top:2px solid var(--blush);
+    padding:10px 16px calc(12px + env(safe-area-inset-bottom));
+    display:flex;
+    flex-direction:column;
+    gap:9px;
+    box-shadow:0 -4px 18px rgba(158,75,118,.08);
+  }
+  .reply-banner{
+    display:none;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    background:var(--blush);
+    border:1px solid var(--blush-border);
+    border-radius:10px;
+    padding:7px 12px;
+    font-size:13.5px;
+    font-weight:700;
+    color:var(--plum-dark);
+  }
   .reply-banner.open{display:flex}
-  .bottom-bar{background:#151922;border-top:2px solid #242b3a;padding:16px 24px 24px;display:flex;flex-direction:column;gap:16px}
-  .shortcuts{display:flex;gap:16px;flex-wrap:wrap}
-  .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:10px 24px;font-size:26px;font-weight:600;cursor:pointer;font-family:inherit}
-  .chip:active{background:#3b82f6;color:#fff;border-color:#3b82f6}
-  form{display:flex;gap:16px}
-  input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:20px;padding:20px 24px;font-size:28px;outline:none;font-family:inherit}
-  input:focus{border-color:#3b82f6}
-  button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:20px;padding:0 32px;font-weight:700;font-size:28px;cursor:pointer;font-family:inherit}
-  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:32px;z-index:20}
-  #settingsModal.open{display:flex}
-  .modal-card{width:100%;max-width:780px;background:#151922;border:1px solid #283042;border-radius:28px;padding:32px;display:flex;flex-direction:column;gap:24px}
-  .modal-title{font-size:32px;font-weight:700}
-  .field-label{font-size:24px;color:#9ca3af;margin-bottom:8px;display:block}
-  .crop-box{position:relative;width:360px;height:360px;margin:12px auto;border-radius:24px;overflow:hidden;border:4px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
+  .shortcuts{display:flex;gap:7px;flex-wrap:wrap}
+  .chip{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1px solid var(--blush-border);
+    border-radius:999px;
+    padding:5px 13px;
+    font-size:13.5px;
+    font-weight:700;
+    cursor:pointer;
+    font-family:inherit;
+    transition:all .12s ease;
+  }
+  .chip:hover{background:var(--blush);border-color:var(--plum)}
+  .chip:active{background:var(--plum);color:var(--blush);border-color:var(--plum)}
+  form{display:flex;gap:9px;align-items:center}
+  input[type=text],input[type=email],input[type=password],input[type=url],select{
+    flex:1;
+    min-width:0;
+    background:var(--bg);
+    color:var(--text);
+    border:1.5px solid var(--blush-border);
+    border-radius:12px;
+    padding:11px 14px;
+    font-size:15.5px;
+    font-weight:500;
+    outline:none;
+    font-family:inherit;
+    transition:border-color .14s ease,background .14s ease;
+  }
+  input[type=text]::placeholder,input[type=email]::placeholder,input[type=password]::placeholder,input[type=url]::placeholder{color:var(--muted)}
+  input[type=text]:focus,input[type=email]:focus,input[type=password]:focus,input[type=url]:focus,select:focus{border-color:var(--plum);background:var(--surface)}
+  button[type=submit]{
+    background:var(--plum);
+    color:var(--blush);
+    border:none;
+    border-radius:12px;
+    padding:0 20px;
+    height:44px;
+    font-family:'Montserrat',sans-serif;
+    font-weight:800;
+    font-size:14px;
+    text-transform:uppercase;
+    letter-spacing:.03em;
+    cursor:pointer;
+    flex-shrink:0;
+    transition:background .12s ease,transform .1s ease;
+  }
+  button[type=submit]:hover{background:var(--plum-dark);color:#FFFFFF}
+  button[type=submit]:active{transform:scale(.98)}
+
+  .modal-backdrop{
+    display:none;
+    position:fixed;
+    inset:0;
+    background:rgba(45,27,37,.55);
+    backdrop-filter:blur(3px);
+    align-items:center;
+    justify-content:center;
+    padding:16px;
+    z-index:40;
+    overflow-y:auto;
+  }
+  .modal-backdrop.open{display:flex}
+  .modal-card{
+    width:min(100%,460px);
+    max-height:90dvh;
+    background:var(--surface);
+    border:2px solid var(--blush);
+    border-radius:20px;
+    overflow-y:auto;
+    box-shadow:0 18px 40px rgba(87,35,62,.24);
+    display:flex;
+    flex-direction:column;
+  }
+  .modal-header{
+    background:var(--plum);
+    color:var(--blush);
+    padding:15px 20px;
+    border-bottom:3px solid var(--blush);
+  }
+  .modal-title{font-size:17px;text-transform:uppercase;letter-spacing:.03em}
+  .modal-body{padding:18px 20px 20px;display:flex;flex-direction:column;gap:14px}
+  .field-label{font-size:13px;font-weight:700;color:var(--plum-dark);margin-bottom:6px;display:block}
+  .mode-row{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:8px;
+    margin-bottom:8px;
+  }
+  .mode-btn{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1.5px solid var(--blush-border);
+    border-radius:10px;
+    padding:8px 10px;
+    font-family:'Montserrat',sans-serif;
+    font-size:12px;
+    font-weight:700;
+    cursor:pointer;
+  }
+  .mode-btn.active{
+    background:var(--plum);
+    color:var(--blush);
+    border-color:var(--plum);
+  }
+  .sonolus-box{
+    background:var(--blush-soft);
+    border:1px solid var(--blush-border);
+    border-radius:12px;
+    padding:11px 13px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+  }
+  .sonolus-label{font-size:13px;font-weight:700;color:var(--plum-dark)}
+  .sonolus-sub{font-size:12px;color:var(--muted)}
+  .auth-error{font-size:13px;font-weight:700;color:#BE123C;min-height:18px}
+  .save-status{font-size:13px;font-weight:700;color:var(--plum-dark);min-height:18px}
+  input[type=file]{font-size:13.5px;color:var(--muted);font-family:inherit}
+  input[type=range]{width:100%;accent-color:var(--plum)}
+  .crop-box{
+    position:relative;
+    width:208px;
+    height:208px;
+    margin:8px auto;
+    border-radius:14px;
+    overflow:hidden;
+    border:2px solid var(--plum);
+    background:var(--blush-soft);
+    touch-action:none;
+    cursor:grab;
+  }
   .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
-  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:8px;flex-wrap:wrap}
-  .modal-actions-right{display:flex;gap:16px}
+  .modal-actions{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:10px;
+    margin-top:4px;
+    padding-top:12px;
+    border-top:1px solid var(--blush-border);
+    flex-wrap:wrap;
+  }
+  .modal-actions-right{display:flex;gap:8px;margin-left:auto}
 </style>
 </head>
 <body>
   <header>
     <div class="header-brand">
       <img class="app-logo" src="/app-icon.png" alt="XX!"/>
-      <span>XX! Chat</span>
+      <span class="header-title">XX! Chat</span>
     </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
-      <button id="settingsBtn" type="button" class="btn-sm" style="display:none">Settings</button>
+      <button id="settingsBtn" type="button" class="btn-header" style="display:none">Settings</button>
     </div>
   </header>
   <div id="picker">
-    <div class="picker-title">Hi!, who are you?</div>
+    <div class="picker-header">
+      <div class="picker-title">Welcome to XX! Chat</div>
+      <div class="picker-sub">Select your staff profile</div>
+    </div>
     <div class="picker-grid">${cardsHtml}</div>
   </div>
-  <div id="chatView">
-    <div id="messages"></div>
-    <div class="bottom-bar">
-      <div id="replyBanner" class="reply-banner">
-        <span id="replyText"></span>
-        <button id="cancelReplyBtn" type="button" class="btn-sm">Cancel</button>
+  <div id="appView">
+    <div class="tab-bar">
+      <div class="tab-group">
+        <button id="tabChatBtn" type="button" class="tab-btn active">Chat</button>
+        <button id="tabMediaBtn" type="button" class="tab-btn">Media</button>
       </div>
-      <div id="shortcutsBar" class="shortcuts"></div>
-      <form id="chatForm">
-        <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
-        <button type="submit">Send</button>
-      </form>
     </div>
-  </div>
-  <div id="settingsModal">
-    <div class="modal-card">
-      <div class="modal-title">Chat Settings</div>
-      <div>
-        <label class="field-label" for="displayNameInput">Display Name (also used for @mention)</label>
-        <input id="displayNameInput" type="text" maxlength="40" placeholder="Your display name"/>
-      </div>
-      <div>
-        <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture (R2)</label>
-        <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
-        <div id="cropWrap" style="display:none;margin-top:16px">
-          <div id="cropBox" class="crop-box">
-            <img id="cropImg" alt="Crop preview"/>
-          </div>
-          <label class="field-label" for="zoomRange">Zoom</label>
-          <input id="zoomRange" type="range" min="1" max="3" step="0.02" value="1"/>
+    <div id="chatTab" class="active">
+      <div id="messages"></div>
+      <footer class="bottom-bar">
+        <div id="replyBanner" class="reply-banner">
+          <span id="replyText"></span>
+          <button id="cancelReplyBtn" type="button" class="btn-sm">Cancel</button>
+        </div>
+        <div id="shortcutsBar" class="shortcuts"></div>
+        <form id="chatForm">
+          <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
+          <button type="submit">Send</button>
+        </form>
+      </footer>
+    </div>
+    <div id="mediaTab">
+      <div id="mediaUploadCard" class="media-upload-card" style="display:none">
+        <span class="field-label">Add 16:9 Media (#163292)</span>
+        <input id="mediaFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
+        <input id="mediaLinkInput" type="url" maxlength="400" placeholder="Optional link (https://...)"/>
+        <input id="mediaCaptionInput" type="text" maxlength="160" placeholder="Optional caption"/>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+          <span id="mediaStatus" class="auth-error"></span>
+          <button id="uploadMediaBtn" type="button" class="btn-primary">Upload Media</button>
         </div>
       </div>
-      <div class="modal-actions">
-        <button id="logoutBtn" type="button" class="btn-sm btn-danger">Log out</button>
-        <div class="modal-actions-right">
-          <button id="closeSettingsBtn" type="button" class="btn-sm">Close</button>
-          <button id="saveSettingsBtn" type="button" class="btn-sm" style="background:#3b82f6;color:#fff;border-color:#3b82f6">Save</button>
+      <div id="mediaFeed" class="media-feed"></div>
+    </div>
+  </div>
+  <div id="passwordModal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">AXX!A Profile Password</div>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="profilePasswordInput">Enter password for AXX!A (#163292)</label>
+          <input id="profilePasswordInput" type="password" placeholder="Password" autocomplete="current-password"/>
+          <div id="passwordError" class="auth-error"></div>
+        </div>
+        <div class="modal-actions">
+          <div class="modal-actions-right">
+            <button id="cancelPasswordBtn" type="button" class="btn-sm">Cancel</button>
+            <button id="submitPasswordBtn" type="button" class="btn-primary">Unlock</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="settingsModal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">Chat Settings</div>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="displayNameInput">Display Name</label>
+          <input id="displayNameInput" type="text" maxlength="40" placeholder="Your display name"/>
+        </div>
+        <div>
+          <label class="field-label" for="notifyEmailInput">Email Notifications</label>
+          <div class="mode-row">
+            <button id="modeMentionBtn" type="button" class="mode-btn">Mentions only</button>
+            <button id="modeAllBtn" type="button" class="mode-btn">All messages</button>
+          </div>
+          <input id="notifyEmailInput" type="email" maxlength="120" placeholder="you@example.com"/>
+        </div>
+        <div class="sonolus-box">
+          <div>
+            <div class="sonolus-label">Sonolus App</div>
+            <div class="sonolus-sub">Open server chat in Sonolus</div>
+          </div>
+          <a id="openSonolusBtn" class="btn-sm" href="${escapeAttr(sonolusUrl)}">Open on Sonolus</a>
+        </div>
+        <div>
+          <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture</label>
+          <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
+          <div id="cropWrap" style="display:none;margin-top:10px">
+            <div id="cropBox" class="crop-box">
+              <img id="cropImg" alt="Crop preview"/>
+            </div>
+            <label class="field-label" for="zoomRange">Zoom</label>
+            <input id="zoomRange" type="range" min="1" max="3" step="0.02" value="1"/>
+          </div>
+        </div>
+        <div id="settingsStatus" class="save-status"></div>
+        <div class="modal-actions">
+          <button id="logoutBtn" type="button" class="btn-sm btn-danger">Log out</button>
+          <div class="modal-actions-right">
+            <button id="closeSettingsBtn" type="button" class="btn-sm">Close</button>
+            <button id="saveSettingsBtn" type="button" class="btn-primary">Save</button>
+          </div>
         </div>
       </div>
     </div>
   </div>
 <script>
   const STORAGE_KEY = 'xx_chat_handle';
+  const UNLOCK_KEY = 'xx_chat_unlocked_163292';
+  const PROTECTED_HANDLE = ${JSON.stringify(PROTECTED_CHAT_HANDLE)};
+  const MEDIA_ADMIN = ${JSON.stringify(MEDIA_ADMIN_HANDLE)};
   const COOKIE_NAME = ${JSON.stringify(CHAT_HANDLE_COOKIE)};
   const HOST_HANDLE = ${JSON.stringify(TOURNAMENT_HOST_HANDLE)};
   const knownHandles = ${JSON.stringify([...CHAT_PFP_HANDLES])};
@@ -899,12 +1735,28 @@ function renderStaffChatHtml(
   const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
   const prefsMap = ${JSON.stringify(prefsMap)};
   const defaultsMap = ${JSON.stringify(DEFAULT_CHAT_PROFILES)};
+  const initialMessages = ${safeInitialMessagesJson};
+  const initialMedia = ${safeInitialMediaJson};
 
   const pickerEl = document.getElementById('picker');
-  const chatViewEl = document.getElementById('chatView');
+  const appViewEl = document.getElementById('appView');
+  const tabChatBtn = document.getElementById('tabChatBtn');
+  const tabMediaBtn = document.getElementById('tabMediaBtn');
+  const chatTabEl = document.getElementById('chatTab');
+  const mediaTabEl = document.getElementById('mediaTab');
+  const mediaUploadCard = document.getElementById('mediaUploadCard');
+  const mediaFileInput = document.getElementById('mediaFileInput');
+  const mediaLinkInput = document.getElementById('mediaLinkInput');
+  const mediaCaptionInput = document.getElementById('mediaCaptionInput');
+  const mediaStatusEl = document.getElementById('mediaStatus');
+  const uploadMediaBtn = document.getElementById('uploadMediaBtn');
+  const mediaFeedEl = document.getElementById('mediaFeed');
+
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
   const logoutBtn = document.getElementById('logoutBtn');
+  const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+  const settingsStatusEl = document.getElementById('settingsStatus');
   const box = document.getElementById('messages');
   const shortcutsBar = document.getElementById('shortcutsBar');
   const input = document.getElementById('chatInput');
@@ -912,19 +1764,64 @@ function renderStaffChatHtml(
   const replyTextEl = document.getElementById('replyText');
   const cancelReplyBtn = document.getElementById('cancelReplyBtn');
 
+  const passwordModal = document.getElementById('passwordModal');
+  const profilePasswordInput = document.getElementById('profilePasswordInput');
+  const passwordError = document.getElementById('passwordError');
+
   const settingsModal = document.getElementById('settingsModal');
   const displayNameInput = document.getElementById('displayNameInput');
+  const modeMentionBtn = document.getElementById('modeMentionBtn');
+  const modeAllBtn = document.getElementById('modeAllBtn');
+  const notifyEmailInput = document.getElementById('notifyEmailInput');
   const pfpFileInput = document.getElementById('pfpFileInput');
   const cropWrap = document.getElementById('cropWrap');
   const cropBox = document.getElementById('cropBox');
   const cropImg = document.getElementById('cropImg');
   const zoomRange = document.getElementById('zoomRange');
 
+  let activeTab = 'chat';
   let loggedOut = false;
+  let pendingPasswordHandle = '';
+  let selectedNotifyMode = 'mention';
   let activeReply = null;
-  let currentMessages = [];
-  let hasLoadedOnce = false;
+  let currentMessages = Array.isArray(initialMessages) ? [...initialMessages] : [];
+  let currentMedia = Array.isArray(initialMedia) ? [...initialMedia] : [];
+  let socket = null;
+  let reconnectTimer = null;
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
+
+  function syncViewportHeight() {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    appViewEl.style.height = Math.max(240, vv.height - headerHeightPx()) + 'px';
+  }
+
+  function headerHeightPx() {
+    const h = document.querySelector('header');
+    return h ? h.getBoundingClientRect().height : 62;
+  }
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      syncViewportHeight();
+      box.scrollTop = box.scrollHeight;
+    });
+  }
+
+  function isProtectedUnlocked() {
+    try {
+      return sessionStorage.getItem(UNLOCK_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  function setProtectedUnlocked(val) {
+    try {
+      if (val) sessionStorage.setItem(UNLOCK_KEY, '1');
+      else sessionStorage.removeItem(UNLOCK_KEY);
+    } catch {}
+  }
 
   function readSavedHandle() {
     try {
@@ -979,17 +1876,23 @@ function renderStaffChatHtml(
   function getActiveUser() {
     if (loggedOut) return null;
     if (sonolusUser && sonolusUser.handle) {
+      if (sonolusUser.handle === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        return null;
+      }
       return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
     }
     const saved = readSavedHandle();
     if (saved && defaultsMap[saved]) {
+      if (saved === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        return null;
+      }
       return {
         id: saved,
         handle: saved,
         name: displayNameFor(saved, defaultsMap[saved].name),
       };
     }
-    return null
+    return null;
   }
 
   function authHeaders(extra = {}) {
@@ -1067,13 +1970,178 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
-  function render(messages) {
-    currentMessages = Array.isArray(messages) ? messages : [];
+  function setActiveTab(tab) {
+    activeTab = tab === 'media' ? 'media' : 'chat';
+    tabChatBtn.classList.toggle('active', activeTab === 'chat');
+    tabMediaBtn.classList.toggle('active', activeTab === 'media');
+    chatTabEl.classList.toggle('active', activeTab === 'chat');
+    mediaTabEl.classList.toggle('active', activeTab === 'media');
+    if (activeTab === 'chat') {
+      box.scrollTop = box.scrollHeight;
+    } else {
+      renderMedia(currentMedia);
+      void refreshMediaList();
+    }
+  }
+
+  tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
+  tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
+
+  function renderMedia(items) {
+    if (Array.isArray(items)) {
+      currentMedia = items;
+    }
+    const active = getActiveUser();
+    const canDelete = active && active.handle === MEDIA_ADMIN;
+
+    if (!currentMedia.length) {
+      mediaFeedEl.innerHTML = '<div class="empty-state">No media items yet.</div>';
+      return;
+    }
+
+    mediaFeedEl.innerHTML = currentMedia.map((item) => {
+      const imgSrc = '/api/chat/media/' + encodeURIComponent(item.id) + '?v=' + encodeURIComponent(String(item.createdAt || 0));
+      const safeLink = item.link && /^https?:\/\//i.test(item.link) ? item.link : '';
+      const linkHtml = safeLink
+        ? '<a class="media-link" href="' + escapeAttr(safeLink) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(safeLink) + '</a>'
+        : '';
+      const captionHtml = item.caption
+        ? '<div class="media-caption">' + escapeHtml(item.caption) + '</div>'
+        : '';
+      const delHtml = canDelete
+        ? '<button type="button" class="del-btn" data-delete-media="' + escapeAttr(item.id) + '">Delete</button>'
+        : '';
+
+      return '<article class="media-card">' +
+        '<div class="media-frame"><img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/></div>' +
+        '<div class="media-meta">' +
+          '<div style="display:flex;flex-direction:column;gap:4px;min-width:0">' + captionHtml + linkHtml + '</div>' +
+          delHtml +
+        '</div>' +
+      '</article>';
+    }).join('');
+  }
+
+  async function refreshMediaList() {
+    const active = getActiveUser();
+    if (!active) return;
+    const res = await fetch('/api/chat/media', {
+      headers: authHeaders(),
+      credentials: 'same-origin',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.items)) renderMedia(data.items);
+    }
+  }
+
+  async function fileTo16x9DataUrl(file) {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('Failed to read image'));
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('Invalid image'));
+      el.src = dataUrl;
+    });
+
+    const targetW = 1280;
+    const targetH = 720;
+    const targetRatio = targetW / targetH;
+    const srcW = img.naturalWidth || targetW;
+    const srcH = img.naturalHeight || targetH;
+    const srcRatio = srcW / srcH;
+
+    let sx = 0;
+    let sy = 0;
+    let sw = srcW;
+    let sh = srcH;
+    if (srcRatio > targetRatio) {
+      sw = Math.round(srcH * targetRatio);
+      sx = Math.round((srcW - sw) / 2);
+    } else if (srcRatio < targetRatio) {
+      sh = Math.round(srcW / targetRatio);
+      sy = Math.round((srcH - sh) / 2);
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
+    return canvas.toDataURL('image/png');
+  }
+
+  uploadMediaBtn.addEventListener('click', async () => {
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    const file = mediaFileInput.files && mediaFileInput.files[0];
+    if (!file) {
+      mediaStatusEl.textContent = 'Select an image first.';
+      return;
+    }
+    mediaStatusEl.textContent = 'Uploading...';
+    uploadMediaBtn.disabled = true;
+    try {
+      const imageDataUrl = await fileTo16x9DataUrl(file);
+      const res = await fetch('/api/chat/media', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          handle: active.handle,
+          imageDataUrl,
+          link: mediaLinkInput.value.trim(),
+          caption: mediaCaptionInput.value.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        mediaStatusEl.textContent = data.message || 'Upload failed.';
+        return;
+      }
+      mediaFileInput.value = '';
+      mediaLinkInput.value = '';
+      mediaCaptionInput.value = '';
+      mediaStatusEl.textContent = '';
+      if (Array.isArray(data.items)) renderMedia(data.items);
+    } finally {
+      uploadMediaBtn.disabled = false;
+    }
+  });
+
+  mediaFeedEl.addEventListener('click', async (e) => {
+    const delBtn = e.target.closest('[data-delete-media]');
+    if (!delBtn) return;
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    const id = delBtn.getAttribute('data-delete-media') || '';
+    if (!id) return;
+    const res = await fetch('/api/chat/media?id=' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: authHeaders(),
+      credentials: 'same-origin',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.items)) renderMedia(data.items);
+    }
+  });
+
+  function render(messages, force = false) {
+    const shouldStickBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90 || force;
+    if (Array.isArray(messages)) {
+      currentMessages = messages;
+    }
     const active = getActiveUser();
     const myHandle = active ? active.handle : '';
 
     if (currentMessages.length === 0) {
-      box.innerHTML = '<div class="empty-state">No messages yet.</div>';
+      box.innerHTML = '<div class="empty-state">No messages yet. Say hello!</div>';
       return;
     }
 
@@ -1083,7 +2151,7 @@ function renderStaffChatHtml(
       const canDelete = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
       const pfpImg = '<img class="pfp" src="' + escapeHtml(pfpUrlFor(m.handle)) + '" alt=""/>';
       const replyHtml = m.replyTo
-        ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.author || m.replyTo.handle || '') + ': ' + escapeHtml(m.replyTo.text || '') + '</div>'
+        ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.text || '') + '</div>'
         : '';
       const delHtml = canDelete
         ? '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>'
@@ -1091,7 +2159,7 @@ function renderStaffChatHtml(
 
       const likers = Array.isArray(m.likes) ? m.likes : [];
       const avatarsHtml = likers.map((h) =>
-        '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt="' + escapeHtml(h) + '"/>'
+        '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt=""/>'
       ).join('');
       const likeBadgeHtml = likers.length > 0
         ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span> ' + likers.length + '</span>'
@@ -1100,7 +2168,7 @@ function renderStaffChatHtml(
       return '<div class="row ' + mine + '" data-row-id="' + escapeHtml(m.id) + '">' +
         pfpImg +
         '<div class="msg" data-msg-id="' + escapeHtml(m.id) + '">' +
-          '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
+          '<div class="meta"><span>' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
             delHtml +
@@ -1111,62 +2179,132 @@ function renderStaffChatHtml(
         '</div>' +
       '</div>';
     }).join('');
-    box.scrollTop = box.scrollHeight;
+
+    if (shouldStickBottom) {
+      box.scrollTop = box.scrollHeight;
+    }
   }
 
-  async function loadMessages() {
+  function disconnectSocket() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (socket) {
+      try { socket.close(1000, 'Switching profile'); } catch {}
+      socket = null;
+    }
+  }
+
+  function connectSocket() {
+    disconnectSocket();
     const active = getActiveUser();
     if (!active) return;
-    if (!hasLoadedOnce) {
-      box.innerHTML = '<div class="empty-state">Loading messages...</div>';
-    }
-    try {
-      const qs = 'handle=' + encodeURIComponent(active.handle) + '&t=' + Date.now();
-      const res = await fetch('/api/chat?' + qs, {
-        headers: authHeaders(),
-        credentials: 'same-origin',
-        cache: 'no-store',
-      });
-      if (!res.ok) throw new Error(await res.text() || ('HTTP ' + res.status));
-      const data = await res.json();
-      if (data.prefs) {
-        Object.assign(prefsMap, data.prefs);
-        renderKnownUserChips();
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const qs = new URLSearchParams({ handle: active.handle });
+    if (sessionToken && !loggedOut) qs.set('session', sessionToken);
+    const ws = new WebSocket(proto + '//' + location.host + '/ws/chat?' + qs.toString());
+    socket = ws;
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(String(event.data || '{}'));
+        if (data.type === 'chat' && Array.isArray(data.messages)) {
+          render(data.messages);
+        }
+      } catch {}
+    };
+
+    ws.onclose = () => {
+      if (socket === ws) socket = null;
+      if (getActiveUser()) {
+        reconnectTimer = setTimeout(() => connectSocket(), 1500);
       }
-      hasLoadedOnce = true;
-      render(Array.isArray(data.messages) ? data.messages : []);
-    } catch (error) {
-      console.error('Could not load chat messages:', error);
-      if (!hasLoadedOnce) {
-        box.innerHTML = '<div class="empty-state">Could not load messages.</div>';
-      }
-    }
+    };
   }
 
   function syncMode() {
     const active = getActiveUser();
     if (!active) {
-      badgeEl.textContent = 'Pick profile';
+      disconnectSocket();
+      badgeEl.textContent = 'Select profile';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
-      chatViewEl.classList.remove('open');
+      appViewEl.classList.remove('open');
+      const saved = readSavedHandle();
+      if (!loggedOut && saved === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        openPasswordPrompt(PROTECTED_HANDLE);
+      }
       return;
     }
 
     badgeEl.textContent = formatTag(active.name, active.handle);
     settingsBtn.style.display = 'inline-block';
+    mediaUploadCard.style.display = active.handle === MEDIA_ADMIN ? 'flex' : 'none';
     pickerEl.classList.remove('open');
-    chatViewEl.classList.add('open');
+    appViewEl.classList.add('open');
+    setActiveTab(activeTab);
+    syncViewportHeight();
     renderKnownUserChips();
-    void loadMessages();
+    render(currentMessages, true);
+    renderMedia(currentMedia);
+    connectSocket();
   }
+
+  function openPasswordPrompt(handle) {
+    pendingPasswordHandle = handle;
+    profilePasswordInput.value = '';
+    passwordError.textContent = '';
+    passwordModal.classList.add('open');
+    setTimeout(() => profilePasswordInput.focus(), 20);
+  }
+
+  async function verifyProfilePassword() {
+    const pw = profilePasswordInput.value;
+    if (!pw) {
+      passwordError.textContent = 'Please enter the password.';
+      return;
+    }
+    const res = await fetch('/api/chat/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ handle: pendingPasswordHandle || PROTECTED_HANDLE, password: pw }),
+    });
+    if (!res.ok) {
+      passwordError.textContent = 'Incorrect password.';
+      return;
+    }
+    setProtectedUnlocked(true);
+    loggedOut = false;
+    persistHandle(pendingPasswordHandle || PROTECTED_HANDLE);
+    pendingPasswordHandle = '';
+    passwordModal.classList.remove('open');
+    syncMode();
+  }
+
+  document.getElementById('cancelPasswordBtn').addEventListener('click', () => {
+    pendingPasswordHandle = '';
+    passwordModal.classList.remove('open');
+  });
+  document.getElementById('submitPasswordBtn').addEventListener('click', () => {
+    void verifyProfilePassword();
+  });
+  profilePasswordInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void verifyProfilePassword();
+    } else if (e.key === 'Escape') {
+      pendingPasswordHandle = '';
+      passwordModal.classList.remove('open');
+    }
+  });
 
   logoutBtn.addEventListener('click', () => {
     loggedOut = true;
-    hasLoadedOnce = false;
+    setProtectedUnlocked(false);
     persistHandle('');
-    currentMessages = [];
-    render([]);
     setReplyTarget(null);
     settingsModal.classList.remove('open');
     syncMode();
@@ -1183,13 +2321,13 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || []);
+      if (Array.isArray(data.messages)) render(data.messages, true);
     }
   }
 
   function updateCropTransform() {
     if (!cropState.loaded) return;
-    const boxSize = 360;
+    const boxSize = 208;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
     const scaledW = cropState.imgW * totalScale;
@@ -1209,8 +2347,8 @@ function renderStaffChatHtml(
       cropImg.onload = () => {
         cropState = {
           loaded: true,
-          imgW: cropImg.naturalWidth || 360,
-          imgH: cropImg.naturalHeight || 360,
+          imgW: cropImg.naturalWidth || 208,
+          imgH: cropImg.naturalHeight || 208,
           scale: Number(zoomRange.value) || 1,
           x: 0,
           y: 0,
@@ -1255,7 +2393,7 @@ function renderStaffChatHtml(
   async function buildCroppedSquareDataUrl() {
     if (!cropState.loaded) return null;
     const outSize = 512;
-    const boxSize = 360;
+    const boxSize = 208;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
     const sx = Math.max(0, (-cropState.x) / totalScale);
@@ -1269,10 +2407,23 @@ function renderStaffChatHtml(
     return canvas.toDataURL('image/png');
   }
 
+  function applyNotifyModeUi(mode) {
+    selectedNotifyMode = mode === 'all' ? 'all' : 'mention';
+    modeMentionBtn.classList.toggle('active', selectedNotifyMode === 'mention');
+    modeAllBtn.classList.toggle('active', selectedNotifyMode === 'all');
+  }
+
+  modeMentionBtn.addEventListener('click', () => applyNotifyModeUi('mention'));
+  modeAllBtn.addEventListener('click', () => applyNotifyModeUi('all'));
+
   settingsBtn.addEventListener('click', () => {
     const active = getActiveUser();
     if (!active) return;
-    displayNameInput.value = active.name;
+    const p = prefsMap[active.handle] || {};
+    displayNameInput.value = p.displayName || active.name;
+    notifyEmailInput.value = p.notifyEmail || '';
+    settingsStatusEl.textContent = '';
+    applyNotifyModeUi(p.emailNotifyMode === 'all' ? 'all' : 'mention');
     pfpFileInput.value = '';
     zoomRange.value = '1';
     cropWrap.style.display = 'none';
@@ -1280,32 +2431,49 @@ function renderStaffChatHtml(
     settingsModal.classList.add('open');
   });
 
-  closeSettingsBtn.addEventListener('click', () => {
+  document.getElementById('closeSettingsBtn').addEventListener('click', () => {
     settingsModal.classList.remove('open');
   });
 
   saveSettingsBtn.addEventListener('click', async () => {
     const active = getActiveUser();
-    if (!active) return;
-    const displayName = displayNameInput.value.trim() || active.name;
-    const croppedPng = await buildCroppedSquareDataUrl();
-    const res = await fetch('/api/chat/settings', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      credentials: 'same-origin',
-      body: JSON.stringify({
-        handle: active.handle,
-        displayName,
-        pfpDataUrl: croppedPng,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
+    if (!active) {
+      settingsStatusEl.textContent = 'Session expired. Re-select profile.';
+      return;
+    }
+    settingsStatusEl.textContent = 'Saving...';
+    saveSettingsBtn.disabled = true;
+    try {
+      const displayName = displayNameInput.value.trim() || active.name;
+      const notifyEmail = notifyEmailInput.value.trim();
+      const croppedPng = await buildCroppedSquareDataUrl();
+      const res = await fetch('/api/chat/settings', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          handle: active.handle,
+          displayName,
+          notifyEmail,
+          emailNotifyMode: selectedNotifyMode,
+          pfpDataUrl: croppedPng,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        settingsStatusEl.textContent = data.message || ('Save failed (' + res.status + ')');
+        return;
+      }
       if (data.prefs) {
         prefsMap[active.handle] = data.prefs;
       }
+      settingsStatusEl.textContent = 'Saved.';
       settingsModal.classList.remove('open');
       syncMode();
+    } catch (err) {
+      settingsStatusEl.textContent = err && err.message ? err.message : 'Network error saving settings.';
+    } finally {
+      saveSettingsBtn.disabled = false;
     }
   });
 
@@ -1313,8 +2481,11 @@ function renderStaffChatHtml(
     card.addEventListener('click', () => {
       const picked = card.getAttribute('data-pick-handle') || '';
       if (!defaultsMap[picked]) return;
+      if (picked === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        openPasswordPrompt(picked);
+        return;
+      }
       loggedOut = false;
-      hasLoadedOnce = false;
       persistHandle(picked);
       syncMode();
     });
@@ -1339,7 +2510,7 @@ function renderStaffChatHtml(
     if (!swipeRow || e.touches.length !== 1) return;
     const dx = e.touches[0].clientX - swipeStartX;
     if (dx > 0) {
-      swipeDeltaX = Math.min(120, dx);
+      swipeDeltaX = Math.min(72, dx);
       swipeRow.style.transform = 'translateX(' + swipeDeltaX + 'px)';
     }
   }, { passive: true });
@@ -1348,7 +2519,7 @@ function renderStaffChatHtml(
     if (!swipeRow) return;
     const rowId = swipeRow.getAttribute('data-row-id') || '';
     swipeRow.style.transform = '';
-    const triggered = swipeDeltaX >= 64;
+    const triggered = swipeDeltaX >= 40;
     swipeRow = null;
     swipeDeltaX = 0;
     if (triggered && rowId) {
@@ -1372,7 +2543,7 @@ function renderStaffChatHtml(
   });
 
   box.addEventListener('dblclick', async (e) => {
-    if (e.target.closest('button')) return;
+    if (e.target.closest('button,input')) return;
     const rowEl = e.target.closest('[data-row-id]');
     if (!rowEl) return;
     const id = rowEl.getAttribute('data-row-id');
@@ -1403,7 +2574,7 @@ function renderStaffChatHtml(
       });
       if (res.ok) {
         const data = await res.json();
-        render(data.messages || []);
+        if (Array.isArray(data.messages)) render(data.messages, true);
       }
       return;
     }
@@ -1434,7 +2605,7 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || []);
+      if (Array.isArray(data.messages)) render(data.messages, true);
     }
   });
 
@@ -1443,25 +2614,22 @@ function renderStaffChatHtml(
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) void loadMessages();
+    if (!document.hidden && !socket) connectSocket();
   });
   window.addEventListener('focus', () => {
-    void loadMessages();
+    if (!socket) connectSocket();
   });
   window.addEventListener('pageshow', () => {
     syncMode();
   });
 
   syncMode();
-  setInterval(() => {
-    void loadMessages();
-  }, 2500);
 </script>
 </body>
 </html>`
 }
 
-async function roomItems(env: Env, _session: AuthSession | null) {
+async function roomItems(env: WorkerEnv, _session: AuthSession | null) {
     const rooms = await lobby(env).list()
 
     const items = await Promise.all(
@@ -1711,7 +2879,7 @@ const isUnch = (chart: SheetChart) => {
     }
 }
 
-async function findChart(name: string, env: Env): Promise<SheetChart | null> {
+async function findChart(name: string, env: WorkerEnv): Promise<SheetChart | null> {
     const [customCharts, playlists] = await Promise.all([
         getCustomLevels(env),
         getPlaylists(env),
@@ -1785,13 +2953,13 @@ async function proxyToUnch(
 export default {
     async scheduled(
         _event: ScheduledEvent,
-        env: Env,
+        env: WorkerEnv,
         ctx: ExecutionContext,
     ): Promise<void> {
         ctx.waitUntil(refreshDailyAssets(env))
     },
 
-    async fetch(req: Request, env: Env): Promise<Response> {
+    async fetch(req: Request, env: WorkerEnv): Promise<Response> {
         const url = new URL(req.url)
         const path = url.pathname.replace(/\/+$/, '') || '/'
 
@@ -1812,8 +2980,8 @@ export default {
                 start_url: '/chat',
                 scope: '/',
                 display: 'standalone',
-                background_color: '#0d0f14',
-                theme_color: '#0d0f14',
+                background_color: '#FAF7F9',
+                theme_color: '#9E4B76',
                 icons: [
                     {
                         src: '/app-icon.png',
@@ -1871,12 +3039,17 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/app-icon.png' && req.method === 'GET') {
-            const obj = await getBucketImage(env, [
-                'chat/XX!.png',
-                'XX!.png',
-                'chat/pfp/163292.png',
-                'chat/163292.png',
-            ])
+            const obj =
+                (await getBucketObject(assetsBucket(env), [
+                    'XX!.png',
+                    'chat/XX!.png',
+                    'chat/pfp/163292.png',
+                ])) ??
+                (await getBucketObject(communityBucket(env), [
+                    'XX!.png',
+                    'chat/XX!.png',
+                    'chat/pfp/163292.png',
+                ]))
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -1888,11 +3061,9 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-            const obj = await getBucketImage(env, [
-                'XX!.png',
-                'sonolus-assets/XX!.png',
-                'chat/XX!.png',
-            ])
+            const obj =
+                (await getBucketObject(assetsBucket(env), ['XX!.png'])) ??
+                (await getBucketObject(communityBucket(env), ['XX!.png']))
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -1909,9 +3080,9 @@ self.addEventListener('fetch', (event) => {
             if (!RANKED_TIERS_UPPER.has(tierUpper)) {
                 return new Response(null, { status: 404 })
             }
-            const obj = await getBucketImage(env, [
-                `sonolus-assets/ranked-match/${tierUpper}/${tierUpper}.png`,
+            const obj = await getBucketObject(assetsBucket(env), [
                 `ranked-match/${tierUpper}/${tierUpper}.png`,
+                `${tierUpper}.png`,
             ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
@@ -1947,7 +3118,7 @@ self.addEventListener('fetch', (event) => {
         const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
         if (pfpMatch && req.method === 'GET') {
             const handle = decodeURIComponent(pfpMatch[1]!).trim()
-            if (!CHAT_PFP_HANDLE_SET.has(handle) || !env.COMMUNITY_BUCKET) {
+            if (!CHAT_PFP_HANDLE_SET.has(handle)) {
                 return new Response(null, { status: 404 })
             }
 
@@ -1956,22 +3127,152 @@ self.addEventListener('fetch', (event) => {
                 prefs.pfpKey,
                 `chat/pfp/${handle}.png`,
                 `chat/${handle}.png`,
+                `${handle}.png`,
             ].filter((k): k is string => Boolean(k))
 
-            for (const key of keys) {
-                const obj = await env.COMMUNITY_BUCKET.get(key).catch(() => null)
-                if (obj) {
-                    return new Response(obj.body, {
-                        headers: {
-                            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-                            'Access-Control-Allow-Origin': '*',
-                            'Cache-Control': 'no-cache',
-                        },
-                    })
-                }
+            const obj =
+                (await getBucketObject(communityBucket(env), keys)) ??
+                (await getBucketObject(assetsBucket(env), keys))
+            if (obj) {
+                return new Response(obj.body, {
+                    headers: {
+                        'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': 'no-cache',
+                    },
+                })
             }
 
             return new Response(null, { status: 404 })
+        }
+
+        const mediaAssetMatch = path.match(/^\/api\/chat\/media\/([^/]+)$/)
+        if (mediaAssetMatch && req.method === 'GET') {
+            const mediaId = decodeURIComponent(mediaAssetMatch[1]!).trim()
+            const items = await listChatMedia(env)
+            const target = items.find((m) => m.id === mediaId)
+            if (!target) return new Response(null, { status: 404 })
+
+            const obj = await getBucketObject(communityBucket(env), [
+                target.imageKey,
+                `chat/media/${mediaId}.png`,
+                `media/${mediaId}.png`,
+            ])
+            if (!obj) return new Response(null, { status: 404 })
+
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? target.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
+        if (path === '/api/chat/media') {
+            let body: any = null
+            if (req.method === 'POST') {
+                try {
+                    body = await req.json()
+                } catch {
+                    return message(400, 'Invalid JSON.')
+                }
+            }
+
+            const resolved = await resolveChatUser(req, env, url, body)
+            if (!resolved) {
+                return message(403, 'Choose a valid handle.')
+            }
+
+            if (req.method === 'GET') {
+                const items = await listChatMedia(env)
+                return json({ items })
+            }
+
+            if (req.method === 'POST') {
+                if (!isMediaAdminHandle(resolved.user.handle)) {
+                    return message(403, 'Only 163292 can add media.')
+                }
+
+                const dataUrl = typeof body?.imageDataUrl === 'string' ? body.imageDataUrl : ''
+                const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
+                if (!match) {
+                    return message(400, 'Invalid image data.')
+                }
+
+                const mime = match[1]!
+                const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
+                if (rawBytes.byteLength > 4 * 1024 * 1024) {
+                    return message(400, 'Media image too large.')
+                }
+
+                const bucket = communityBucket(env)
+                if (!bucket) {
+                    return message(500, 'COMMUNITY_BUCKET is not configured.')
+                }
+
+                const id = randomId(12)
+                const imageKey = `chat/media/${id}.png`
+                await bucket.put(imageKey, rawBytes, {
+                    httpMetadata: { contentType: mime },
+                })
+
+                const safeLink = sanitizeHttpLink(body?.link)
+                const safeCaption = typeof body?.caption === 'string'
+                    ? body.caption.trim().slice(0, 160)
+                    : ''
+
+                const existing = await listChatMedia(env)
+                const nextItem: ChatMediaItem = {
+                    id,
+                    imageKey,
+                    contentType: mime,
+                    ...(safeLink ? { link: safeLink } : {}),
+                    ...(safeCaption ? { caption: safeCaption } : {}),
+                    createdAt: Date.now(),
+                    authorHandle: resolved.user.handle,
+                }
+                const updated = [nextItem, ...existing]
+                await saveChatMediaIndex(env, updated)
+                return json({ ok: true, item: nextItem, items: updated })
+            }
+
+            if (req.method === 'DELETE') {
+                if (!isMediaAdminHandle(resolved.user.handle)) {
+                    return message(403, 'Only 163292 can delete media.')
+                }
+                const id = (url.searchParams.get('id') ?? '').trim()
+                if (!id) return message(400, 'Missing media id.')
+
+                const existing = await listChatMedia(env)
+                const target = existing.find((m) => m.id === id)
+                if (!target) return message(404, 'Media item not found.')
+
+                const bucket = communityBucket(env)
+                if (bucket) {
+                    await bucket.delete(target.imageKey).catch(() => {})
+                }
+                const updated = existing.filter((m) => m.id !== id)
+                await saveChatMediaIndex(env, updated)
+                return json({ ok: true, items: updated })
+            }
+        }
+
+        if (path === '/api/chat/auth' && req.method === 'POST') {
+            let body: any
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid JSON.')
+            }
+            const handle = String(body?.handle ?? '').trim()
+            if (!requiresProfilePassword(handle)) {
+                return json({ ok: true })
+            }
+            if (!matchesSessionSecretPassword(env, body?.password)) {
+                return message(401, 'Invalid password.')
+            }
+            return json({ ok: true })
         }
 
         if (path === '/api/chat/settings' && req.method === 'POST') {
@@ -1987,6 +3288,11 @@ self.addEventListener('fetch', (event) => {
                 return message(403, 'Choose a valid handle to update settings.')
             }
 
+            const bucket = communityBucket(env)
+            if (!bucket) {
+                return message(500, 'COMMUNITY_BUCKET is not configured.')
+            }
+
             const handle = resolved.user.handle
             let pfpKey: string | undefined
 
@@ -2000,34 +3306,71 @@ self.addEventListener('fetch', (event) => {
                 if (rawBytes.byteLength > 2 * 1024 * 1024) {
                     return message(400, 'Profile image too large.')
                 }
-                if (env.COMMUNITY_BUCKET) {
-                    pfpKey = `chat/pfp/${handle}.png`
-                    await env.COMMUNITY_BUCKET.put(pfpKey, rawBytes, {
-                        httpMetadata: { contentType: mime },
-                    })
-                }
+                pfpKey = `chat/pfp/${handle}.png`
+                await bucket.put(pfpKey, rawBytes, {
+                    httpMetadata: { contentType: mime },
+                })
             }
 
             const nextDisplayName = typeof body?.displayName === 'string' && body.displayName.trim()
                 ? body.displayName.trim().slice(0, 40)
                 : resolved.user.name
 
-            const savedPrefs = await saveUserChatPrefs(env, handle, nextDisplayName, pfpKey)
+            const notifyEmail = typeof body?.notifyEmail === 'string'
+                ? body.notifyEmail.trim().slice(0, 120)
+                : undefined
+
+            const emailNotifyMode: EmailNotifyMode | undefined =
+                body?.emailNotifyMode === 'all' || body?.emailNotifyMode === 'mention'
+                    ? body.emailNotifyMode
+                    : undefined
+
+            const savedPrefs = await saveUserChatPrefs(
+                env,
+                handle,
+                nextDisplayName,
+                pfpKey,
+                notifyEmail,
+                emailNotifyMode,
+            )
             return json({ ok: true, prefs: savedPrefs })
         }
 
+        if (path === '/ws/chat' && req.headers.get('Upgrade') === 'websocket') {
+            const resolved = await resolveChatUser(req, env, url)
+            if (!resolved) {
+                return new Response('Unauthorized', { status: 401 })
+            }
+            return chatStub(env).fetch(req)
+        }
+
         if (path === '/chat' && req.method === 'GET') {
-            const prefsEntries = await Promise.all(
-                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
-            )
+            const [prefsEntries, initialMessages, initialMedia] = await Promise.all([
+                Promise.all(
+                    CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
+                ),
+                chatStub(env).listMessages().catch(() => []),
+                listChatMedia(env).catch(() => []),
+            ])
             const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
+            const sUrl = sonolusDeepLinkUrl(req, env)
             if (resolved) {
                 return html(
-                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus, prefsMap),
+                    renderStaffChatHtml(
+                        resolved.user,
+                        resolved.token,
+                        resolved.fromSonolus,
+                        prefsMap,
+                        sUrl,
+                        initialMessages,
+                        initialMedia,
+                    ),
                 )
             }
-            return html(renderStaffChatHtml(null, '', false, prefsMap))
+            return html(
+                renderStaffChatHtml(null, '', false, prefsMap, sUrl, initialMessages, initialMedia),
+            )
         }
 
         if (path === '/api/chat') {
@@ -2051,7 +3394,7 @@ self.addEventListener('fetch', (event) => {
             const prefsMap = Object.fromEntries(prefsEntries)
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json({ messages, prefs: prefsMap })
             }
 
@@ -2061,7 +3404,7 @@ self.addEventListener('fetch', (event) => {
                     if (!targetId) {
                         return message(400, 'Missing message id.')
                     }
-                    const messages = await lobby(env).listChatMessages().catch(() => [])
+                    const messages = await chatStub(env).listMessages().catch(() => [])
                     const target = messages.find((m) => m.id === targetId)
                     if (!target) {
                         return message(404, 'Message not found.')
@@ -2069,16 +3412,16 @@ self.addEventListener('fetch', (event) => {
                     if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                         return message(403, 'Only 163292 can delete messages from other members.')
                     }
-                    await lobby(env).deleteChatMessage(targetId)
-                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    await chatStub(env).deleteMessage(targetId)
+                    const updated = await chatStub(env).listMessages().catch(() => [])
                     return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
 
                 if (body?.action === 'like') {
                     const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
                     if (!targetId) return message(400, 'Missing message id.')
-                    await lobby(env).toggleChatLike(targetId, resolved.user.handle)
-                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    await chatStub(env).toggleLike(targetId, resolved.user.handle)
+                    const updated = await chatStub(env).listMessages().catch(() => [])
                     return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
 
@@ -2094,14 +3437,14 @@ self.addEventListener('fetch', (event) => {
                     }
                     : undefined
 
-                await lobby(env).addChatMessage({
+                await chatStub(env).addMessage({
                     handle: resolved.user.handle,
                     author: resolved.user.name || resolved.user.handle,
                     text: text.slice(0, 500),
                     ...(replyTo ? { replyTo } : {}),
                 })
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json({ ok: true, messages, prefs: prefsMap })
             }
 
@@ -2110,7 +3453,7 @@ self.addEventListener('fetch', (event) => {
                 if (!id) {
                     return message(400, 'Missing message id.')
                 }
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 const target = messages.find((m) => m.id === id)
                 if (!target) {
                     return message(404, 'Message not found.')
@@ -2118,8 +3461,8 @@ self.addEventListener('fetch', (event) => {
                 if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                     return message(403, 'Only 163292 can delete messages from other members.')
                 }
-                await lobby(env).deleteChatMessage(id)
-                const updated = await lobby(env).listChatMessages().catch(() => [])
+                await chatStub(env).deleteMessage(id)
+                const updated = await chatStub(env).listMessages().catch(() => [])
                 return json({ ok: true, messages: updated, prefs: prefsMap })
             }
         }
@@ -2157,7 +3500,9 @@ self.addEventListener('fetch', (event) => {
             const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
+            const bannerObject =
+                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
+                (await getBucketObject(communityBucket(env), ['banner.png']))
             let banner: { hash: string; url: string } | undefined
 
             if (bannerObject) {
@@ -2239,7 +3584,9 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object = await env.POSTS_BUCKET.get('server/banner.png')
+            const object =
+                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
+                (await getBucketObject(communityBucket(env), ['banner.png']))
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -2259,8 +3606,8 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
+                    chatStub(env).listMessages().catch(() => []),
+                    chatStub(env).getPinnedId().catch(() => null),
                 ])
 
                 return json({
@@ -2318,8 +3665,8 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
+                    chatStub(env).listMessages().catch(() => []),
+                    chatStub(env).getPinnedId().catch(() => null),
                 ])
 
                 return json({
@@ -2437,7 +3784,7 @@ self.addEventListener('fetch', (event) => {
                     return json({ creates: [], actions: [], topComments: [] })
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json({
                     creates: [],
                     actions: [chatActionForm],
@@ -2484,7 +3831,7 @@ self.addEventListener('fetch', (event) => {
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await lobby(env).addChatMessage({
+                await chatStub(env).addMessage({
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
@@ -2555,7 +3902,7 @@ self.addEventListener('fetch', (event) => {
                     return json({ pageCount: 1, comments: [] })
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json(formatChatCommunityComments(messages, session, page))
             }
 
@@ -2583,13 +3930,13 @@ self.addEventListener('fetch', (event) => {
                     return message(403, 'Chat is restricted.')
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 const target = messages.find((m) => m.id === commentName)
                 if (!target || !canDeleteComment(session, target.handle)) {
                     return message(403, 'You cannot delete this comment.')
                 }
 
-                await lobby(env).deleteChatMessage(commentName)
+                await chatStub(env).deleteMessage(commentName)
                 return json({
                     key: '',
                     hashes: [],
@@ -2643,7 +3990,7 @@ self.addEventListener('fetch', (event) => {
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await lobby(env).addChatMessage({
+                await chatStub(env).addMessage({
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
@@ -2689,10 +4036,10 @@ self.addEventListener('fetch', (event) => {
             }
 
             await Promise.all([
-                env.POSTS_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
-                env.POSTS_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
-                env.COMMUNITY_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
-                env.COMMUNITY_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
+                ...[...bucketsForRead(env)].flatMap((b) => [
+                    b.delete(`${post.category}/${postName}/thumbnail`).catch(() => {}),
+                    b.delete(`posts/${postName}/thumbnail`).catch(() => {}),
+                ]),
                 lobby(env).removePost(postName),
             ])
 
@@ -2785,11 +4132,13 @@ self.addEventListener('fetch', (event) => {
                 return message(400, 'Image hash does not match.')
             }
 
-            const targetBucket = env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET
-            const objectKey = `${post.category}/${post.item.name}/thumbnail`
-            await targetBucket.put(objectKey, bytes, {
-                httpMetadata: { contentType },
-            })
+            const targetBucket = communityBucket(env)
+            if (targetBucket) {
+                const objectKey = `${post.category}/${post.item.name}/thumbnail`
+                await targetBucket.put(objectKey, bytes, {
+                    httpMetadata: { contentType },
+                })
+            }
 
             await lobby(env).setPostThumbnail(
                 post.item.name,
@@ -2807,7 +4156,7 @@ self.addEventListener('fetch', (event) => {
             const post = await lobby(env).getPost(name).catch(() => null)
             const cat = post?.category ?? 'posts'
 
-            const object = await getBucketImage(env, [
+            const object = await getBucketObject(communityBucket(env), [
                 `${cat}/${name}/thumbnail`,
                 `posts/${name}/thumbnail`,
                 `announcements/${name}/thumbnail`,
@@ -2835,8 +4184,8 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
+                    chatStub(env).listMessages().catch(() => []),
+                    chatStub(env).getPinnedId().catch(() => null),
                 ])
                 const extUrl = externalChatUrl(req, env)
 
@@ -3202,4 +4551,4 @@ self.addEventListener('fetch', (event) => {
 
         return new Response('Not found', { status: 404 })
     },
-} satisfies ExportedHandler<Env>
+} satisfies ExportedHandler<WorkerEnv>
