@@ -162,60 +162,88 @@ export class Lobby extends DurableObject<Env> {
         })
     }
 
-    private async loadFromR2(): Promise<LobbyState | null> {
+    private async loadPostsFromR2(): Promise<StoredPost[]> {
         const bucket = this.env.COMMUNITY_BUCKET
-        if (!bucket) return null
+        if (!bucket) return []
 
-        try {
-            const [annObj, postsObj, resObj, chatObj] = await Promise.all([
-                bucket.get(categoryIndexKey('announcements')),
-                bucket.get(categoryIndexKey('posts')),
-                bucket.get(categoryIndexKey('results')),
-                bucket.get(CHAT_INDEX_KEY),
-            ])
+        const [annObj, postsObj, resObj] = await Promise.all([
+            bucket.get(categoryIndexKey('announcements')).catch(() => null),
+            bucket.get(categoryIndexKey('posts')).catch(() => null),
+            bucket.get(categoryIndexKey('results')).catch(() => null),
+        ])
 
-            const loadedPosts: StoredPost[] = []
-            const seenNames = new Set<string>()
+        const loadedPosts: StoredPost[] = []
+        const seenNames = new Set<string>()
 
-            for (const [category, obj] of [
-                ['announcements', annObj],
-                ['posts', postsObj],
-                ['results', resObj],
-            ] as const) {
-                if (!obj) continue
-                const parsed = await obj.json() as { posts?: StoredPost[] }
-                if (!Array.isArray(parsed.posts)) continue
-                for (const raw of parsed.posts) {
+        for (const [category, obj] of [
+            ['announcements', annObj],
+            ['posts', postsObj],
+            ['results', resObj],
+        ] as const) {
+            if (!obj) continue
+            try {
+                const text = (await obj.text()).trim()
+                if (!text) continue
+                const parsed = JSON.parse(text) as { posts?: StoredPost[] } | StoredPost[]
+                const list = Array.isArray(parsed)
+                    ? parsed
+                    : Array.isArray(parsed?.posts)
+                        ? parsed.posts
+                        : []
+                for (const raw of list) {
                     const normalized = normalizePost(raw, category)
                     if (!seenNames.has(normalized.item.name)) {
                         seenNames.add(normalized.item.name)
                         loadedPosts.push(normalized)
                     }
                 }
+            } catch {
+                // ignore empty/invalid manual placeholder JSON
             }
+        }
+
+        return loadedPosts.slice(-MAX_POSTS)
+    }
+
+    private async loadFromR2(): Promise<LobbyState | null> {
+        const bucket = this.env.COMMUNITY_BUCKET
+        if (!bucket) return null
+
+        try {
+            const [loadedPosts, chatObj] = await Promise.all([
+                this.loadPostsFromR2(),
+                bucket.get(CHAT_INDEX_KEY).catch(() => null),
+            ])
 
             let chat: StoredChatMessage[] = []
             let pinnedChatId: string | null = null
 
             if (chatObj) {
-                const parsedChat = await chatObj.json() as {
-                    messages?: StoredChatMessage[]
-                    pinnedChatId?: string | null
-                }
-                if (Array.isArray(parsedChat.messages)) {
-                    chat = parsedChat.messages
-                        .slice(-MAX_CHAT)
-                        .map((message) => normalizeChatMessage(message))
-                }
-                if (typeof parsedChat.pinnedChatId === 'string') {
-                    pinnedChatId = parsedChat.pinnedChatId
+                try {
+                    const text = (await chatObj.text()).trim()
+                    if (text) {
+                        const parsedChat = JSON.parse(text) as {
+                            messages?: StoredChatMessage[]
+                            pinnedChatId?: string | null
+                        }
+                        if (Array.isArray(parsedChat.messages)) {
+                            chat = parsedChat.messages
+                                .slice(-MAX_CHAT)
+                                .map((message) => normalizeChatMessage(message))
+                        }
+                        if (typeof parsedChat.pinnedChatId === 'string') {
+                            pinnedChatId = parsedChat.pinnedChatId
+                        }
+                    }
+                } catch {
+                    // ignore empty/invalid chat JSON
                 }
             }
 
             return {
                 rooms: [],
                 roomEntries: {},
-                posts: loadedPosts.slice(-MAX_POSTS),
+                posts: loadedPosts,
                 chat,
                 pinnedChatId,
             }
@@ -279,14 +307,23 @@ export class Lobby extends DurableObject<Env> {
         if (stored) {
             const roomNames = Array.isArray(stored.rooms) ? stored.rooms.map(String).filter(Boolean) : []
             this.rooms = new Set(roomNames)
+            const r2Posts = await this.loadPostsFromR2()
+            const storedPosts = Array.isArray(stored.posts)
+                ? stored.posts.slice(-MAX_POSTS).map((post) => normalizePost(post))
+                : []
+            const mergedPosts = r2Posts.length > 0
+                ? [
+                    ...r2Posts,
+                    ...storedPosts.filter((sp) => !r2Posts.some((rp) => rp.item.name === sp.item.name)),
+                ].slice(-MAX_POSTS)
+                : storedPosts
+
             this.st = {
                 rooms: [...this.rooms],
                 roomEntries: stored.roomEntries && typeof stored.roomEntries === 'object'
                     ? stored.roomEntries
                     : {},
-                posts: Array.isArray(stored.posts)
-                    ? stored.posts.slice(-MAX_POSTS).map((post) => normalizePost(post))
-                    : [],
+                posts: mergedPosts,
                 chat: Array.isArray(stored.chat)
                     ? stored.chat.slice(-MAX_CHAT).map((message) => normalizeChatMessage(message))
                     : [],
