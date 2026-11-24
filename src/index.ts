@@ -3199,7 +3199,7 @@ self.addEventListener('fetch', (event) => {
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
             const obj = await getBucketObject(assetsBucket(env), [
-                'server/banner.png',
+                'XX!.png',
                 'ranked-match/MASTER/MASTER.png',
             ])
             if (!obj) return new Response(null, { status: 404 })
