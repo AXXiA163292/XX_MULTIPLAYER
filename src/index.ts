@@ -2298,6 +2298,7 @@ self.addEventListener('fetch', (event) => {
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
+                        searchValues: `category=${kind}`,
                         items: posts.map(buildPostItemWithBadges),
                     }
                 }),
