@@ -1,4 +1,3 @@
-
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "xx-multiplayer",
@@ -23,6 +22,9 @@
     "issue_detection": {
       "enabled": true
     }
+  },
+  "vars": {
+    "RESEND_FROM_EMAIL": "XX! <onboarding@resend.dev>"
   },
   "durable_objects": {
     "bindings": [
