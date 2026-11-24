@@ -146,7 +146,7 @@ function assetsBucket(env: WorkerEnv): R2Bucket | null {
 }
 
 function bucketsForRead(env: WorkerEnv): R2Bucket[] {
-    return [env.COMMUNITY_BUCKET, env.SONOLUS_ASSETS_BUCKET].filter(
+    return [env.SONOLUS_ASSETS_BUCKET, env.COMMUNITY_BUCKET].filter(
         (b): b is R2Bucket => Boolean(b),
     )
 }
@@ -163,6 +163,31 @@ function sanitizeHttpLink(raw?: unknown): string {
         // invalid link
     }
     return ''
+}
+
+async function getBucketObject(
+    bucket: R2Bucket | null,
+    keys: string[],
+): Promise<R2ObjectBody | null> {
+    if (!bucket) return null
+    for (const key of keys) {
+        const obj = await bucket.get(key).catch(() => null)
+        if (obj) return obj
+    }
+    return null
+}
+
+async function getCachedJsonFromAssets<T>(
+    env: WorkerEnv,
+    keys: string[],
+): Promise<T | null> {
+    const obj = await getBucketObject(assetsBucket(env), keys)
+    if (!obj) return null
+    try {
+        return await obj.json() as T
+    } catch {
+        return null
+    }
 }
 
 async function getUserChatPrefs(env: WorkerEnv, handle: string): Promise<UserChatPrefs> {
@@ -247,6 +272,7 @@ async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
     const bucket = communityBucket(env)
     if (!bucket) return []
 
+    const indexed: ChatMediaItem[] = []
     for (const key of [MEDIA_INDEX_KEY, 'media/index.json']) {
         try {
             const obj = await bucket.get(key)
@@ -257,14 +283,40 @@ async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
                 : Array.isArray(parsed?.items)
                     ? parsed.items
                     : []
-            return rawList
-                .filter((item): item is ChatMediaItem => Boolean(item && typeof item.id === 'string' && typeof item.imageKey === 'string'))
-                .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+            for (const item of rawList) {
+                if (item && typeof item.id === 'string' && typeof item.imageKey === 'string') {
+                    indexed.push(item)
+                }
+            }
+            if (indexed.length > 0) break
         } catch {
             // try next
         }
     }
-    return []
+
+    if (indexed.length > 0) {
+        return indexed.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    }
+
+    try {
+        const listed = await bucket.list({ prefix: 'chat/media/' })
+        const derived: ChatMediaItem[] = []
+        for (const obj of listed.objects ?? []) {
+            if (!obj.key || obj.key.endsWith('/') || obj.key.endsWith('.json')) continue
+            const fileName = obj.key.slice('chat/media/'.length)
+            const id = fileName.replace(/\.[^.]+$/, '') || fileName
+            derived.push({
+                id,
+                imageKey: obj.key,
+                contentType: obj.httpMetadata?.contentType ?? 'image/png',
+                createdAt: obj.uploaded ? new Date(obj.uploaded).getTime() : Date.now(),
+                authorHandle: MEDIA_ADMIN_HANDLE,
+            })
+        }
+        return derived.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    } catch {
+        return []
+    }
 }
 
 async function saveChatMediaIndex(env: WorkerEnv, items: ChatMediaItem[]): Promise<void> {
@@ -470,29 +522,33 @@ function resolveCategory(
 
     const candidates: (string | null | undefined)[] = [
         values?.get('type'),
+        values?.get('infoType'),
+        values?.get('postType'),
+        values?.get('section'),
+        values?.get('category'),
         bodyValueParams?.get('type'),
+        bodyValueParams?.get('infoType'),
+        bodyValueParams?.get('postType'),
+        bodyValueParams?.get('section'),
+        bodyValueParams?.get('category'),
         body?.type,
+        body?.infoType,
+        body?.postType,
+        body?.section,
+        body?.category,
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
         url.searchParams.get('section'),
-        url.searchParams.get('title'),
-        body?.infoType,
-        body?.postType,
-        body?.section,
-        body?.title,
         url.searchParams.get('category'),
-        values?.get('category'),
-        bodyValueParams?.get('category'),
-        body?.category,
         urlSearchParams?.get('category'),
-        bodySearchParams?.get('category'),
         urlSearchParams?.get('infoType'),
-        bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
-        bodySearchParams?.get('type'),
         urlSearchParams?.get('section'),
-        urlSearchParams?.get('title'),
+        bodySearchParams?.get('category'),
+        bodySearchParams?.get('infoType'),
+        bodySearchParams?.get('type'),
+        bodySearchParams?.get('section'),
     ]
 
     for (const c of candidates) {
@@ -668,9 +724,9 @@ function externalChatUrl(req: Request, env: WorkerEnv): string {
     return `${addressOf(req, env)}/chat`
 }
 
-function sonolusDeepLinkUrl(req: Request, env: WorkerEnv): string {
-    const serverUrl = `${addressOf(req, env)}/sonolus`
-    return `sonolus://external-server/${encodeURIComponent(serverUrl)}`
+function sonolusChatLinkUrl(req: Request, env: WorkerEnv): string {
+    const hostAndBase = addressOf(req, env).replace(/^https?:\/\//, '')
+    return `sonolus://${hostAndBase}/sonolus/posts/chat`
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -691,10 +747,12 @@ function rawPostCategory(url: URL): string | null {
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
+        url.searchParams.get('section'),
         url.searchParams.get('category'),
         searchParams?.get('category'),
         searchParams?.get('infoType'),
         searchParams?.get('type'),
+        searchParams?.get('section'),
     ]
 
     for (const candidate of candidates) {
@@ -800,18 +858,6 @@ const RANKED_TIERS_UPPER = new Set([
     'DIAMOND',
     'MASTER',
 ])
-
-async function getBucketObject(
-    bucket: R2Bucket | null,
-    keys: string[],
-): Promise<R2ObjectBody | null> {
-    if (!bucket) return null
-    for (const key of keys) {
-        const obj = await bucket.get(key).catch(() => null)
-        if (obj) return obj
-    }
-    return null
-}
 
 async function resolveRoomCover(
     env: WorkerEnv,
@@ -1156,7 +1202,7 @@ function renderStaffChatHtml(
     align-items:center;
     justify-content:space-between;
   }
-  .tab-group{display:flex;gap:8px}
+  .tab-group{display:flex;gap:8px;align-items:center}
   .tab-btn{
     background:var(--blush-soft);
     color:var(--plum-dark);
@@ -1174,6 +1220,26 @@ function renderStaffChatHtml(
     color:var(--blush);
     border-color:var(--plum);
   }
+  .tab-plus{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1.5px solid var(--blush-border);
+    border-radius:10px;
+    width:32px;
+    height:32px;
+    padding:0;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    font-family:'Montserrat',sans-serif;
+    font-size:18px;
+    font-weight:800;
+    line-height:1;
+    cursor:pointer;
+    transition:all .12s ease;
+  }
+  .tab-plus:hover{background:var(--blush);border-color:var(--plum);color:var(--plum)}
+  .tab-plus:active{background:var(--plum);color:var(--blush);border-color:var(--plum)}
 
   #chatTab{
     flex:1 1 auto;
@@ -1366,44 +1432,25 @@ function renderStaffChatHtml(
     overflow-y:auto;
     -webkit-overflow-scrolling:touch;
     overscroll-behavior:contain;
-    padding:12px 12px 32px;
+    padding:0 0 32px;
     gap:16px;
   }
   #mediaTab.active{display:flex}
-  .media-upload-card{
-    background:var(--surface);
-    border:1.5px solid var(--blush-border);
-    border-radius:16px;
-    padding:14px 16px;
-    display:flex;
-    flex-direction:column;
-    gap:10px;
-    box-shadow:0 4px 14px rgba(158,75,118,.08);
-  }
   .media-feed{
     display:flex;
     flex-direction:column;
-    gap:20px;
+    gap:16px;
     width:100%;
   }
   .media-card{
     background:var(--surface);
-    border:1.5px solid var(--blush-border);
-    border-radius:16px;
-    overflow:hidden;
+    border-top:1.5px solid var(--blush-border);
+    border-bottom:1.5px solid var(--blush-border);
     width:100%;
-    box-shadow:0 4px 16px rgba(45,27,37,.06);
   }
-  .media-frame{
+  .media-card img{
     width:100%;
-    aspect-ratio:16/9;
-    background:var(--plum-deep);
-    display:block;
-  }
-  .media-frame img{
-    width:100%;
-    height:100%;
-    object-fit:cover;
+    height:auto;
     display:block;
   }
   .media-meta{
@@ -1625,6 +1672,7 @@ function renderStaffChatHtml(
       <div class="tab-group">
         <button id="tabChatBtn" type="button" class="tab-btn active">Chat</button>
         <button id="tabMediaBtn" type="button" class="tab-btn">Media</button>
+        <button id="addMediaBtn" type="button" class="tab-plus" style="display:none" title="Add Media" aria-label="Add Media">+</button>
       </div>
     </div>
     <div id="chatTab" class="active">
@@ -1642,17 +1690,35 @@ function renderStaffChatHtml(
       </footer>
     </div>
     <div id="mediaTab">
-      <div id="mediaUploadCard" class="media-upload-card" style="display:none">
-        <span class="field-label">Add 16:9 Media (#163292)</span>
-        <input id="mediaFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
-        <input id="mediaLinkInput" type="url" maxlength="400" placeholder="Optional link (https://...)"/>
-        <input id="mediaCaptionInput" type="text" maxlength="160" placeholder="Optional caption"/>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-          <span id="mediaStatus" class="auth-error"></span>
-          <button id="uploadMediaBtn" type="button" class="btn-primary">Upload Media</button>
+      <div id="mediaFeed" class="media-feed"></div>
+    </div>
+  </div>
+  <div id="mediaUploadModal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">Upload Media (#163292)</div>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="mediaFileInput">Image (keeps original aspect ratio)</label>
+          <input id="mediaFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
+        </div>
+        <div>
+          <label class="field-label" for="mediaLinkInput">Optional Link</label>
+          <input id="mediaLinkInput" type="url" maxlength="400" placeholder="https://..."/>
+        </div>
+        <div>
+          <label class="field-label" for="mediaCaptionInput">Optional Caption</label>
+          <input id="mediaCaptionInput" type="text" maxlength="160" placeholder="Caption"/>
+        </div>
+        <div id="mediaStatus" class="auth-error"></div>
+        <div class="modal-actions">
+          <div class="modal-actions-right">
+            <button id="closeMediaModalBtn" type="button" class="btn-sm">Cancel</button>
+            <button id="uploadMediaBtn" type="button" class="btn-primary">Upload</button>
+          </div>
         </div>
       </div>
-      <div id="mediaFeed" class="media-feed"></div>
     </div>
   </div>
   <div id="passwordModal" class="modal-backdrop">
@@ -1742,9 +1808,11 @@ function renderStaffChatHtml(
   const appViewEl = document.getElementById('appView');
   const tabChatBtn = document.getElementById('tabChatBtn');
   const tabMediaBtn = document.getElementById('tabMediaBtn');
+  const addMediaBtn = document.getElementById('addMediaBtn');
   const chatTabEl = document.getElementById('chatTab');
   const mediaTabEl = document.getElementById('mediaTab');
-  const mediaUploadCard = document.getElementById('mediaUploadCard');
+  const mediaUploadModal = document.getElementById('mediaUploadModal');
+  const closeMediaModalBtn = document.getElementById('closeMediaModalBtn');
   const mediaFileInput = document.getElementById('mediaFileInput');
   const mediaLinkInput = document.getElementById('mediaLinkInput');
   const mediaCaptionInput = document.getElementById('mediaCaptionInput');
@@ -1970,6 +2038,15 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
+  function openMediaUploadModal() {
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    setActiveTab('media');
+    mediaStatusEl.textContent = '';
+    mediaUploadModal.classList.add('open');
+    setTimeout(() => mediaFileInput.focus(), 20);
+  }
+
   function setActiveTab(tab) {
     activeTab = tab === 'media' ? 'media' : 'chat';
     tabChatBtn.classList.toggle('active', activeTab === 'chat');
@@ -1987,6 +2064,16 @@ function renderStaffChatHtml(
   tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
   tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
 
+  addMediaBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openMediaUploadModal();
+  });
+
+  closeMediaModalBtn.addEventListener('click', () => {
+    mediaUploadModal.classList.remove('open');
+  });
+
   function renderMedia(items) {
     if (Array.isArray(items)) {
       currentMedia = items;
@@ -1995,7 +2082,7 @@ function renderStaffChatHtml(
     const canDelete = active && active.handle === MEDIA_ADMIN;
 
     if (!currentMedia.length) {
-      mediaFeedEl.innerHTML = '<div class="empty-state">No media items yet.</div>';
+      mediaFeedEl.innerHTML = '<div class="empty-state">No media uploaded yet.</div>';
       return;
     }
 
@@ -2013,7 +2100,7 @@ function renderStaffChatHtml(
         : '';
 
       return '<article class="media-card">' +
-        '<div class="media-frame"><img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/></div>' +
+        '<img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/>' +
         '<div class="media-meta">' +
           '<div style="display:flex;flex-direction:column;gap:4px;min-width:0">' + captionHtml + linkHtml + '</div>' +
           delHtml +
@@ -2035,50 +2122,21 @@ function renderStaffChatHtml(
     }
   }
 
-  async function fileTo16x9DataUrl(file) {
-    const dataUrl = await new Promise((resolve, reject) => {
+  async function fileToDataUrl(file) {
+    return await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result || ''));
       reader.onerror = () => reject(new Error('Failed to read image'));
       reader.readAsDataURL(file);
     });
-    const img = await new Promise((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = () => reject(new Error('Invalid image'));
-      el.src = dataUrl;
-    });
-
-    const targetW = 1280;
-    const targetH = 720;
-    const targetRatio = targetW / targetH;
-    const srcW = img.naturalWidth || targetW;
-    const srcH = img.naturalHeight || targetH;
-    const srcRatio = srcW / srcH;
-
-    let sx = 0;
-    let sy = 0;
-    let sw = srcW;
-    let sh = srcH;
-    if (srcRatio > targetRatio) {
-      sw = Math.round(srcH * targetRatio);
-      sx = Math.round((srcW - sw) / 2);
-    } else if (srcRatio < targetRatio) {
-      sh = Math.round(srcW / targetRatio);
-      sy = Math.round((srcH - sh) / 2);
-    }
-
-    const canvas = document.createElement('canvas');
-    canvas.width = targetW;
-    canvas.height = targetH;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
-    return canvas.toDataURL('image/png');
   }
 
   uploadMediaBtn.addEventListener('click', async () => {
     const active = getActiveUser();
-    if (!active || active.handle !== MEDIA_ADMIN) return;
+    if (!active || active.handle !== MEDIA_ADMIN) {
+      mediaStatusEl.textContent = 'Only #163292 can upload media.';
+      return;
+    }
     const file = mediaFileInput.files && mediaFileInput.files[0];
     if (!file) {
       mediaStatusEl.textContent = 'Select an image first.';
@@ -2087,7 +2145,7 @@ function renderStaffChatHtml(
     mediaStatusEl.textContent = 'Uploading...';
     uploadMediaBtn.disabled = true;
     try {
-      const imageDataUrl = await fileTo16x9DataUrl(file);
+      const imageDataUrl = await fileToDataUrl(file);
       const res = await fetch('/api/chat/media', {
         method: 'POST',
         headers: authHeaders({ 'Content-Type': 'application/json' }),
@@ -2108,6 +2166,8 @@ function renderStaffChatHtml(
       mediaLinkInput.value = '';
       mediaCaptionInput.value = '';
       mediaStatusEl.textContent = '';
+      mediaUploadModal.classList.remove('open');
+      setActiveTab('media');
       if (Array.isArray(data.items)) renderMedia(data.items);
     } finally {
       uploadMediaBtn.disabled = false;
@@ -2229,6 +2289,7 @@ function renderStaffChatHtml(
     if (!active) {
       disconnectSocket();
       badgeEl.textContent = 'Select profile';
+      addMediaBtn.style.display = 'none';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
       appViewEl.classList.remove('open');
@@ -2240,8 +2301,8 @@ function renderStaffChatHtml(
     }
 
     badgeEl.textContent = formatTag(active.name, active.handle);
+    addMediaBtn.style.display = active.handle === MEDIA_ADMIN ? 'inline-flex' : 'none';
     settingsBtn.style.display = 'inline-block';
-    mediaUploadCard.style.display = active.handle === MEDIA_ADMIN ? 'flex' : 'none';
     pickerEl.classList.remove('open');
     appViewEl.classList.add('open');
     setActiveTab(activeTab);
@@ -2709,6 +2770,52 @@ function postForm(category: PostCategory) {
     }
 }
 
+function makeEditPostForm(post: StoredPost) {
+    return {
+        name: 'Edit',
+        type: 'editPost',
+        title: 'Edit',
+        icon: 'edit',
+        requireConfirmation: false,
+        options: [
+            {
+                name: 'Title',
+                query: 'title',
+                required: false,
+                type: 'text',
+                def: String(post.item?.title ?? ''),
+                placeholder: 'Post title',
+                limit: 100,
+                shortcuts: [],
+            },
+            {
+                name: 'Description',
+                query: 'description',
+                required: false,
+                type: 'textArea',
+                def: String(post.description ?? ''),
+                placeholder: 'Post description',
+                limit: 2000,
+                shortcuts: [],
+            },
+            {
+                name: 'Thumbnail',
+                query: 'thumbnail',
+                description: 'Optional replacement image.',
+                required: false,
+                type: 'file',
+                def: '',
+                validation: {
+                    type: 'postThumbnail',
+                    maxSize: 5242880,
+                    maxWidth: 2048,
+                    maxHeight: 2048,
+                },
+            },
+        ],
+    }
+}
+
 function makeLikePostForm(liked: boolean) {
     return {
         name: liked ? 'Unlike' : 'Like',
@@ -2743,12 +2850,11 @@ const deletePostForm = {
 function postActionsFor(post: StoredPost, session: AuthSession | null) {
     const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
     const pinned = Boolean(post.pinned)
-    const actions = [
+    const actions: any[] = [
         makeLikePostForm(liked),
-        makePinPostForm(pinned),
     ]
     if (canManagePosts(session)) {
-        actions.push(deletePostForm)
+        actions.push(makeEditPostForm(post), makePinPostForm(pinned), deletePostForm)
     }
     return actions
 }
@@ -2866,6 +2972,40 @@ async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
         (entry): entry is { chart: SheetChart; item: RemoteLevelItem } =>
             entry !== null,
     )
+}
+
+async function getCachedLevelItemsForCharts(
+    env: WorkerEnv,
+    charts: SheetChart[],
+): Promise<RemoteLevelItem[] | null> {
+    const cachedList = await getCachedJsonFromAssets<any>(env, [
+        'server/level-list/index.json',
+    ])
+    const rawItems: any[] = Array.isArray(cachedList)
+        ? cachedList
+        : Array.isArray(cachedList?.items)
+            ? cachedList.items
+            : []
+
+    if (!rawItems.length) return null
+
+    const byKey = new Map<string, RemoteLevelItem>()
+    for (const raw of rawItems) {
+        const item = raw?.item ?? raw
+        if (!item || typeof item.name !== 'string') continue
+        byKey.set(item.name, item)
+        if (typeof item.id === 'string' && item.id) {
+            byKey.set(item.id, item)
+        }
+    }
+
+    const matched: RemoteLevelItem[] = []
+    for (const chart of charts) {
+        const hit = byKey.get(chart.name) ?? byKey.get(chart.id)
+        if (!hit) return null
+        matched.push(hit)
+    }
+    return matched
 }
 
 const UNCH_HOST = 'untitledcharts.com'
@@ -3041,13 +3181,10 @@ self.addEventListener('fetch', (event) => {
         if (path === '/app-icon.png' && req.method === 'GET') {
             const obj =
                 (await getBucketObject(assetsBucket(env), [
-                    'XX!.png',
-                    'chat/XX!.png',
+                    'server/banner.png',
                     'chat/pfp/163292.png',
                 ])) ??
                 (await getBucketObject(communityBucket(env), [
-                    'XX!.png',
-                    'chat/XX!.png',
                     'chat/pfp/163292.png',
                 ]))
             if (!obj) return new Response(null, { status: 404 })
@@ -3061,9 +3198,10 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-            const obj =
-                (await getBucketObject(assetsBucket(env), ['XX!.png'])) ??
-                (await getBucketObject(communityBucket(env), ['XX!.png']))
+            const obj = await getBucketObject(assetsBucket(env), [
+                'server/banner.png',
+                'ranked-match/MASTER/MASTER.png',
+            ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -3082,7 +3220,6 @@ self.addEventListener('fetch', (event) => {
             }
             const obj = await getBucketObject(assetsBucket(env), [
                 `ranked-match/${tierUpper}/${tierUpper}.png`,
-                `${tierUpper}.png`,
             ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
@@ -3126,13 +3263,9 @@ self.addEventListener('fetch', (event) => {
             const keys = [
                 prefs.pfpKey,
                 `chat/pfp/${handle}.png`,
-                `chat/${handle}.png`,
-                `${handle}.png`,
             ].filter((k): k is string => Boolean(k))
 
-            const obj =
-                (await getBucketObject(communityBucket(env), keys)) ??
-                (await getBucketObject(assetsBucket(env), keys))
+            const obj = await getBucketObject(communityBucket(env), keys)
             if (obj) {
                 return new Response(obj.body, {
                     headers: {
@@ -3156,7 +3289,8 @@ self.addEventListener('fetch', (event) => {
             const obj = await getBucketObject(communityBucket(env), [
                 target.imageKey,
                 `chat/media/${mediaId}.png`,
-                `media/${mediaId}.png`,
+                `chat/media/${mediaId}.jpg`,
+                `chat/media/${mediaId}.webp`,
             ])
             if (!obj) return new Response(null, { status: 404 })
 
@@ -3201,8 +3335,9 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const mime = match[1]!
+                const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
                 const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
-                if (rawBytes.byteLength > 4 * 1024 * 1024) {
+                if (rawBytes.byteLength > 8 * 1024 * 1024) {
                     return message(400, 'Media image too large.')
                 }
 
@@ -3212,7 +3347,7 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const id = randomId(12)
-                const imageKey = `chat/media/${id}.png`
+                const imageKey = `chat/media/${id}.${ext}`
                 await bucket.put(imageKey, rawBytes, {
                     httpMetadata: { contentType: mime },
                 })
@@ -3354,7 +3489,7 @@ self.addEventListener('fetch', (event) => {
             ])
             const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
-            const sUrl = sonolusDeepLinkUrl(req, env)
+            const sUrl = sonolusChatLinkUrl(req, env)
             if (resolved) {
                 return html(
                     renderStaffChatHtml(
@@ -3500,9 +3635,9 @@ self.addEventListener('fetch', (event) => {
             const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            const bannerObject =
-                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
-                (await getBucketObject(communityBucket(env), ['banner.png']))
+            const bannerObject = await getBucketObject(assetsBucket(env), [
+                'server/banner.png',
+            ])
             let banner: { hash: string; url: string } | undefined
 
             if (bannerObject) {
@@ -3584,9 +3719,9 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object =
-                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
-                (await getBucketObject(communityBucket(env), ['banner.png']))
+            const object = await getBucketObject(assetsBucket(env), [
+                'server/banner.png',
+            ])
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -4015,6 +4150,43 @@ self.addEventListener('fetch', (event) => {
                 })
             }
 
+            if (actionType === 'editPost') {
+                if (!canManagePosts(session)) {
+                    return message(403, 'Only handle 163292 can edit posts.')
+                }
+
+                const nextTitle = (values.get('title') ?? String(post.item?.title ?? '')).trim()
+                const nextDescription = (values.get('description') ?? String(post.description ?? '')).trim()
+                const nextThumbHash = (values.get('thumbnail') ?? '').trim()
+
+                if (!nextTitle || !nextDescription) {
+                    return message(400, 'A title and content are required.')
+                }
+
+                if (nextTitle.length > 100 || nextDescription.length > 2000) {
+                    return message(400, 'Post title or description exceeds maximum length.')
+                }
+
+                const uploadKey = nextThumbHash ? (post.uploadKey || randomId(24)) : post.uploadKey
+
+                await lobby(env).createPost({
+                    ...post,
+                    item: {
+                        ...post.item,
+                        title: nextTitle,
+                    },
+                    description: nextDescription,
+                    uploadKey,
+                    ...(nextThumbHash ? { thumbnailHash: nextThumbHash } : {}),
+                })
+
+                return json({
+                    key: nextThumbHash ? uploadKey : '',
+                    hashes: nextThumbHash ? [nextThumbHash] : [],
+                    shouldUpdateItem: true,
+                })
+            }
+
             if (actionType === 'pinPost') {
                 if (!canManagePosts(session)) {
                     return message(403, 'Only handle 163292 can pin posts.')
@@ -4199,7 +4371,8 @@ self.addEventListener('fetch', (event) => {
                 })
             }
 
-            const post = await lobby(env).getPost(postPath[1]!).catch(() => null)
+            const postId = postPath[1]!
+            const post = await lobby(env).getPost(postId).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
             return json({
@@ -4215,10 +4388,11 @@ self.addEventListener('fetch', (event) => {
         if (path === '/sonolus/levels/info' && req.method === 'GET') {
             try {
                 const { charts, pageCount } = await getCustomLevelPage(0, env)
-                const loaded = await loadLevelItems(charts)
+                const cached = await getCachedLevelItemsForCharts(env, charts)
+                const items = cached ?? (await loadLevelItems(charts)).map((entry) => entry.item)
 
                 console.log(
-                    `[Levels] Info page 0: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
+                    `[Levels] Info page 0: ${items.length}/${charts.length} levels loaded (${cached ? 'R2 cache' : 'live'}). ${pageCount} pages total.`,
                 )
 
                 return json({
@@ -4228,7 +4402,7 @@ self.addEventListener('fetch', (event) => {
                         {
                             title: 'Custom Levels',
                             itemType: 'level',
-                            items: loaded.map((entry) => entry.item),
+                            items,
                         },
                     ],
                 })
@@ -4255,11 +4429,12 @@ self.addEventListener('fetch', (event) => {
                     })
                 }
 
-                const loaded = await loadLevelItems(charts)
+                const cached = await getCachedLevelItemsForCharts(env, charts)
+                const items = cached ?? (await loadLevelItems(charts)).map((entry) => entry.item)
 
                 return json({
                     pageCount,
-                    items: loaded.map((entry) => entry.item),
+                    items,
                     searches: [],
                 })
             } catch (error) {
@@ -4323,14 +4498,42 @@ self.addEventListener('fetch', (event) => {
         }
 
         const makePlaylistItems = async () => {
-            const playlists = await getPlaylists(env)
+            const [playlists, cachedPlaylistsRaw] = await Promise.all([
+                getPlaylists(env),
+                getCachedJsonFromAssets<any>(env, ['server/playlists/index.json']),
+            ])
+
+            const cachedList: any[] = Array.isArray(cachedPlaylistsRaw)
+                ? cachedPlaylistsRaw
+                : Array.isArray(cachedPlaylistsRaw?.items)
+                    ? cachedPlaylistsRaw.items
+                    : []
+
+            const cachedBySlug = new Map<string, any>()
+            for (const entry of cachedList) {
+                const item = entry?.item ?? entry
+                if (item && typeof item.name === 'string') {
+                    cachedBySlug.set(item.name.toLowerCase(), item)
+                }
+            }
 
             return Promise.all(
                 playlists.map(async (playlist) => {
+                    const slug = playlistSlug(playlist.name)
+                    const cachedItem = cachedBySlug.get(slug.toLowerCase())
+                    if (cachedItem && Array.isArray(cachedItem.levels)) {
+                        return {
+                            ...cachedItem,
+                            name: slug,
+                            title: playlist.name,
+                            subtitle: `${cachedItem.levels.length} levels`,
+                        }
+                    }
+
                     const loaded = await loadLevelItems(playlist.charts)
 
                     return {
-                        name: playlistSlug(playlist.name),
+                        name: slug,
                         version: 1 as const,
                         title: playlist.name,
                         subtitle: `${loaded.length} levels`,
@@ -4391,17 +4594,8 @@ self.addEventListener('fetch', (event) => {
 
                 if (!playlist) return new Response(null, { status: 404 })
 
-                const loaded = await loadLevelItems(playlist.charts)
-
-                const item = {
-                    name: playlistSlug(playlist.name),
-                    version: 1 as const,
-                    title: playlist.name,
-                    subtitle: `${loaded.length} levels`,
-                    author: 'XX!',
-                    tags: [],
-                    levels: loaded.map((entry) => entry.item),
-                }
+                const allItems = await makePlaylistItems()
+                const item = allItems.find((entry) => samePlaylist(entry.name, playlistSlug(playlist.name)))
 
                 return json({
                     item,
@@ -4505,10 +4699,20 @@ self.addEventListener('fetch', (event) => {
             const key = req.headers.get('Sonolus-Room-Key')
 
             if (key) {
-                const settings = parseSettings(url.searchParams, undefined, user.name || user.handle)
-                if (!settings) {
+                const params = new URLSearchParams(url.searchParams)
+                const rawSettings = parseSettings(params, undefined, user.name || user.handle)
+                if (!rawSettings) {
                     return new Response(null, { status: 400 })
                 }
+
+                const existingSummary = await stub.summary().catch(() => null)
+                const isAlreadyOpened = Boolean(existingSummary)
+                const settings = rawSettings.type === 'rankedRoom' && isAlreadyOpened
+                    ? {
+                        ...rawSettings,
+                        title: existingSummary?.title || rawSettings.title,
+                    }
+                    : rawSettings
 
                 if (
                     (
