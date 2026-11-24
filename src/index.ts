@@ -59,6 +59,11 @@ type ChatMediaItem = {
     authorHandle: string
 }
 
+type WorkerEnv = Env & {
+    COMMUNITY_BUCKET?: R2Bucket
+    SONOLUS_ASSETS_BUCKET?: R2Bucket
+}
+
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
         status,
@@ -81,10 +86,10 @@ const html = (body: string, status = 200) =>
 const message = (status: number, text: string) =>
     json({ message: text }, status)
 
-const addressOf = (req: Request, env: Env) =>
+const addressOf = (req: Request, env: WorkerEnv) =>
     (env.PUBLIC_ADDRESS ?? new URL(req.url).origin).replace(/\/+$/, '')
 
-const isDevSkipSignature = (env: Env): boolean =>
+const isDevSkipSignature = (env: WorkerEnv): boolean =>
     String(env.DEV_SKIP_SIGNATURE ?? '').trim().toLowerCase() === 'true'
 
 const isStaffChatHandle = (handle?: string | null): boolean =>
@@ -100,7 +105,7 @@ function requiresProfilePassword(handle?: string | null): boolean {
     return String(handle ?? '').trim() === PROTECTED_CHAT_HANDLE
 }
 
-function matchesSessionSecretPassword(env: Env, password?: unknown): boolean {
+function matchesSessionSecretPassword(env: WorkerEnv, password?: unknown): boolean {
     const secret = String(env.SESSION_SECRET ?? '')
     const candidate = typeof password === 'string' ? password : ''
     return Boolean(secret) && candidate.length > 0 && candidate === secret
@@ -132,12 +137,16 @@ function parseCookie(req: Request, name: string): string | null {
     return null
 }
 
-function primaryCommunityBucket(env: Env): R2Bucket | null {
-    return env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET ?? null
+function communityBucket(env: WorkerEnv): R2Bucket | null {
+    return env.COMMUNITY_BUCKET ?? null
 }
 
-function bucketsForRead(env: Env): R2Bucket[] {
-    return [env.COMMUNITY_BUCKET, env.POSTS_BUCKET].filter(
+function assetsBucket(env: WorkerEnv): R2Bucket | null {
+    return env.SONOLUS_ASSETS_BUCKET ?? null
+}
+
+function bucketsForRead(env: WorkerEnv): R2Bucket[] {
+    return [env.COMMUNITY_BUCKET, env.SONOLUS_ASSETS_BUCKET].filter(
         (b): b is R2Bucket => Boolean(b),
     )
 }
@@ -156,7 +165,7 @@ function sanitizeHttpLink(raw?: unknown): string {
     return ''
 }
 
-async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs> {
+async function getUserChatPrefs(env: WorkerEnv, handle: string): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
     const fallback: UserChatPrefs = {
         handle: clean,
@@ -168,30 +177,31 @@ async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs
 
     if (!clean) return fallback
 
+    const bucket = communityBucket(env)
+    if (!bucket) return fallback
+
     const keys = [
-        `community/chat/users/${clean}.json`,
         `chat/users/${clean}.json`,
+        `${clean}.json`,
     ]
 
-    for (const bucket of bucketsForRead(env)) {
-        for (const key of keys) {
-            try {
-                const obj = await bucket.get(key)
-                if (!obj) continue
-                const parsed = await obj.json() as Partial<UserChatPrefs>
-                const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
-                const mode: EmailNotifyMode = parsed?.emailNotifyMode === 'all' ? 'all' : 'mention'
-                return {
-                    handle: clean,
-                    displayName: displayName || fallback.displayName,
-                    pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
-                    notifyEmail: typeof parsed?.notifyEmail === 'string' ? parsed.notifyEmail.trim().slice(0, 120) : '',
-                    emailNotifyMode: mode,
-                    updatedAt: Number(parsed?.updatedAt) || 0,
-                }
-            } catch {
-                // try next key
+    for (const key of keys) {
+        try {
+            const obj = await bucket.get(key)
+            if (!obj) continue
+            const parsed = await obj.json() as Partial<UserChatPrefs>
+            const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
+            const mode: EmailNotifyMode = parsed?.emailNotifyMode === 'all' ? 'all' : 'mention'
+            return {
+                handle: clean,
+                displayName: displayName || fallback.displayName,
+                pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
+                notifyEmail: typeof parsed?.notifyEmail === 'string' ? parsed.notifyEmail.trim().slice(0, 120) : '',
+                emailNotifyMode: mode,
+                updatedAt: Number(parsed?.updatedAt) || 0,
             }
+        } catch {
+            // try next key
         }
     }
 
@@ -199,7 +209,7 @@ async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs
 }
 
 async function saveUserChatPrefs(
-    env: Env,
+    env: WorkerEnv,
     handle: string,
     displayName: string,
     pfpKey?: string,
@@ -217,47 +227,51 @@ async function saveUserChatPrefs(
         updatedAt: Date.now(),
     }
 
-    const bucket = primaryCommunityBucket(env)
-    if (bucket) {
-        await bucket.put(
-            `community/chat/users/${clean}.json`,
-            JSON.stringify(next),
-            { httpMetadata: { contentType: 'application/json' } },
-        )
+    const bucket = communityBucket(env)
+    if (!bucket) {
+        throw new Error('COMMUNITY_BUCKET is not configured.')
     }
+
+    await bucket.put(
+        `chat/users/${clean}.json`,
+        JSON.stringify(next),
+        { httpMetadata: { contentType: 'application/json' } },
+    )
 
     return next
 }
 
-const MEDIA_INDEX_KEY = 'community/chat/media/index.json'
+const MEDIA_INDEX_KEY = 'chat/media/index.json'
 
-async function listChatMedia(env: Env): Promise<ChatMediaItem[]> {
-    const keys = [MEDIA_INDEX_KEY, 'chat/media/index.json']
-    for (const bucket of bucketsForRead(env)) {
-        for (const key of keys) {
-            try {
-                const obj = await bucket.get(key)
-                if (!obj) continue
-                const parsed = await obj.json() as { items?: ChatMediaItem[] } | ChatMediaItem[]
-                const rawList = Array.isArray(parsed)
-                    ? parsed
-                    : Array.isArray(parsed?.items)
-                        ? parsed.items
-                        : []
-                return rawList
-                    .filter((item): item is ChatMediaItem => Boolean(item && typeof item.id === 'string' && typeof item.imageKey === 'string'))
-                    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
-            } catch {
-                // try next
-            }
+async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
+    const bucket = communityBucket(env)
+    if (!bucket) return []
+
+    for (const key of [MEDIA_INDEX_KEY, 'media/index.json']) {
+        try {
+            const obj = await bucket.get(key)
+            if (!obj) continue
+            const parsed = await obj.json() as { items?: ChatMediaItem[] } | ChatMediaItem[]
+            const rawList = Array.isArray(parsed)
+                ? parsed
+                : Array.isArray(parsed?.items)
+                    ? parsed.items
+                    : []
+            return rawList
+                .filter((item): item is ChatMediaItem => Boolean(item && typeof item.id === 'string' && typeof item.imageKey === 'string'))
+                .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+        } catch {
+            // try next
         }
     }
     return []
 }
 
-async function saveChatMediaIndex(env: Env, items: ChatMediaItem[]): Promise<void> {
-    const bucket = primaryCommunityBucket(env)
-    if (!bucket) return
+async function saveChatMediaIndex(env: WorkerEnv, items: ChatMediaItem[]): Promise<void> {
+    const bucket = communityBucket(env)
+    if (!bucket) {
+        throw new Error('COMMUNITY_BUCKET is not configured.')
+    }
     await bucket.put(
         MEDIA_INDEX_KEY,
         JSON.stringify({ items }),
@@ -267,7 +281,7 @@ async function saveChatMediaIndex(env: Env, items: ChatMediaItem[]): Promise<voi
 
 async function verifySigned(
     req: Request,
-    env: Env,
+    env: WorkerEnv,
     raw: Uint8Array,
     expectType: string,
 ) {
@@ -327,7 +341,7 @@ function extractSessionToken(req: Request, url?: URL): string | null {
 
 async function sessionOf(
     req: Request,
-    env: Env,
+    env: WorkerEnv,
     url?: URL,
 ): Promise<AuthSession | null> {
     const token = extractSessionToken(req, url)
@@ -347,7 +361,7 @@ function pickedProfile(handle?: string | null): UserProfile | null {
 
 async function resolveChatUser(
     req: Request,
-    env: Env,
+    env: WorkerEnv,
     url: URL,
     body?: any,
 ): Promise<{ user: UserProfile; fromSonolus: boolean; token: string } | null> {
@@ -391,13 +405,13 @@ async function resolveChatUser(
     return null
 }
 
-const roomStub = (env: Env, name: string) =>
+const roomStub = (env: WorkerEnv, name: string) =>
     env.ROOM.get(env.ROOM.idFromName(name))
 
-const lobby = (env: Env) =>
+const lobby = (env: WorkerEnv) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
 
-const chatStub = (env: Env) =>
+const chatStub = (env: WorkerEnv) =>
     env.CHAT.get(env.CHAT.idFromName('staff'))
 
 const POST_LABELS: Record<PostCategory, {
@@ -650,11 +664,11 @@ function extractCommentText(values: URLSearchParams): string {
     return ''
 }
 
-function externalChatUrl(req: Request, env: Env): string {
+function externalChatUrl(req: Request, env: WorkerEnv): string {
     return `${addressOf(req, env)}/chat`
 }
 
-function sonolusDeepLinkUrl(req: Request, env: Env): string {
+function sonolusDeepLinkUrl(req: Request, env: WorkerEnv): string {
     const serverUrl = `${addressOf(req, env)}/sonolus`
     return `sonolus://external-server/${encodeURIComponent(serverUrl)}`
 }
@@ -787,22 +801,20 @@ const RANKED_TIERS_UPPER = new Set([
     'MASTER',
 ])
 
-async function getBucketImage(
-    env: Env,
+async function getBucketObject(
+    bucket: R2Bucket | null,
     keys: string[],
 ): Promise<R2ObjectBody | null> {
-    const buckets = bucketsForRead(env)
+    if (!bucket) return null
     for (const key of keys) {
-        for (const bucket of buckets) {
-            const obj = await bucket.get(key).catch(() => null)
-            if (obj) return obj
-        }
+        const obj = await bucket.get(key).catch(() => null)
+        if (obj) return obj
     }
     return null
 }
 
 async function resolveRoomCover(
-    env: Env,
+    env: WorkerEnv,
     summary: {
         type?: string
         tier?: string
@@ -861,6 +873,7 @@ async function resolveRoomCover(
         }
     }
 
+    void env
     return undefined
 }
 
@@ -2616,7 +2629,7 @@ function renderStaffChatHtml(
 </html>`
 }
 
-async function roomItems(env: Env, _session: AuthSession | null) {
+async function roomItems(env: WorkerEnv, _session: AuthSession | null) {
     const rooms = await lobby(env).list()
 
     const items = await Promise.all(
@@ -2866,7 +2879,7 @@ const isUnch = (chart: SheetChart) => {
     }
 }
 
-async function findChart(name: string, env: Env): Promise<SheetChart | null> {
+async function findChart(name: string, env: WorkerEnv): Promise<SheetChart | null> {
     const [customCharts, playlists] = await Promise.all([
         getCustomLevels(env),
         getPlaylists(env),
@@ -2940,13 +2953,13 @@ async function proxyToUnch(
 export default {
     async scheduled(
         _event: ScheduledEvent,
-        env: Env,
+        env: WorkerEnv,
         ctx: ExecutionContext,
     ): Promise<void> {
         ctx.waitUntil(refreshDailyAssets(env))
     },
 
-    async fetch(req: Request, env: Env): Promise<Response> {
+    async fetch(req: Request, env: WorkerEnv): Promise<Response> {
         const url = new URL(req.url)
         const path = url.pathname.replace(/\/+$/, '') || '/'
 
@@ -3026,14 +3039,17 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/app-icon.png' && req.method === 'GET') {
-            const obj = await getBucketImage(env, [
-                'sonolus-assets/XX!.png',
-                'community/chat/XX!.png',
-                'chat/XX!.png',
-                'XX!.png',
-                'community/chat/pfp/163292.png',
-                'chat/pfp/163292.png',
-            ])
+            const obj =
+                (await getBucketObject(assetsBucket(env), [
+                    'XX!.png',
+                    'chat/XX!.png',
+                    'chat/pfp/163292.png',
+                ])) ??
+                (await getBucketObject(communityBucket(env), [
+                    'XX!.png',
+                    'chat/XX!.png',
+                    'chat/pfp/163292.png',
+                ]))
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -3045,11 +3061,9 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-            const obj = await getBucketImage(env, [
-                'sonolus-assets/XX!.png',
-                'XX!.png',
-                'community/chat/XX!.png',
-            ])
+            const obj =
+                (await getBucketObject(assetsBucket(env), ['XX!.png'])) ??
+                (await getBucketObject(communityBucket(env), ['XX!.png']))
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -3066,9 +3080,9 @@ self.addEventListener('fetch', (event) => {
             if (!RANKED_TIERS_UPPER.has(tierUpper)) {
                 return new Response(null, { status: 404 })
             }
-            const obj = await getBucketImage(env, [
-                `sonolus-assets/ranked-match/${tierUpper}/${tierUpper}.png`,
+            const obj = await getBucketObject(assetsBucket(env), [
                 `ranked-match/${tierUpper}/${tierUpper}.png`,
+                `${tierUpper}.png`,
             ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
@@ -3111,12 +3125,14 @@ self.addEventListener('fetch', (event) => {
             const prefs = await getUserChatPrefs(env, handle)
             const keys = [
                 prefs.pfpKey,
-                `community/chat/pfp/${handle}.png`,
                 `chat/pfp/${handle}.png`,
                 `chat/${handle}.png`,
+                `${handle}.png`,
             ].filter((k): k is string => Boolean(k))
 
-            const obj = await getBucketImage(env, keys)
+            const obj =
+                (await getBucketObject(communityBucket(env), keys)) ??
+                (await getBucketObject(assetsBucket(env), keys))
             if (obj) {
                 return new Response(obj.body, {
                     headers: {
@@ -3137,10 +3153,10 @@ self.addEventListener('fetch', (event) => {
             const target = items.find((m) => m.id === mediaId)
             if (!target) return new Response(null, { status: 404 })
 
-            const obj = await getBucketImage(env, [
+            const obj = await getBucketObject(communityBucket(env), [
                 target.imageKey,
-                `community/chat/media/${mediaId}.png`,
                 `chat/media/${mediaId}.png`,
+                `media/${mediaId}.png`,
             ])
             if (!obj) return new Response(null, { status: 404 })
 
@@ -3190,13 +3206,13 @@ self.addEventListener('fetch', (event) => {
                     return message(400, 'Media image too large.')
                 }
 
-                const bucket = primaryCommunityBucket(env)
+                const bucket = communityBucket(env)
                 if (!bucket) {
-                    return message(500, 'Community R2 bucket is not configured.')
+                    return message(500, 'COMMUNITY_BUCKET is not configured.')
                 }
 
                 const id = randomId(12)
-                const imageKey = `community/chat/media/${id}.png`
+                const imageKey = `chat/media/${id}.png`
                 await bucket.put(imageKey, rawBytes, {
                     httpMetadata: { contentType: mime },
                 })
@@ -3232,7 +3248,8 @@ self.addEventListener('fetch', (event) => {
                 const target = existing.find((m) => m.id === id)
                 if (!target) return message(404, 'Media item not found.')
 
-                for (const bucket of bucketsForRead(env)) {
+                const bucket = communityBucket(env)
+                if (bucket) {
                     await bucket.delete(target.imageKey).catch(() => {})
                 }
                 const updated = existing.filter((m) => m.id !== id)
@@ -3271,9 +3288,9 @@ self.addEventListener('fetch', (event) => {
                 return message(403, 'Choose a valid handle to update settings.')
             }
 
-            const bucket = primaryCommunityBucket(env)
+            const bucket = communityBucket(env)
             if (!bucket) {
-                return message(500, 'Community R2 bucket is not bound.')
+                return message(500, 'COMMUNITY_BUCKET is not configured.')
             }
 
             const handle = resolved.user.handle
@@ -3289,7 +3306,7 @@ self.addEventListener('fetch', (event) => {
                 if (rawBytes.byteLength > 2 * 1024 * 1024) {
                     return message(400, 'Profile image too large.')
                 }
-                pfpKey = `community/chat/pfp/${handle}.png`
+                pfpKey = `chat/pfp/${handle}.png`
                 await bucket.put(pfpKey, rawBytes, {
                     httpMetadata: { contentType: mime },
                 })
@@ -3483,10 +3500,9 @@ self.addEventListener('fetch', (event) => {
             const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            const bannerObject = await getBucketImage(env, [
-                'sonolus-assets/banner.png',
-                'server/banner.png',
-            ])
+            const bannerObject =
+                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
+                (await getBucketObject(communityBucket(env), ['banner.png']))
             let banner: { hash: string; url: string } | undefined
 
             if (bannerObject) {
@@ -3568,10 +3584,9 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object = await getBucketImage(env, [
-                'sonolus-assets/banner.png',
-                'server/banner.png',
-            ])
+            const object =
+                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
+                (await getBucketObject(communityBucket(env), ['banner.png']))
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -4022,7 +4037,6 @@ self.addEventListener('fetch', (event) => {
 
             await Promise.all([
                 ...[...bucketsForRead(env)].flatMap((b) => [
-                    b.delete(`community/${post.category}/${postName}/thumbnail`).catch(() => {}),
                     b.delete(`${post.category}/${postName}/thumbnail`).catch(() => {}),
                     b.delete(`posts/${postName}/thumbnail`).catch(() => {}),
                 ]),
@@ -4118,9 +4132,9 @@ self.addEventListener('fetch', (event) => {
                 return message(400, 'Image hash does not match.')
             }
 
-            const targetBucket = primaryCommunityBucket(env)
+            const targetBucket = communityBucket(env)
             if (targetBucket) {
-                const objectKey = `community/${post.category}/${post.item.name}/thumbnail`
+                const objectKey = `${post.category}/${post.item.name}/thumbnail`
                 await targetBucket.put(objectKey, bytes, {
                     httpMetadata: { contentType },
                 })
@@ -4142,14 +4156,10 @@ self.addEventListener('fetch', (event) => {
             const post = await lobby(env).getPost(name).catch(() => null)
             const cat = post?.category ?? 'posts'
 
-            const object = await getBucketImage(env, [
-                `community/${cat}/${name}/thumbnail`,
+            const object = await getBucketObject(communityBucket(env), [
                 `${cat}/${name}/thumbnail`,
-                `community/posts/${name}/thumbnail`,
                 `posts/${name}/thumbnail`,
-                `community/announcements/${name}/thumbnail`,
                 `announcements/${name}/thumbnail`,
-                `community/results/${name}/thumbnail`,
                 `results/${name}/thumbnail`,
             ])
 
@@ -4541,4 +4551,4 @@ self.addEventListener('fetch', (event) => {
 
         return new Response('Not found', { status: 404 })
     },
-} satisfies ExportedHandler<Env>
+} satisfies ExportedHandler<WorkerEnv>
