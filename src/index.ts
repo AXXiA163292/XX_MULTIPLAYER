@@ -162,6 +162,10 @@ function sanitizeHttpLink(raw?: unknown): string {
     return ''
 }
 
+function isValidEmail(email: string): boolean {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+}
+
 async function getBucketObject(
     bucket: R2Bucket | null,
     keys: string[],
@@ -267,6 +271,72 @@ async function saveUserChatPrefs(
     )
 
     return next
+}
+
+async function sendChatNotificationEmails(
+    env: WorkerEnv,
+    req: Request,
+    sender: UserProfile,
+    text: string,
+): Promise<void> {
+    const apiKey = String(env.RESEND_API_KEY ?? '').trim()
+    if (!apiKey) {
+        console.warn('[Mail] RESEND_API_KEY is not configured; skipping chat email notifications.')
+        return
+    }
+
+    const fromEmail = String(env.NOTIFY_FROM_EMAIL ?? '').trim() || 'onboarding@resend.dev'
+    const allPrefs = await Promise.all(
+        CHAT_PFP_HANDLES.map((h) => getUserChatPrefs(env, h)),
+    )
+
+    const lowerText = text.toLowerCase()
+    const chatUrl = externalChatUrl(req, env)
+
+    for (const pref of allPrefs) {
+        if (pref.handle === sender.handle) continue
+        const email = String(pref.notifyEmail ?? '').trim()
+        if (!email || !isValidEmail(email)) continue
+
+        const mode: EmailNotifyMode = pref.emailNotifyMode === 'all' ? 'all' : 'mention'
+        const namesToMatch = [
+            pref.displayName,
+            DEFAULT_CHAT_PROFILES[pref.handle]?.name,
+            pref.handle,
+        ]
+            .map((v) => String(v ?? '').trim().toLowerCase())
+            .filter(Boolean)
+
+        const isMentioned = namesToMatch.some(
+            (n) => lowerText.includes(`@${n}`) || lowerText.includes(`#${n}`),
+        )
+
+        if (mode === 'mention' && !isMentioned) continue
+
+        try {
+            const res = await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    from: fromEmail,
+                    to: [email],
+                    subject: `XX! Chat • ${formatAuthorTag(sender.name, sender.handle)}`,
+                    text: `${formatAuthorTag(sender.name, sender.handle)}:\n${text}\n\nOpen chat: ${chatUrl}`,
+                }),
+                signal: AbortSignal.timeout(8000),
+            })
+
+            if (!res.ok) {
+                const bodyText = await res.text().catch(() => '')
+                console.warn('[Mail] Failed sending email to', email, res.status, bodyText)
+            }
+        } catch (err) {
+            console.warn('[Mail] Error sending email to', email, err)
+        }
+    }
 }
 
 const MEDIA_INDEX_KEY = 'chat/media/index.json'
@@ -1688,7 +1758,7 @@ function renderStaffChatHtml(
       <div class="tab-group">
         <button id="tabChatBtn" type="button" class="tab-btn active">Chat</button>
         <button id="tabMediaBtn" type="button" class="tab-btn">Media</button>
-        <button id="addMediaBtn" type="button" class="tab-plus" style="display:none" title="Add Media" aria-label="Add Media">+</button>
+        <button id="addMediaBtn" type="button" class="tab-plus" title="Add Media" aria-label="Add Media">+</button>
       </div>
     </div>
     <div id="chatTab" class="active">
@@ -2060,8 +2130,18 @@ function renderStaffChatHtml(
 
   function openMediaUploadModal() {
     const active = getActiveUser();
-    if (!active || active.handle !== MEDIA_ADMIN) return;
-    setActiveTab('media');
+    if (!active) {
+      openPasswordPrompt(MEDIA_ADMIN);
+      return;
+    }
+    if (active.handle !== MEDIA_ADMIN) {
+      mediaStatusEl.textContent = 'Only #163292 can upload media.';
+      mediaUploadModal.classList.add('open');
+      return;
+    }
+    if (activeTab !== 'media') {
+      setActiveTab('media');
+    }
     mediaStatusEl.textContent = '';
     mediaUploadModal.classList.add('open');
     setTimeout(() => mediaFileInput.focus(), 20);
@@ -2099,7 +2179,7 @@ function renderStaffChatHtml(
       currentMedia = items;
     }
     const active = getActiveUser();
-    const canDelete = active && active.handle === MEDIA_ADMIN;
+    const canDelete = Boolean(active && active.handle === MEDIA_ADMIN);
 
     if (!currentMedia.length) {
       mediaFeedEl.innerHTML = '<div class="empty-state">No media uploaded yet.</div>';
@@ -3166,7 +3246,7 @@ export default {
         ctx.waitUntil(refreshDailyAssets(env))
     },
 
-    async fetch(req: Request, env: WorkerEnv): Promise<Response> {
+    async fetch(req: Request, env: WorkerEnv, ctx?: ExecutionContext): Promise<Response> {
         const url = new URL(req.url)
         const path = url.pathname.replace(/\/+$/, '') || '/'
 
@@ -3520,6 +3600,10 @@ self.addEventListener('fetch', (event) => {
                 ? body.notifyEmail.trim().slice(0, 120)
                 : undefined
 
+            if (notifyEmail && !isValidEmail(notifyEmail)) {
+                return message(400, 'Enter a valid email address.')
+            }
+
             const emailNotifyMode: EmailNotifyMode | undefined =
                 body?.emailNotifyMode === 'all' || body?.emailNotifyMode === 'mention'
                     ? body.emailNotifyMode
@@ -3663,6 +3747,12 @@ self.addEventListener('fetch', (event) => {
                     : undefined
 
                 const messages = await chatStub(env).post(resolved.user, text, replyTo)
+                const mailPromise = sendChatNotificationEmails(env, req, resolved.user, text)
+                if (ctx) {
+                    ctx.waitUntil(mailPromise)
+                } else {
+                    await mailPromise.catch(() => {})
+                }
                 return json({ messages })
             }
 
@@ -3929,14 +4019,23 @@ self.addEventListener('fetch', (event) => {
             const labels = POST_LABELS[category]
             const title = String(values.get('title') ?? '').trim() || labels.section
             const description = String(values.get('description') ?? '').trim()
+            const now = Date.now()
+            const postName = randomId(12)
 
-            const created = await lobby(env).createPost(
+            const created = await lobby(env).createPost({
                 category,
-                title,
+                item: {
+                    name: postName,
+                    version: 1,
+                    title,
+                    time: now,
+                    author: user.name || user.handle,
+                    tags: [],
+                },
                 description,
-                user.name || user.handle,
-                user.handle,
-            )
+                uploadKey: '',
+                thumbnailHash: '',
+            })
 
             return json({
                 name: created.item.name,
@@ -4065,7 +4164,13 @@ self.addEventListener('fetch', (event) => {
                 return json({ comments, pageCount })
             }
 
-            const updated = await lobby(env).addComment(name, user.handle, user.name || user.handle, text)
+            const added = await lobby(env).addPostComment(name, {
+                handle: user.handle,
+                author: user.name || user.handle,
+                text,
+            })
+            if (!added) return message(404, 'Post not found.')
+            const updated = await lobby(env).getPost(name)
             if (!updated) return message(404, 'Post not found.')
 
             const { pageCount, comments } = formatPostComments(
@@ -4102,7 +4207,9 @@ self.addEventListener('fetch', (event) => {
             if (!canDeleteComment(session, target.handle)) {
                 return message(403, 'Cannot delete this comment.')
             }
-            const updated = await lobby(env).deleteComment(name, commentId)
+            const removed = await lobby(env).deletePostComment(name, commentId)
+            if (!removed) return message(404, 'Post not found.')
+            const updated = await lobby(env).getPost(name)
             if (!updated) return message(404, 'Post not found.')
             const { pageCount, comments } = formatPostComments(updated, session, 0)
             return json({ comments, pageCount })
@@ -4141,7 +4248,7 @@ self.addEventListener('fetch', (event) => {
             if (!existing) return message(404, 'Post not found.')
 
             if (actionType === 'likePost') {
-                const updated = await lobby(env).toggleLike(name, user.handle)
+                const updated = await lobby(env).togglePostLike(name, user.handle)
                 if (!updated) return message(404, 'Post not found.')
                 return json({ item: buildPostItemWithBadges(updated) })
             }
@@ -4155,7 +4262,7 @@ self.addEventListener('fetch', (event) => {
                 if (bucket && existing.thumbnailHash) {
                     await bucket.delete(`posts/thumbnails/${existing.thumbnailHash}`).catch(() => {})
                 }
-                await lobby(env).deletePost(name)
+                await lobby(env).removePost(name)
                 return json({ deleted: true })
             }
 
@@ -4164,17 +4271,13 @@ self.addEventListener('fetch', (event) => {
                 if (bucket && existing.thumbnailHash) {
                     await bucket.delete(`posts/thumbnails/${existing.thumbnailHash}`).catch(() => {})
                 }
-                const updated = await lobby(env).updatePost(name, {
-                    clearThumbnail: true,
-                })
+                const updated = await lobby(env).clearPostThumbnail(name)
                 if (!updated) return message(404, 'Post not found.')
                 return json({ item: buildPostItemWithBadges(updated) })
             }
 
             if (actionType === 'pinPost') {
-                const updated = await lobby(env).updatePost(name, {
-                    pinned: !existing.pinned,
-                })
+                const updated = await lobby(env).togglePostPin(name)
                 if (!updated) return message(404, 'Post not found.')
                 return json({ item: buildPostItemWithBadges(updated) })
             }
@@ -4197,7 +4300,12 @@ self.addEventListener('fetch', (event) => {
 
             const text = extractCommentText(values)
             if (text) {
-                const updated = await lobby(env).addComment(name, user.handle, user.name || user.handle, text)
+                await lobby(env).addPostComment(name, {
+                    handle: user.handle,
+                    author: user.name || user.handle,
+                    text,
+                })
+                const updated = await lobby(env).getPost(name)
                 if (!updated) return message(404, 'Post not found.')
                 return json({ item: buildPostItemWithBadges(updated) })
             }
