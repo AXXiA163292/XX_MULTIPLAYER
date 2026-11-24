@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import { randomId } from './crypto.ts'
-import type { ChatMessage, Env, UserProfile } from './types.ts'
+import type { ChatMessage, Env, RoomVisibility, UserProfile } from './types.ts'
 
 export type PostCategory = 'announcements' | 'posts' | 'results'
 
@@ -46,8 +46,19 @@ export type StoredChatMessage = ChatMessage & {
     }
 }
 
+export type RoomDirectoryEntry = {
+    name: string
+    title: string
+    subtitle: string
+    master: string
+    hostId?: string
+    visibility: RoomVisibility
+    updatedAt: number
+}
+
 type LobbyState = {
     rooms: string[]
+    roomEntries?: Record<string, RoomDirectoryEntry>
     posts: StoredPost[]
     chat: StoredChatMessage[]
     pinnedChatId: string | null
@@ -131,11 +142,14 @@ export class Lobby extends DurableObject<Env> {
     private rooms = new Set<string>()
     private st: LobbyState = {
         rooms: [],
+        roomEntries: {},
         posts: [],
         chat: [],
         pinnedChatId: null,
     }
     private loaded = false
+    private r2Queue: Promise<void> = Promise.resolve()
+    private r2Dirty = false
 
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
@@ -182,40 +196,51 @@ export class Lobby extends DurableObject<Env> {
                 }
             }
 
-            return { rooms: [], posts, chat, pinnedChatId }
+            return { rooms: [], roomEntries: {}, posts, chat, pinnedChatId }
         } catch (error) {
             console.error('Could not load lobby state from R2:', error)
             return null
         }
     }
 
-    private async persistToR2(): Promise<void> {
+    private async writeR2Now(): Promise<void> {
         const bucket = this.env.COMMUNITY_BUCKET
         if (!bucket) return
 
+        const postsPayload = JSON.stringify({
+            updatedAt: Date.now(),
+            posts: this.st.posts.slice(-MAX_POSTS),
+        })
+        const chatPayload = JSON.stringify({
+            updatedAt: Date.now(),
+            pinnedChatId: this.st.pinnedChatId,
+            messages: this.st.chat.slice(-MAX_CHAT),
+        })
+
         try {
-            await Promise.all([
-                bucket.put(
-                    POSTS_INDEX_KEY,
-                    JSON.stringify({
-                        updatedAt: Date.now(),
-                        posts: this.st.posts.slice(-MAX_POSTS),
-                    }),
-                    { httpMetadata: { contentType: 'application/json' } },
-                ),
-                bucket.put(
-                    CHAT_INDEX_KEY,
-                    JSON.stringify({
-                        updatedAt: Date.now(),
-                        pinnedChatId: this.st.pinnedChatId,
-                        messages: this.st.chat.slice(-MAX_CHAT),
-                    }),
-                    { httpMetadata: { contentType: 'application/json' } },
-                ),
-            ])
+            await bucket.put(POSTS_INDEX_KEY, postsPayload, {
+                httpMetadata: { contentType: 'application/json' },
+            })
+            await bucket.put(CHAT_INDEX_KEY, chatPayload, {
+                httpMetadata: { contentType: 'application/json' },
+            })
         } catch (error) {
             console.error('Could not persist lobby state to R2:', error)
         }
+    }
+
+    private scheduleR2Persist(): Promise<void> {
+        this.r2Dirty = true
+        this.r2Queue = this.r2Queue
+            .then(async () => {
+                if (!this.r2Dirty) return
+                this.r2Dirty = false
+                await this.writeR2Now()
+            })
+            .catch((error) => {
+                console.error('R2 queue error:', error)
+            })
+        return this.r2Queue
     }
 
     private async ensureLoaded(): Promise<void> {
@@ -227,6 +252,9 @@ export class Lobby extends DurableObject<Env> {
             this.rooms = new Set(roomNames)
             this.st = {
                 rooms: [...this.rooms],
+                roomEntries: stored.roomEntries && typeof stored.roomEntries === 'object'
+                    ? stored.roomEntries
+                    : {},
                 posts: Array.isArray(stored.posts)
                     ? stored.posts.slice(-MAX_POSTS).map((post) => normalizePost(post))
                     : [],
@@ -250,7 +278,7 @@ export class Lobby extends DurableObject<Env> {
         this.loaded = true
     }
 
-    private async save(): Promise<void> {
+    private async save(persistR2 = false): Promise<void> {
         this.st.rooms = [...this.rooms]
         this.st.posts = this.st.posts.slice(-MAX_POSTS)
         this.st.chat = this.st.chat.slice(-MAX_CHAT)
@@ -261,12 +289,14 @@ export class Lobby extends DurableObject<Env> {
             this.st.pinnedChatId = null
         }
         await this.ctx.storage.put('state', this.st)
-        await this.persistToR2()
+        if (persistR2) {
+            await this.scheduleR2Persist()
+        }
     }
 
     async syncAllToR2(): Promise<void> {
         await this.ensureLoaded()
-        await this.persistToR2()
+        await this.scheduleR2Persist()
     }
 
     async list(): Promise<{ name: string }[]> {
@@ -274,18 +304,40 @@ export class Lobby extends DurableObject<Env> {
         return [...this.rooms].map((name) => ({ name }))
     }
 
+    async upsert(entry: {
+        name: string
+        title: string
+        subtitle: string
+        master: string
+        hostId?: string
+        visibility: RoomVisibility
+    }): Promise<void> {
+        await this.ensureLoaded()
+        if (!entry?.name) return
+        this.rooms.add(entry.name)
+        this.st.roomEntries ??= {}
+        this.st.roomEntries[entry.name] = {
+            ...entry,
+            updatedAt: Date.now(),
+        }
+        await this.save(false)
+    }
+
     async register(name: string): Promise<void> {
         await this.ensureLoaded()
         if (!name) return
         this.rooms.add(name)
-        await this.save()
+        await this.save(false)
     }
 
     async remove(name: string): Promise<void> {
         await this.ensureLoaded()
         if (!name) return
         this.rooms.delete(name)
-        await this.save()
+        if (this.st.roomEntries) {
+            delete this.st.roomEntries[name]
+        }
+        await this.save(false)
     }
 
     async listPosts(category?: PostCategory): Promise<StoredPost[]> {
@@ -329,7 +381,7 @@ export class Lobby extends DurableObject<Env> {
             post,
         ].slice(-MAX_POSTS)
 
-        await this.save()
+        await this.save(true)
         return post
     }
 
@@ -359,7 +411,7 @@ export class Lobby extends DurableObject<Env> {
         })
 
         this.st.posts[index] = updated
-        await this.save()
+        await this.save(true)
         return updated
     }
 
@@ -368,7 +420,7 @@ export class Lobby extends DurableObject<Env> {
         const before = this.st.posts.length
         this.st.posts = this.st.posts.filter((post) => post.item.name !== name)
         if (this.st.posts.length === before) return false
-        await this.save()
+        await this.save(true)
         return true
     }
 
@@ -384,7 +436,7 @@ export class Lobby extends DurableObject<Env> {
             : [...current.likes, handle]
 
         this.st.posts[index] = current
-        await this.save()
+        await this.save(true)
         return current
     }
 
@@ -396,7 +448,7 @@ export class Lobby extends DurableObject<Env> {
         const current = normalizePost(this.st.posts[index])
         current.pinned = !current.pinned
         this.st.posts[index] = current
-        await this.save()
+        await this.save(true)
         return current
     }
 
@@ -419,7 +471,7 @@ export class Lobby extends DurableObject<Env> {
         const current = normalizePost(this.st.posts[index])
         current.comments = [...current.comments, comment]
         this.st.posts[index] = current
-        await this.save()
+        await this.save(true)
         return comment
     }
 
@@ -434,7 +486,7 @@ export class Lobby extends DurableObject<Env> {
 
         current.comments = nextComments
         this.st.posts[index] = current
-        await this.save()
+        await this.save(true)
         return true
     }
 
@@ -490,7 +542,7 @@ export class Lobby extends DurableObject<Env> {
         })
 
         this.st.chat = [...this.st.chat, message].slice(-MAX_CHAT)
-        await this.save()
+        await this.save(true)
         return message
     }
 
@@ -502,7 +554,7 @@ export class Lobby extends DurableObject<Env> {
             this.st.pinnedChatId = null
         }
         if (this.st.chat.length === before) return false
-        await this.save()
+        await this.save(true)
         return true
     }
 
@@ -518,7 +570,7 @@ export class Lobby extends DurableObject<Env> {
             : [...(current.likes ?? []), handle]
 
         this.st.chat[idx] = current
-        await this.save()
+        await this.save(true)
         return current
     }
 
@@ -527,7 +579,7 @@ export class Lobby extends DurableObject<Env> {
         const exists = this.st.chat.some((m) => m.id === id)
         if (!exists) return this.st.pinnedChatId
         this.st.pinnedChatId = this.st.pinnedChatId === id ? null : id
-        await this.save()
+        await this.save(true)
         return this.st.pinnedChatId
     }
 
