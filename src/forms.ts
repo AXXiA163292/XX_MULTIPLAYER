@@ -93,6 +93,20 @@ const customSongsOption = {
     })),
 }
 
+export type RankedVocalType = 'virtualSinger' | 'sekai'
+
+const vocalTypeOption = {
+    query: 'vocalType',
+    name: 'Vocal Type',
+    required: false,
+    type: 'select' as const,
+    def: 'virtualSinger' as RankedVocalType,
+    values: [
+        { name: 'virtualSinger', title: 'VIRTUAL SINGER' },
+        { name: 'sekai', title: 'SEKAI' },
+    ],
+}
+
 const tournamentVisibilityOption = {
     query: 'visibility',
     name: 'Room access',
@@ -148,7 +162,7 @@ export const roomForms = (isTournamentHost = false) =>
                 : type === 'casualRoom'
                     ? [titleOption, customScoringOption, customVisibilityOption, randomOption]
                     : type === 'rankedRoom'
-                        ? [tierOption, customSongsOption]
+                        ? [tierOption, customSongsOption, vocalTypeOption]
                         : [tournamentScoringOption, tournamentVisibilityOption],
         }))
 
@@ -167,6 +181,7 @@ export type RoomSettings = {
     random: boolean
     tier: string
     customSongs: CustomSongsMode
+    vocalType: RankedVocalType
 }
 
 export const serializeSettings = (s: RoomSettings) => {
@@ -183,9 +198,10 @@ export const serializeSettings = (s: RoomSettings) => {
         values.push(`title=${encodeURIComponent(s.title || '')}`)
         values.push(`random=${s.random ? '1' : '0'}`)
     }
-    if (s.type === 'rankedRoom') {
+        if (s.type === 'rankedRoom') {
         values.push(`tier=${encodeURIComponent(s.tier || 'master')}`)
         values.push(`customSongs=${encodeURIComponent(s.customSongs || 'off')}`)
+        values.push(`vocalType=${encodeURIComponent(s.vocalType || 'virtualSinger')}`)
     }
 
     return values.join('&')
@@ -249,6 +265,8 @@ export function parseSettings(
     const customSongs: CustomSongsMode = type === 'rankedRoom'
         ? normalizeCustomSongsMode(p.get('customSongs') ?? existing?.customSongs)
         : 'off'
+        const rawVocalType = (p.get('vocalType') ?? existing?.vocalType ?? 'virtualSinger').trim()
+    const vocalType: RankedVocalType = rawVocalType === 'sekai' ? 'sekai' : 'virtualSinger'
 
     if (!Object.prototype.hasOwnProperty.call(SCORING_MODES, scoring)) return null
     if (type === 'groupStage' && group.length > 24) return null
@@ -264,5 +282,6 @@ export function parseSettings(
         random,
         tier,
         customSongs,
+        vocalType,
     }
 }
