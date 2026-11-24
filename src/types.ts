@@ -1,3 +1,4 @@
+
 export type RoomVisibility = 'public' | 'private'
 
 export type UserProfile = {
