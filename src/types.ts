@@ -19,38 +19,46 @@ export type JoinSession = {
     exp: number
 }
 
-export type RoomVisibility = 'public' | 'private'
+export type RoomVisibility = 'public' | 'private' | 'locked'
 
 export type MatchMode = 'casual' | 'ranked'
 
-export type RoomSettings = {
-    title: string
-    master: boolean
-    maxCount: number
-    visibility: RoomVisibility
-    matchMode?: MatchMode
-    roundCount?: number
-    timeLimitSec?: number
-    levelPool?: string
-    level?: LevelItem
-    ratingMin?: number
-    ratingMax?: number
-    grade?: string
-    accuracyMin?: number
-    accuracyMax?: number
-    fullCombo?: boolean
-    allPerfect?: boolean
+export type RoomStatus = 'selecting' | 'preparing' | 'playing'
+
+export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
+
+export interface Sil {
+    address: string
+    name: string
 }
 
-export type GameplayResult = {
+export interface GameplayResult {
+    grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
     score: number
     accuracy: number
+    arcadeScore: number
+    accuracyScore: number
     combo: number
     perfect: number
     great: number
     good: number
     miss: number
-    grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
+    totalCount: number
+}
+
+export type LevelItem = {
+    name: string
+    version: 1
+    title: string
+    artists: string
+    author: string
+    rating: number
+    engine: any
+    cover: any
+    bgm: any
+    data: any
+    source?: string
+    tags?: { title: string; icon?: string }[]
 }
 
 export type RoomMember = {
@@ -76,21 +84,6 @@ export type ChatMessage = {
     author: string
     text: string
     time: number
-}
-
-export type LevelItem = {
-    name: string
-    version: 1
-    title: string
-    artists: string
-    author: string
-    rating: number
-    engine: any
-    cover: any
-    bgm: any
-    data: any
-    source?: string
-    tags?: { title: string; icon?: string }[]
 }
 
 export type RoomSummary = {
