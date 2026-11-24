@@ -347,16 +347,16 @@ function resolveCategory(
         bodyValueParams?.get('category'),
         url.searchParams.get('category'),
         body?.category,
+        body?.infoType,
+        body?.postType,
+        url.searchParams.get('infoType'),
+        url.searchParams.get('postType'),
+        urlSearchParams?.get('infoType'),
+        bodySearchParams?.get('infoType'),
         values?.get('type'),
         bodyValueParams?.get('type'),
         body?.type,
         url.searchParams.get('type'),
-        url.searchParams.get('infoType'),
-        url.searchParams.get('postType'),
-        body?.infoType,
-        body?.postType,
-        urlSearchParams?.get('infoType'),
-        bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
         bodySearchParams?.get('type'),
     ]
@@ -493,16 +493,13 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
 function formatChatCommunityComments(
     messages: ChatMessage[],
     session: AuthSession | null,
-    page = 0,
+    _page = 0,
 ) {
     const ordered = [...messages].reverse()
-    const pageSize = 10
-    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
-    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
-        pageCount,
-        comments: slice.map((m) => ({
+        pageCount: 1,
+        comments: ordered.map((m) => ({
             name: m.id,
             author: formatAuthorTag(m.author, m.handle),
             time: m.time,
@@ -753,7 +750,7 @@ function renderStaffChatHtml(
     </div>
   </header>
   <div id="picker">
-    <div class="picker-title">Hi!, who are you?</div>
+    <div class="picker-title">Hi, who is here?</div>
     <div class="picker-grid">${cardsHtml}</div>
   </div>
   <div id="chatView">
@@ -1234,8 +1231,6 @@ function renderStaffChatHtml(
   let swipeRow = null;
   let swipeStartX = 0;
   let swipeDeltaX = 0;
-  let lastTapId = '';
-  let lastTapAt = 0;
 
   box.addEventListener('touchstart', (e) => {
     const row = e.target.closest('[data-row-id]');
@@ -1267,13 +1262,6 @@ function renderStaffChatHtml(
     }
   });
 
-  box.addEventListener('dblclick', async (e) => {
-    const msgEl = e.target.closest('[data-msg-id]');
-    if (!msgEl) return;
-    const id = msgEl.getAttribute('data-msg-id');
-    if (id) await toggleLikeMessage(id);
-  });
-
   box.addEventListener('click', async (e) => {
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
@@ -1295,21 +1283,6 @@ function renderStaffChatHtml(
       if (res.ok) {
         const data = await res.json();
         render(data.messages || []);
-      }
-      return;
-    }
-
-    const msgEl = e.target.closest('[data-msg-id]');
-    if (msgEl) {
-      const id = msgEl.getAttribute('data-msg-id') || '';
-      const now = Date.now();
-      if (id && id === lastTapId && now - lastTapAt < 320) {
-        lastTapId = '';
-        lastTapAt = 0;
-        await toggleLikeMessage(id);
-      } else {
-        lastTapId = id;
-        lastTapAt = now;
       }
     }
   });
@@ -1469,17 +1442,14 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
 function formatPostComments(
     post: StoredPost,
     session: AuthSession | null,
-    page = 0,
+    _page = 0,
 ) {
     const comments: PostComment[] = post.comments ?? []
     const ordered = [...comments].reverse()
-    const pageSize = 10
-    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
-    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
-        pageCount,
-        comments: slice.map((c) => ({
+        pageCount: 1,
+        comments: ordered.map((c) => ({
             name: c.id,
             author: formatAuthorTag(c.author, c.handle),
             time: c.time,
@@ -1553,16 +1523,6 @@ async function remoteLevelItem(
 ): Promise<RemoteLevelItem | null> {
     const details = await remoteLevelDetails(chart)
     return details?.item ?? null
-}
-
-function localizedTitle(value: any): string {
-    if (typeof value === 'string') return value
-    if (value && typeof value === 'object') {
-        if (typeof value.en === 'string') return value.en
-        const first = Object.values(value).find((entry) => typeof entry === 'string')
-        return typeof first === 'string' ? first : ''
-    }
-    return ''
 }
 
 async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
@@ -1911,8 +1871,7 @@ self.addEventListener('fetch', (event) => {
             const prefsMap = Object.fromEntries(prefsEntries)
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).getChatMessagesFromR2()
-                    .catch(() => lobby(env).listChatMessages().catch(() => []))
+                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({ messages, prefs: prefsMap })
             }
 
@@ -2154,9 +2113,6 @@ self.addEventListener('fetch', (event) => {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         items: posts.map(buildPostItemWithBadges),
-                        ...(explicit
-                            ? { searchValues: new URLSearchParams({ category: explicit }).toString() }
-                            : {}),
                     }
                 }),
             )
@@ -2174,7 +2130,6 @@ self.addEventListener('fetch', (event) => {
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
             const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
-            const pageSize = 10
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -2217,13 +2172,10 @@ self.addEventListener('fetch', (event) => {
                 })
                 : allCategoryPosts
 
-            const pageCount = Math.max(1, Math.ceil(posts.length / pageSize))
-            const slice = posts.slice(page * pageSize, page * pageSize + pageSize)
-
             return json({
                 title: POST_LABELS[kind].section,
-                pageCount,
-                items: slice.map(buildPostItemWithBadges),
+                pageCount: 1,
+                items: posts.map(buildPostItemWithBadges),
                 searches: [],
             })
         }
