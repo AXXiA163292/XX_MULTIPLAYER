@@ -1,4 +1,4 @@
-import type { CustomSongsMode } from './forms.ts'
+import type { CustomSongsMode, RankedVocalType } from './forms.ts'
 import type { Env, LevelItem } from './types.ts'
 
 const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
@@ -49,6 +49,8 @@ export type SheetChart = {
     url: string
     address: string
     name: string
+    musicVocalIds?: number[]
+    sekaiVocalVersion?: number
 }
 
 export type EditionData = {
@@ -652,6 +654,32 @@ function resolveOfficialColumns(headers: string[]): Record<OfficialDiff, { level
     return resolved
 }
 
+function parseMusicVocalIds(raw: string): number[] {
+    return (raw.match(/\d+/g) ?? [])
+        .map(Number)
+        .filter((value) => Number.isSafeInteger(value) && value > 0)
+}
+
+function applyRankedVocalType(
+    chart: SheetChart,
+    vocalType: RankedVocalType,
+): SheetChart {
+    if (vocalType !== 'sekai' || !chart.sekaiVocalVersion || !chart.musicVocalIds) {
+        return chart
+    }
+
+    const vocalId = chart.musicVocalIds[chart.sekaiVocalVersion - 1]
+    if (!vocalId) return chart
+
+    const match = chart.name.match(/^(.*-\d+)-\d+-(hard|expert|master|append)$/i)
+    if (!match) return chart
+
+    return {
+        ...chart,
+        name: `${match[1]}-${vocalId}-${match[2]}`,
+    }
+}
+
 function officialRankedPoolFromSheet(
     values: string[][],
     tier: RankedTier,
@@ -666,14 +694,30 @@ function officialRankedPoolFromSheet(
     })
     if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
 
-    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+        const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const idCol = headers.indexOf('id')
+    const musicVocalIdsCol = headers.indexOf('musicvocalids')
+    const vocalTypeCols = Array.from(
+        { length: 12 },
+        (_, index) => headers.indexOf(`v${index + 2}musicvocaltype`),
+    )
     const cols = resolveOfficialColumns(headers)
     const rules = RANKED_TIERS[tier]
     const pool: SheetChart[] = []
 
     for (let rowIdx = headerIndex + 1; rowIdx < values.length; rowIdx++) {
         const cells = values[rowIdx]!
+                const musicVocalIds = musicVocalIdsCol >= 0
+            ? parseMusicVocalIds(normalizeId(cells[musicVocalIdsCol]))
+            : []
+
+        const sekaiVocalVersionIndex = vocalTypeCols.findIndex((col) =>
+            col >= 0 && normalizeId(cells[col]).toLowerCase().includes('sekai'),
+        )
+
+        const sekaiVocalVersion = sekaiVocalVersionIndex >= 0
+            ? sekaiVocalVersionIndex + 2
+            : undefined
         const rowId = idCol >= 0 && normalizeId(cells[idCol])
             ? normalizeId(cells[idCol])
             : String(rowIdx)
@@ -691,8 +735,14 @@ function officialRankedPoolFromSheet(
                 : inRange(level, rules.main)
             if (!fits) continue
 
-            const chart = chartFromUrl(`${rowId}-${diff}`, link)
-            if (chart) pool.push(chart)
+                        const chart = chartFromUrl(`${rowId}-${diff}`, link)
+            if (chart) {
+                pool.push({
+                    ...chart,
+                    musicVocalIds,
+                    ...(sekaiVocalVersion ? { sekaiVocalVersion } : {}),
+                })
+            }
         }
     }
 
@@ -758,6 +808,7 @@ async function getRankedCustomPool(tier: RankedTier, env?: Env): Promise<SheetCh
 export async function pickRankedLevel(
     tier: RankedTier,
     customSongs: CustomSongsMode,
+    vocalType: RankedVocalType,
     env?: Env,
 ): Promise<SheetChart | null> {
     const official = customSongs === 'customOnly'
@@ -770,7 +821,8 @@ export async function pickRankedLevel(
     const pool = [...official, ...custom]
     if (pool.length === 0) return null
 
-    return pool[Math.floor(Math.random() * pool.length)]!
+    const selected = pool[Math.floor(Math.random() * pool.length)]!
+    return applyRankedVocalType(selected, vocalType)
 }
 
 export type RefreshSummary = {
