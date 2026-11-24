@@ -1284,6 +1284,13 @@ function renderStaffChatHtml(
         const data = await res.json();
         render(data.messages || []);
       }
+      return;
+    }
+
+    const msgEl = e.target.closest('[data-msg-id]');
+    if (msgEl) {
+      const id = msgEl.getAttribute('data-msg-id') || '';
+      if (id) await toggleLikeMessage(id);
     }
   });
 
