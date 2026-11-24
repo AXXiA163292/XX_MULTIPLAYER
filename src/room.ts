@@ -40,10 +40,14 @@ import type {
     GameplayResult,
     JoinSession,
     RoomStatus,
-    RoomUser,
     Sil,
     UserStatus,
 } from './types.ts'
+
+type RoomUser = {
+    authentication: string
+    signature: string
+}
 
 type Member = {
     id: string
