@@ -1051,16 +1051,6 @@ function renderStaffChatHtml(
   }
   .btn-header:hover{background:#FFFFFF}
   .btn-header:active{transform:scale(.97)}
-  .btn-plus{
-    width:34px;
-    height:34px;
-    padding:0;
-    display:inline-flex;
-    align-items:center;
-    justify-content:center;
-    font-size:20px;
-    line-height:1;
-  }
   .btn-sm{
     background:var(--blush-soft);
     color:var(--plum-dark);
@@ -1212,7 +1202,7 @@ function renderStaffChatHtml(
     align-items:center;
     justify-content:space-between;
   }
-  .tab-group{display:flex;gap:8px}
+  .tab-group{display:flex;gap:8px;align-items:center}
   .tab-btn{
     background:var(--blush-soft);
     color:var(--plum-dark);
@@ -1230,6 +1220,26 @@ function renderStaffChatHtml(
     color:var(--blush);
     border-color:var(--plum);
   }
+  .tab-plus{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1.5px solid var(--blush-border);
+    border-radius:10px;
+    width:32px;
+    height:32px;
+    padding:0;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    font-family:'Montserrat',sans-serif;
+    font-size:18px;
+    font-weight:800;
+    line-height:1;
+    cursor:pointer;
+    transition:all .12s ease;
+  }
+  .tab-plus:hover{background:var(--blush);border-color:var(--plum);color:var(--plum)}
+  .tab-plus:active{background:var(--plum);color:var(--blush);border-color:var(--plum)}
 
   #chatTab{
     flex:1 1 auto;
@@ -1647,7 +1657,6 @@ function renderStaffChatHtml(
     </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
-      <button id="addMediaHeaderBtn" type="button" class="btn-header btn-plus" style="display:none" title="Add Media" aria-label="Add Media">+</button>
       <button id="settingsBtn" type="button" class="btn-header" style="display:none">Settings</button>
     </div>
   </header>
@@ -1663,6 +1672,7 @@ function renderStaffChatHtml(
       <div class="tab-group">
         <button id="tabChatBtn" type="button" class="tab-btn active">Chat</button>
         <button id="tabMediaBtn" type="button" class="tab-btn">Media</button>
+        <button id="addMediaBtn" type="button" class="tab-plus" style="display:none" title="Add Media" aria-label="Add Media">+</button>
       </div>
     </div>
     <div id="chatTab" class="active">
@@ -1798,9 +1808,9 @@ function renderStaffChatHtml(
   const appViewEl = document.getElementById('appView');
   const tabChatBtn = document.getElementById('tabChatBtn');
   const tabMediaBtn = document.getElementById('tabMediaBtn');
+  const addMediaBtn = document.getElementById('addMediaBtn');
   const chatTabEl = document.getElementById('chatTab');
   const mediaTabEl = document.getElementById('mediaTab');
-  const addMediaHeaderBtn = document.getElementById('addMediaHeaderBtn');
   const mediaUploadModal = document.getElementById('mediaUploadModal');
   const closeMediaModalBtn = document.getElementById('closeMediaModalBtn');
   const mediaFileInput = document.getElementById('mediaFileInput');
@@ -2028,6 +2038,15 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
+  function openMediaUploadModal() {
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    setActiveTab('media');
+    mediaStatusEl.textContent = '';
+    mediaUploadModal.classList.add('open');
+    setTimeout(() => mediaFileInput.focus(), 20);
+  }
+
   function setActiveTab(tab) {
     activeTab = tab === 'media' ? 'media' : 'chat';
     tabChatBtn.classList.toggle('active', activeTab === 'chat');
@@ -2045,12 +2064,10 @@ function renderStaffChatHtml(
   tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
   tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
 
-  addMediaHeaderBtn.addEventListener('click', () => {
-    const active = getActiveUser();
-    if (!active || active.handle !== MEDIA_ADMIN) return;
-    setActiveTab('media');
-    mediaStatusEl.textContent = '';
-    mediaUploadModal.classList.add('open');
+  addMediaBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openMediaUploadModal();
   });
 
   closeMediaModalBtn.addEventListener('click', () => {
@@ -2116,7 +2133,10 @@ function renderStaffChatHtml(
 
   uploadMediaBtn.addEventListener('click', async () => {
     const active = getActiveUser();
-    if (!active || active.handle !== MEDIA_ADMIN) return;
+    if (!active || active.handle !== MEDIA_ADMIN) {
+      mediaStatusEl.textContent = 'Only #163292 can upload media.';
+      return;
+    }
     const file = mediaFileInput.files && mediaFileInput.files[0];
     if (!file) {
       mediaStatusEl.textContent = 'Select an image first.';
@@ -2147,6 +2167,7 @@ function renderStaffChatHtml(
       mediaCaptionInput.value = '';
       mediaStatusEl.textContent = '';
       mediaUploadModal.classList.remove('open');
+      setActiveTab('media');
       if (Array.isArray(data.items)) renderMedia(data.items);
     } finally {
       uploadMediaBtn.disabled = false;
@@ -2268,7 +2289,7 @@ function renderStaffChatHtml(
     if (!active) {
       disconnectSocket();
       badgeEl.textContent = 'Select profile';
-      addMediaHeaderBtn.style.display = 'none';
+      addMediaBtn.style.display = 'none';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
       appViewEl.classList.remove('open');
@@ -2280,7 +2301,7 @@ function renderStaffChatHtml(
     }
 
     badgeEl.textContent = formatTag(active.name, active.handle);
-    addMediaHeaderBtn.style.display = active.handle === MEDIA_ADMIN ? 'inline-flex' : 'none';
+    addMediaBtn.style.display = active.handle === MEDIA_ADMIN ? 'inline-flex' : 'none';
     settingsBtn.style.display = 'inline-block';
     pickerEl.classList.remove('open');
     appViewEl.classList.add('open');
