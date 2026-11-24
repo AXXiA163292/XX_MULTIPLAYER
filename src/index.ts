@@ -315,9 +315,9 @@ const POST_LABELS: Record<PostCategory, {
 function parseCategoryString(raw: string | null | undefined): PostCategory | null {
     if (!raw) return null
     const clean = raw.trim().toLowerCase()
-    if (clean === 'announcements' || clean === 'announcement') return 'announcements'
-    if (clean === 'results' || clean === 'result') return 'results'
-    if (clean === 'posts' || clean === 'post') return 'posts'
+    if (clean === 'announcements' || clean === 'announcement' || clean.includes('announce')) return 'announcements'
+    if (clean === 'results' || clean === 'result' || clean.includes('result')) return 'results'
+    if (clean === 'posts' || clean === 'post' || clean.includes('post')) return 'posts'
     return null
 }
 
@@ -347,8 +347,12 @@ function resolveCategory(
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
+        url.searchParams.get('section'),
+        url.searchParams.get('title'),
         body?.infoType,
         body?.postType,
+        body?.section,
+        body?.title,
         url.searchParams.get('category'),
         values?.get('category'),
         bodyValueParams?.get('category'),
@@ -359,6 +363,8 @@ function resolveCategory(
         bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
         bodySearchParams?.get('type'),
+        urlSearchParams?.get('section'),
+        urlSearchParams?.get('title'),
     ]
 
     for (const c of candidates) {
