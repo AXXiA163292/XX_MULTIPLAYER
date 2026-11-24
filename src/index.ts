@@ -778,65 +778,65 @@ function renderStaffChatHtml(
 <title>XX! Chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0d0f14;color:#f3f4f6;font-family:'Red Hat Display',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:28px;display:flex;flex-direction:column;height:100dvh}
-  header{padding:24px 32px;background:#151922;border-bottom:2px solid #242b3a;font-weight:700;font-size:30px;display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
-  .header-brand{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  .app-logo{width:48px;height:48px;border-radius:12px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
-  .header-right{display:flex;align-items:center;gap:16px}
-  .badge{font-size:24px;color:#9ca3af;font-weight:600}
-  .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:16px;padding:10px 18px;font-size:22px;font-weight:700;cursor:pointer;font-family:inherit}
+  body{background:#0d0f14;color:#f3f4f6;font-family:'Red Hat Display',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:17px;display:flex;flex-direction:column;height:100dvh}
+  header{padding:14px 20px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:18px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .header-brand{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .app-logo{width:30px;height:30px;border-radius:8px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
+  .header-right{display:flex;align-items:center;gap:10px}
+  .badge{font-size:14px;color:#9ca3af;font-weight:600}
+  .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:6px 11px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit}
   .btn-sm:hover{border-color:#3b82f6}
   .btn-danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
-  #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:48px 32px;gap:36px}
+  #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:20px;overflow-y:auto}
   #picker.open{display:flex}
-  .picker-title{font-size:36px;font-weight:700;text-align:center}
-  .picker-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,260px));gap:28px}
-  .pick-card{background:#151922;border:1px solid #283042;border-radius:28px;padding:24px;display:flex;flex-direction:column;align-items:center;gap:16px;color:#f3f4f6;cursor:pointer;font-family:inherit}
+  .picker-title{font-size:21px;font-weight:700;text-align:center}
+  .picker-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,156px));gap:14px;width:100%;max-width:520px;justify-content:center}
+  .pick-card{background:#151922;border:1px solid #283042;border-radius:16px;padding:14px;display:flex;flex-direction:column;align-items:center;gap:10px;color:#f3f4f6;cursor:pointer;font-family:inherit}
   .pick-card:hover{border-color:#3b82f6;background:#192131}
-  .pick-pfp{width:128px;height:128px;aspect-ratio:1/1;border-radius:20px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
-  .pick-name{font-size:26px;font-weight:700;text-align:center}
-  .pick-handle{font-size:22px;color:#9ca3af}
+  .pick-pfp{width:76px;height:76px;aspect-ratio:1/1;border-radius:12px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
+  .pick-name{font-size:16px;font-weight:700;text-align:center}
+  .pick-handle{font-size:13px;color:#9ca3af}
   #chatView{flex:1;display:none;flex-direction:column;min-height:0}
   #chatView.open{display:flex}
-  #messages{flex:1;overflow-y:auto;padding:28px 32px;display:flex;flex-direction:column;gap:24px}
-  .empty-state{color:#9ca3af;font-size:26px;text-align:center;margin:auto}
-  .row{display:flex;align-items:flex-start;gap:16px;max-width:94%;transition:transform .14s ease;touch-action:pan-y;cursor:pointer;user-select:none;-webkit-user-select:none}
+  #messages{flex:1;overflow-y:auto;padding:16px 20px;display:flex;flex-direction:column;gap:14px}
+  .empty-state{color:#9ca3af;font-size:16px;text-align:center;margin:auto}
+  .row{display:flex;align-items:flex-start;gap:10px;max-width:min(94%,780px);transition:transform .14s ease;touch-action:pan-y;cursor:pointer;user-select:none;-webkit-user-select:none}
   .row.me{align-self:flex-end;flex-direction:row-reverse}
   .row:not(.me){align-self:flex-start}
-  .pfp{width:88px;height:88px;min-width:88px;min-height:88px;aspect-ratio:1/1;flex-shrink:0;border-radius:20px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
-  .msg{background:#191e2a;border:1px solid #283042;border-radius:24px;padding:18px 24px;flex:1;min-width:0;user-select:none;-webkit-user-select:none}
+  .pfp{width:52px;height:52px;min-width:52px;min-height:52px;aspect-ratio:1/1;flex-shrink:0;border-radius:12px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
+  .msg{background:#191e2a;border:1px solid #283042;border-radius:14px;padding:11px 15px;flex:1;min-width:0;user-select:none;-webkit-user-select:none}
   .row.me .msg{background:#1d2b45;border-color:#3b82f6}
-  .meta{font-size:22px;color:#9ca3af;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:16px}
-  .meta-actions{display:flex;align-items:center;gap:12px}
-  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.35);border-radius:12px;padding:4px 12px;font-size:20px;font-weight:600;cursor:pointer;font-family:inherit}
+  .meta{font-size:13px;color:#9ca3af;margin-bottom:5px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .meta-actions{display:flex;align-items:center;gap:8px}
+  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.35);border-radius:8px;padding:2px 8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit}
   .reply-btn:hover{background:rgba(59,130,246,.18)}
-  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:4px 12px;font-size:20px;font-weight:600;cursor:pointer;font-family:inherit}
+  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:8px;padding:2px 8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit}
   .del-btn:hover{background:rgba(248,113,113,.15)}
-  .reply-quote{font-size:22px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:4px solid #60a5fa;padding:6px 14px;border-radius:8px;margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .text{font-size:28px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
-  .msg-footer{margin-top:12px;display:flex;align-items:center;flex-wrap:wrap;gap:12px}
-  .like-pill{display:inline-flex;align-items:center;gap:8px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:4px 14px;font-size:22px;color:#fda4af}
-  .like-avatars{display:inline-flex;align-items:center;gap:6px}
-  .like-pfp{width:28px;height:28px;aspect-ratio:1/1;border-radius:8px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
-  .reply-banner{display:none;align-items:center;justify-content:space-between;gap:16px;background:#1e293b;border:1px solid #3b82f6;border-radius:16px;padding:12px 20px;font-size:24px;color:#dbeafe}
+  .reply-quote{font-size:13px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:3px solid #60a5fa;padding:4px 9px;border-radius:6px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .text{font-size:17px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+  .msg-footer{margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+  .like-pill{display:inline-flex;align-items:center;gap:5px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 9px;font-size:13px;color:#fda4af}
+  .like-avatars{display:inline-flex;align-items:center;gap:4px}
+  .like-pfp{width:18px;height:18px;aspect-ratio:1/1;border-radius:5px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
+  .reply-banner{display:none;align-items:center;justify-content:space-between;gap:10px;background:#1e293b;border:1px solid #3b82f6;border-radius:10px;padding:8px 12px;font-size:14px;color:#dbeafe}
   .reply-banner.open{display:flex}
-  .bottom-bar{background:#151922;border-top:2px solid #242b3a;padding:16px 24px 24px;display:flex;flex-direction:column;gap:16px}
-  .shortcuts{display:flex;gap:16px;flex-wrap:wrap}
-  .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:10px 24px;font-size:26px;font-weight:600;cursor:pointer;font-family:inherit}
+  .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:10px 14px 14px;display:flex;flex-direction:column;gap:10px}
+  .shortcuts{display:flex;gap:8px;flex-wrap:wrap}
+  .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:6px 14px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit}
   .chip:active{background:#3b82f6;color:#fff;border-color:#3b82f6}
-  form{display:flex;gap:16px}
-  input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:20px;padding:20px 24px;font-size:28px;outline:none;font-family:inherit}
+  form{display:flex;gap:10px}
+  input{flex:1;min-width:0;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:12px;padding:11px 14px;font-size:16px;outline:none;font-family:inherit}
   input:focus{border-color:#3b82f6}
-  button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:20px;padding:0 32px;font-weight:700;font-size:28px;cursor:pointer;font-family:inherit}
-  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:32px;z-index:20}
+  button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:12px;padding:0 20px;font-weight:700;font-size:16px;cursor:pointer;font-family:inherit}
+  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20;overflow-y:auto}
   #settingsModal.open{display:flex}
-  .modal-card{width:100%;max-width:780px;background:#151922;border:1px solid #283042;border-radius:28px;padding:32px;display:flex;flex-direction:column;gap:24px}
-  .modal-title{font-size:32px;font-weight:700}
-  .field-label{font-size:24px;color:#9ca3af;margin-bottom:8px;display:block}
-  .crop-box{position:relative;width:360px;height:360px;margin:12px auto;border-radius:24px;overflow:hidden;border:4px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
+  .modal-card{width:min(100%,480px);background:#151922;border:1px solid #283042;border-radius:18px;padding:20px;display:flex;flex-direction:column;gap:14px}
+  .modal-title{font-size:19px;font-weight:700}
+  .field-label{font-size:14px;color:#9ca3af;margin-bottom:5px;display:block}
+  .crop-box{position:relative;width:216px;height:216px;margin:8px auto;border-radius:14px;overflow:hidden;border:2px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
   .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
-  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:8px;flex-wrap:wrap}
-  .modal-actions-right{display:flex;gap:16px}
+  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:4px;flex-wrap:wrap}
+  .modal-actions-right{display:flex;gap:10px}
 </style>
 </head>
 <body>
@@ -878,7 +878,7 @@ function renderStaffChatHtml(
       <div>
         <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture (R2)</label>
         <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
-        <div id="cropWrap" style="display:none;margin-top:16px">
+        <div id="cropWrap" style="display:none;margin-top:10px">
           <div id="cropBox" class="crop-box">
             <img id="cropImg" alt="Crop preview"/>
           </div>
@@ -1195,7 +1195,7 @@ function renderStaffChatHtml(
 
   function updateCropTransform() {
     if (!cropState.loaded) return;
-    const boxSize = 360;
+    const boxSize = 216;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
     const scaledW = cropState.imgW * totalScale;
@@ -1215,8 +1215,8 @@ function renderStaffChatHtml(
       cropImg.onload = () => {
         cropState = {
           loaded: true,
-          imgW: cropImg.naturalWidth || 360,
-          imgH: cropImg.naturalHeight || 360,
+          imgW: cropImg.naturalWidth || 216,
+          imgH: cropImg.naturalHeight || 216,
           scale: Number(zoomRange.value) || 1,
           x: 0,
           y: 0,
@@ -1261,7 +1261,7 @@ function renderStaffChatHtml(
   async function buildCroppedSquareDataUrl() {
     if (!cropState.loaded) return null;
     const outSize = 512;
-    const boxSize = 360;
+    const boxSize = 216;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
     const sx = Math.max(0, (-cropState.x) / totalScale);
@@ -1345,7 +1345,7 @@ function renderStaffChatHtml(
     if (!swipeRow || e.touches.length !== 1) return;
     const dx = e.touches[0].clientX - swipeStartX;
     if (dx > 0) {
-      swipeDeltaX = Math.min(120, dx);
+      swipeDeltaX = Math.min(72, dx);
       swipeRow.style.transform = 'translateX(' + swipeDeltaX + 'px)';
     }
   }, { passive: true });
@@ -1354,7 +1354,7 @@ function renderStaffChatHtml(
     if (!swipeRow) return;
     const rowId = swipeRow.getAttribute('data-row-id') || '';
     swipeRow.style.transform = '';
-    const triggered = swipeDeltaX >= 64;
+    const triggered = swipeDeltaX >= 40;
     swipeRow = null;
     swipeDeltaX = 0;
     if (triggered && rowId) {
@@ -2298,7 +2298,6 @@ self.addEventListener('fetch', (event) => {
                     return {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
-                        searchValues: `category=${kind}`,
                         items: posts.map(buildPostItemWithBadges),
                     }
                 }),
