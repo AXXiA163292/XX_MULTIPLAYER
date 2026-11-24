@@ -1,7 +1,9 @@
 {
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "xx-multiplayer",
   "main": "src/index.ts",
-  "compatibility_date": "2025-06-01",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
     "bindings": [
       {
@@ -11,53 +13,34 @@
       {
         "name": "LOBBY",
         "class_name": "Lobby"
+      },
+      {
+        "name": "CHAT",
+        "class_name": "Chat"
       }
-    ]
-  },
-  "r2_buckets": [
-    {
-      "binding": "SONOLUS_ASSETS_BUCKET",
-      "bucket_name": "sonolus-assets"
-    },
-    {
-      "binding": "COMMUNITY_BUCKET",
-      "bucket_name": "community"
-    }
-  ],
-  "triggers": {
-    "crons": [
-      "0 3 * * *"
     ]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": [
-        "Room",
-        "Lobby"
-      ]
+      "new_sqlite_classes": ["Room", "Lobby"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["Chat"]
     }
   ],
-  "vars": {
-    "HOST_HANDLE": "163292"
-  },
-  "observability": {
-    "enabled": false,
-    "head_sampling_rate": 1,
-    "redact_query_string": true,
-    "logs": {
-      "enabled": true,
-      "head_sampling_rate": 1,
-      "invocation_logs": true,
-      "persist": true
+  "r2_buckets": [
+    {
+      "binding": "COMMUNITY_BUCKET",
+      "bucket_name": "community"
     },
-    "traces": {
-      "enabled": true,
-      "head_sampling_rate": 1,
-      "persist": true
-    },
-    "issues": {
-      "enabled": true
+    {
+      "binding": "SONOLUS_ASSETS_BUCKET",
+      "bucket_name": "sonolus-assets"
     }
+  ],
+  "triggers": {
+    "crons": ["0 */3 * * *"]
   }
 }
