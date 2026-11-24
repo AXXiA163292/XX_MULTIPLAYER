@@ -165,17 +165,6 @@ function sanitizeHttpLink(raw?: unknown): string {
     return ''
 }
 
-function buildPostShareUrl(req: Request, env: WorkerEnv, postId: string): string {
-    const cleanId = postId.replace(/^#/, '').trim()
-    return `${addressOf(req, env)}/p/${encodeURIComponent(cleanId)}`
-}
-
-function buildPostSonolusDeepLink(req: Request, env: WorkerEnv, postId: string): string {
-    const cleanId = postId.replace(/^#/, '').trim()
-    const hostAndBase = addressOf(req, env).replace(/^https?:\/\//, '')
-    return `sonolus://${hostAndBase}/sonolus/posts/${encodeURIComponent(cleanId)}`
-}
-
 async function getBucketObject(
     bucket: R2Bucket | null,
     keys: string[],
@@ -309,7 +298,6 @@ async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
         return indexed.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
     }
 
-    // Fallback to objects stored directly under chat/media/ in R2
     try {
         const listed = await bucket.list({ prefix: 'chat/media/' })
         const derived: ChatMediaItem[] = []
@@ -859,89 +847,6 @@ function escapeAttr(str: string): string {
         .replace(/"/g, '&quot;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-}
-
-function renderPostShareHtml(
-    post: StoredPost,
-    shareUrl: string,
-    sonolusDeepLink: string,
-    sonolusItemUrl: string,
-): string {
-    const title = String(post.item?.title ?? 'Post')
-    const author = String(post.item?.author ?? '')
-    const desc = String(post.description ?? '')
-    const categoryLabel = POST_LABELS[post.category]?.section ?? post.category
-    const hasThumb = Boolean(post.thumbnailHash)
-
-    return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<meta name="theme-color" content="#9E4B76"/>
-<meta property="og:title" content="${escapeAttr(title)}"/>
-<meta property="og:description" content="${escapeAttr(desc.slice(0, 240))}"/>
-${hasThumb ? `<meta property="og:image" content="${escapeAttr(shareUrl.replace(/\/p\/[^/]+$/, `/sonolus/posts/${encodeURIComponent(post.item.name)}/thumbnail`))}"/>` : ''}
-<title>${escapeAttr(title)} — XX!</title>
-<style>
-  :root{--plum:#9E4B76;--plum-dark:#833B61;--blush:#F4DCE6;--blush-soft:#FBF2F6;--blush-border:#E8C6D6;--bg:#FAF7F9;--surface:#FFFFFF;--text:#2D1B25;--muted:#7D5D6E}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:24px 16px;display:flex;justify-content:center}
-  .card{width:100%;max-width:560px;background:var(--surface);border:2px solid var(--blush-border);border-radius:18px;overflow:hidden;box-shadow:0 10px 28px rgba(87,35,62,.1)}
-  .top{background:var(--plum);color:var(--blush);padding:16px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-  .cat{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;background:rgba(244,220,230,.18);padding:4px 10px;border-radius:999px}
-  .body{padding:20px;display:flex;flex-direction:column;gap:14px}
-  h1{font-size:21px;line-height:1.25}
-  .meta{font-size:13px;color:var(--muted);font-weight:600}
-  .desc{font-size:15px;line-height:1.55;white-space:pre-wrap;word-break:break-word;background:var(--blush-soft);border:1px solid var(--blush-border);border-radius:12px;padding:14px}
-  .link-box{display:flex;gap:8px;align-items:center}
-  input{flex:1;min-width:0;padding:10px 12px;border:1.5px solid var(--blush-border);border-radius:10px;font-size:13px;background:var(--bg);color:var(--text)}
-  .btn{display:inline-flex;align-items:center;justify-content:center;padding:10px 16px;border-radius:10px;font-weight:700;font-size:13px;text-decoration:none;border:none;cursor:pointer}
-  .btn-primary{background:var(--plum);color:var(--blush)}
-  .btn-secondary{background:var(--blush);color:var(--plum-dark)}
-  .actions{display:flex;gap:10px;flex-wrap:wrap}
-</style>
-</head>
-<body>
-  <article class="card">
-    <div class="top">
-      <strong>XX!</strong>
-      <span class="cat">${escapeAttr(categoryLabel)}</span>
-    </div>
-    <div class="body">
-      <div>
-        <h1>${escapeAttr(title)}</h1>
-        <div class="meta">${escapeAttr(author)} · #${escapeAttr(post.item.name)}</div>
-      </div>
-      <div class="desc">${escapeAttr(desc)}</div>
-      <div class="link-box">
-        <input id="shareInput" type="text" readonly value="${escapeAttr(shareUrl)}"/>
-        <button id="copyBtn" type="button" class="btn btn-secondary">Copy Link</button>
-      </div>
-      <div class="actions">
-        <a class="btn btn-primary" href="${escapeAttr(sonolusDeepLink)}">Open in Sonolus</a>
-        <a class="btn btn-secondary" href="${escapeAttr(sonolusItemUrl)}">Post JSON</a>
-      </div>
-    </div>
-  </article>
-  <script>
-    const copyBtn = document.getElementById('copyBtn');
-    const shareInput = document.getElementById('shareInput');
-    copyBtn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(shareInput.value);
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => { copyBtn.textContent = 'Copy Link'; }, 1500);
-      } catch {
-        shareInput.select();
-        document.execCommand('copy');
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => { copyBtn.textContent = 'Copy Link'; }, 1500);
-      }
-    });
-  </script>
-</body>
-</html>`
 }
 
 const RANKED_TIERS_UPPER = new Set([
@@ -2890,15 +2795,6 @@ function makeEditPostForm(post: StoredPost) {
     }
 }
 
-const sharePostForm = {
-    name: 'Share',
-    type: 'sharePost',
-    title: 'Share Link',
-    icon: 'share',
-    requireConfirmation: false,
-    options: [],
-}
-
 function makeLikePostForm(liked: boolean) {
     return {
         name: liked ? 'Unlike' : 'Like',
@@ -2934,7 +2830,6 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
     const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
     const pinned = Boolean(post.pinned)
     const actions: any[] = [
-        sharePostForm,
         makeLikePostForm(liked),
     ]
     if (canManagePosts(session)) {
@@ -3195,17 +3090,6 @@ export default {
                     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
                 },
             })
-        }
-
-        const sharePageMatch = path.match(/^\/p\/([\w-]+)$/)
-        if (sharePageMatch && req.method === 'GET') {
-            const postId = decodeURIComponent(sharePageMatch[1]!)
-            const post = await lobby(env).getPost(postId).catch(() => null)
-            if (!post) return new Response('Post not found', { status: 404 })
-            const shareUrl = buildPostShareUrl(req, env, postId)
-            const deepLink = buildPostSonolusDeepLink(req, env, postId)
-            const itemUrl = `${addressOf(req, env)}/sonolus/posts/${encodeURIComponent(postId)}`
-            return html(renderPostShareHtml(post, shareUrl, deepLink, itemUrl))
         }
 
         if (path === '/manifest.webmanifest' && req.method === 'GET') {
@@ -4236,14 +4120,6 @@ self.addEventListener('fetch', (event) => {
             const post = await lobby(env).getPost(postName).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
-            if (actionType === 'sharePost') {
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateItem: false,
-                })
-            }
-
             if (actionType === 'likePost') {
                 await lobby(env).togglePostLike(postName, session.user.handle)
                 return json({
@@ -4270,20 +4146,21 @@ self.addEventListener('fetch', (event) => {
                     return message(400, 'Post title or description exceeds maximum length.')
                 }
 
-                const updatedPost: StoredPost = {
+                const uploadKey = nextThumbHash ? (post.uploadKey || randomId(24)) : post.uploadKey
+
+                await lobby(env).createPost({
                     ...post,
                     item: {
                         ...post.item,
                         title: nextTitle,
                     },
                     description: nextDescription,
+                    uploadKey,
                     ...(nextThumbHash ? { thumbnailHash: nextThumbHash } : {}),
-                }
-
-                await lobby(env).updatePost(updatedPost)
+                })
 
                 return json({
-                    key: nextThumbHash ? post.uploadKey || randomId(24) : '',
+                    key: nextThumbHash ? uploadKey : '',
                     hashes: nextThumbHash ? [nextThumbHash] : [],
                     shouldUpdateItem: true,
                 })
@@ -4477,16 +4354,9 @@ self.addEventListener('fetch', (event) => {
             const post = await lobby(env).getPost(postId).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
-            const shareUrl = buildPostShareUrl(req, env, postId)
-            const deepLink = buildPostSonolusDeepLink(req, env, postId)
-            const baseDesc = String(post.description ?? '')
-            const fullDesc = baseDesc.includes(shareUrl)
-                ? baseDesc
-                : `${baseDesc}\n\nShare Link:\n${shareUrl}\nSonolus Link:\n${deepLink}`
-
             return json({
                 item: buildPostItemWithBadges(post),
-                description: fullDesc,
+                description: post.description,
                 actions: postActionsFor(post, session),
                 hasCommunity: true,
                 leaderboards: [],
