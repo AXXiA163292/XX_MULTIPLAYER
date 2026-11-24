@@ -68,6 +68,7 @@ const MAX_POSTS = 200
 const MAX_CHAT = 200
 const POSTS_INDEX_KEY = 'posts/index.json'
 const CHAT_INDEX_KEY = 'chat/index.json'
+const MIN_R2_WRITE_INTERVAL_MS = 1100
 
 function normalizeCategory(raw: unknown): PostCategory {
     if (raw === 'announcements' || raw === 'results' || raw === 'posts') {
@@ -150,6 +151,7 @@ export class Lobby extends DurableObject<Env> {
     private loaded = false
     private r2Queue: Promise<void> = Promise.resolve()
     private r2Dirty = false
+    private lastR2WriteAt = 0
 
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
@@ -207,23 +209,21 @@ export class Lobby extends DurableObject<Env> {
         const bucket = this.env.COMMUNITY_BUCKET
         if (!bucket) return
 
+        const elapsed = Date.now() - this.lastR2WriteAt
+        if (elapsed < MIN_R2_WRITE_INTERVAL_MS) {
+            await new Promise((resolve) => setTimeout(resolve, MIN_R2_WRITE_INTERVAL_MS - elapsed))
+        }
+
         const postsPayload = JSON.stringify({
             updatedAt: Date.now(),
             posts: this.st.posts.slice(-MAX_POSTS),
-        })
-        const chatPayload = JSON.stringify({
-            updatedAt: Date.now(),
-            pinnedChatId: this.st.pinnedChatId,
-            messages: this.st.chat.slice(-MAX_CHAT),
         })
 
         try {
             await bucket.put(POSTS_INDEX_KEY, postsPayload, {
                 httpMetadata: { contentType: 'application/json' },
             })
-            await bucket.put(CHAT_INDEX_KEY, chatPayload, {
-                httpMetadata: { contentType: 'application/json' },
-            })
+            this.lastR2WriteAt = Date.now()
         } catch (error) {
             console.error('Could not persist lobby state to R2:', error)
         }
@@ -542,7 +542,7 @@ export class Lobby extends DurableObject<Env> {
         })
 
         this.st.chat = [...this.st.chat, message].slice(-MAX_CHAT)
-        await this.save(true)
+        await this.save(false)
         return message
     }
 
@@ -554,7 +554,7 @@ export class Lobby extends DurableObject<Env> {
             this.st.pinnedChatId = null
         }
         if (this.st.chat.length === before) return false
-        await this.save(true)
+        await this.save(false)
         return true
     }
 
@@ -570,7 +570,7 @@ export class Lobby extends DurableObject<Env> {
             : [...(current.likes ?? []), handle]
 
         this.st.chat[idx] = current
-        await this.save(true)
+        await this.save(false)
         return current
     }
 
@@ -579,7 +579,7 @@ export class Lobby extends DurableObject<Env> {
         const exists = this.st.chat.some((m) => m.id === id)
         if (!exists) return this.st.pinnedChatId
         this.st.pinnedChatId = this.st.pinnedChatId === id ? null : id
-        await this.save(true)
+        await this.save(false)
         return this.st.pinnedChatId
     }
 
