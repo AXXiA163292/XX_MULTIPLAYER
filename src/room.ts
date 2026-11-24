@@ -430,7 +430,8 @@ export class Room extends DurableObject {
             name: this.state.name,
             title: s.title,
             subtitle: subtitleParts.join(' · '),
-            master: true,
+            // RoomItem.master is the host's display name (text). A boolean makes the app reject the whole list.
+            master: this.state.hostName || this.state.hostHandle,
             visibility: s.visibility,
             matchMode,
             roundCount: this.state.roundCount,
