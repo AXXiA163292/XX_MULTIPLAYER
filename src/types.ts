@@ -106,4 +106,6 @@ export type Env = {
     REFRESH_KEY?: string
     CUSTOM_LEVELS_SHEET_ID?: string
     PLAYLISTS_SHEET_ID?: string
+    RESEND_API_KEY?: string
+    NOTIFY_FROM_EMAIL?: string
 }
