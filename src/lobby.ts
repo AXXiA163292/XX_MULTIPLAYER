@@ -1,4 +1,3 @@
-
 import { DurableObject } from 'cloudflare:workers'
 import { randomId } from './crypto.ts'
 import type { Env, RoomVisibility, UserProfile } from './types.ts'
@@ -164,9 +163,7 @@ export class Lobby extends DurableObject<Env> {
             }
         }
 
-        return loadedPosts
-            .sort((a, b) => Number(a.item.time || 0) - Number(b.item.time || 0))
-            .slice(-MAX_POSTS)
+        return loadedPosts.slice(-MAX_POSTS)
     }
 
     private async writeR2Now(): Promise<void> {
@@ -179,9 +176,7 @@ export class Lobby extends DurableObject<Env> {
         }
 
         const now = Date.now()
-        const allPosts = this.st.posts
-            .sort((a, b) => Number(a.item.time || 0) - Number(b.item.time || 0))
-            .slice(-MAX_POSTS)
+        const allPosts = this.st.posts.slice(-MAX_POSTS)
 
         try {
             await Promise.all(
@@ -227,18 +222,14 @@ export class Lobby extends DurableObject<Env> {
             const roomNames = Array.isArray(stored.rooms) ? stored.rooms.map(String).filter(Boolean) : []
             this.rooms = new Set(roomNames)
             const storedPosts = Array.isArray(stored.posts)
-                ? stored.posts.map((post) => normalizePost(post))
+                ? stored.posts.slice(-MAX_POSTS).map((post) => normalizePost(post))
                 : []
             const mergedPosts = r2Posts.length > 0
                 ? [
                     ...r2Posts,
                     ...storedPosts.filter((sp) => !r2Posts.some((rp) => rp.item.name === sp.item.name)),
-                ]
-                    .sort((a, b) => Number(a.item.time || 0) - Number(b.item.time || 0))
-                    .slice(-MAX_POSTS)
+                ].slice(-MAX_POSTS)
                 : storedPosts
-                    .sort((a, b) => Number(a.item.time || 0) - Number(b.item.time || 0))
-                    .slice(-MAX_POSTS)
 
             this.st = {
                 rooms: [...this.rooms],
@@ -262,9 +253,7 @@ export class Lobby extends DurableObject<Env> {
 
     private async save(persistR2 = false): Promise<void> {
         this.st.rooms = [...this.rooms]
-        this.st.posts = this.st.posts
-            .sort((a, b) => Number(a.item.time || 0) - Number(b.item.time || 0))
-            .slice(-MAX_POSTS)
+        this.st.posts = this.st.posts.slice(-MAX_POSTS)
         await this.ctx.storage.put('state', this.st)
         if (persistR2) {
             await this.scheduleR2Persist()
@@ -356,49 +345,10 @@ export class Lobby extends DurableObject<Env> {
         this.st.posts = [
             ...this.st.posts.filter((existing) => existing.item.name !== post.item.name),
             post,
-        ]
-            .sort((a, b) => Number(a.item.time || 0) - Number(b.item.time || 0))
-            .slice(-MAX_POSTS)
+        ].slice(-MAX_POSTS)
 
         await this.save(true)
         return post
-    }
-
-    async updatePost(
-        name: string,
-        patch: { title?: string; description?: string; clearThumbnail?: boolean },
-    ): Promise<StoredPost | null> {
-        await this.ensureLoaded()
-
-        const index = this.st.posts.findIndex((post) => post.item.name === name)
-        if (index === -1) return null
-
-        const current = normalizePost(this.st.posts[index])
-        const nextItem: PostItem = {
-            ...current.item,
-            ...(patch.title !== undefined ? { title: patch.title.slice(0, 100) } : {}),
-        }
-
-        if (patch.clearThumbnail) {
-            delete nextItem.thumbnail
-        }
-
-        const updated: StoredPost = {
-            ...current,
-            item: nextItem,
-            description: patch.description !== undefined
-                ? patch.description.slice(0, 2000)
-                : current.description,
-            ...(patch.clearThumbnail ? { thumbnailHash: '', uploadKey: '' } : {}),
-        }
-
-        this.st.posts[index] = updated
-        await this.save(true)
-        return updated
-    }
-
-    async clearPostThumbnail(name: string): Promise<StoredPost | null> {
-        return this.updatePost(name, { clearThumbnail: true })
     }
 
     async findPostByUploadKey(uploadKey: string): Promise<StoredPost | null> {
