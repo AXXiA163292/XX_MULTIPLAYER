@@ -24,6 +24,7 @@ const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
 const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
 const CHAT_HANDLE_COOKIE = 'xx_chat_handle'
 const PROTECTED_CHAT_HANDLE = '163292'
+const MEDIA_ADMIN_HANDLE = '163292'
 
 const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = {
     '163292': { handle: '163292', name: 'AXX!A' },
@@ -46,6 +47,16 @@ type UserChatPrefs = {
     notifyEmail?: string
     emailNotifyMode?: EmailNotifyMode
     updatedAt: number
+}
+
+type ChatMediaItem = {
+    id: string
+    imageKey: string
+    contentType: string
+    link?: string
+    caption?: string
+    createdAt: number
+    authorHandle: string
 }
 
 const json = (data: unknown, status = 200) =>
@@ -81,6 +92,9 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         handle &&
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
+
+const isMediaAdminHandle = (handle?: string | null): boolean =>
+    String(handle ?? '').trim() === MEDIA_ADMIN_HANDLE
 
 function requiresProfilePassword(handle?: string | null): boolean {
     return String(handle ?? '').trim() === PROTECTED_CHAT_HANDLE
@@ -118,6 +132,30 @@ function parseCookie(req: Request, name: string): string | null {
     return null
 }
 
+function primaryCommunityBucket(env: Env): R2Bucket | null {
+    return env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET ?? null
+}
+
+function bucketsForRead(env: Env): R2Bucket[] {
+    return [env.COMMUNITY_BUCKET, env.POSTS_BUCKET].filter(
+        (b): b is R2Bucket => Boolean(b),
+    )
+}
+
+function sanitizeHttpLink(raw?: unknown): string {
+    const val = String(raw ?? '').trim()
+    if (!val) return ''
+    try {
+        const parsed = new URL(val)
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+            return parsed.toString()
+        }
+    } catch {
+        // invalid link
+    }
+    return ''
+}
+
 async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
     const fallback: UserChatPrefs = {
@@ -128,25 +166,36 @@ async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs
         updatedAt: 0,
     }
 
-    if (!clean || !env.COMMUNITY_BUCKET) return fallback
+    if (!clean) return fallback
 
-    try {
-        const obj = await env.COMMUNITY_BUCKET.get(`chat/users/${clean}.json`)
-        if (!obj) return fallback
-        const parsed = await obj.json() as Partial<UserChatPrefs>
-        const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
-        const mode: EmailNotifyMode = parsed?.emailNotifyMode === 'all' ? 'all' : 'mention'
-        return {
-            handle: clean,
-            displayName: displayName || fallback.displayName,
-            pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
-            notifyEmail: typeof parsed?.notifyEmail === 'string' ? parsed.notifyEmail.trim().slice(0, 120) : '',
-            emailNotifyMode: mode,
-            updatedAt: Number(parsed?.updatedAt) || 0,
+    const keys = [
+        `community/chat/users/${clean}.json`,
+        `chat/users/${clean}.json`,
+    ]
+
+    for (const bucket of bucketsForRead(env)) {
+        for (const key of keys) {
+            try {
+                const obj = await bucket.get(key)
+                if (!obj) continue
+                const parsed = await obj.json() as Partial<UserChatPrefs>
+                const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
+                const mode: EmailNotifyMode = parsed?.emailNotifyMode === 'all' ? 'all' : 'mention'
+                return {
+                    handle: clean,
+                    displayName: displayName || fallback.displayName,
+                    pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
+                    notifyEmail: typeof parsed?.notifyEmail === 'string' ? parsed.notifyEmail.trim().slice(0, 120) : '',
+                    emailNotifyMode: mode,
+                    updatedAt: Number(parsed?.updatedAt) || 0,
+                }
+            } catch {
+                // try next key
+            }
         }
-    } catch {
-        return fallback
     }
+
+    return fallback
 }
 
 async function saveUserChatPrefs(
@@ -168,15 +217,52 @@ async function saveUserChatPrefs(
         updatedAt: Date.now(),
     }
 
-    if (env.COMMUNITY_BUCKET) {
-        await env.COMMUNITY_BUCKET.put(
-            `chat/users/${clean}.json`,
+    const bucket = primaryCommunityBucket(env)
+    if (bucket) {
+        await bucket.put(
+            `community/chat/users/${clean}.json`,
             JSON.stringify(next),
             { httpMetadata: { contentType: 'application/json' } },
         )
     }
 
     return next
+}
+
+const MEDIA_INDEX_KEY = 'community/chat/media/index.json'
+
+async function listChatMedia(env: Env): Promise<ChatMediaItem[]> {
+    const keys = [MEDIA_INDEX_KEY, 'chat/media/index.json']
+    for (const bucket of bucketsForRead(env)) {
+        for (const key of keys) {
+            try {
+                const obj = await bucket.get(key)
+                if (!obj) continue
+                const parsed = await obj.json() as { items?: ChatMediaItem[] } | ChatMediaItem[]
+                const rawList = Array.isArray(parsed)
+                    ? parsed
+                    : Array.isArray(parsed?.items)
+                        ? parsed.items
+                        : []
+                return rawList
+                    .filter((item): item is ChatMediaItem => Boolean(item && typeof item.id === 'string' && typeof item.imageKey === 'string'))
+                    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+            } catch {
+                // try next
+            }
+        }
+    }
+    return []
+}
+
+async function saveChatMediaIndex(env: Env, items: ChatMediaItem[]): Promise<void> {
+    const bucket = primaryCommunityBucket(env)
+    if (!bucket) return
+    await bucket.put(
+        MEDIA_INDEX_KEY,
+        JSON.stringify({ items }),
+        { httpMetadata: { contentType: 'application/json' } },
+    )
 }
 
 async function verifySigned(
@@ -497,7 +583,7 @@ function canDeleteComment(session: AuthSession | null, authorHandle: string): bo
     return session.user.handle === authorHandle || session.user.handle === TOURNAMENT_HOST_HANDLE
 }
 
-function canModifyChatMessage(actorHandle: string, authorHandle: string): boolean {
+function canDeleteChatMessage(actorHandle: string, authorHandle: string): boolean {
     return actorHandle === authorHandle || actorHandle === TOURNAMENT_HOST_HANDLE
 }
 
@@ -705,9 +791,7 @@ async function getBucketImage(
     env: Env,
     keys: string[],
 ): Promise<R2ObjectBody | null> {
-    const buckets = [env.COMMUNITY_BUCKET, env.POSTS_BUCKET].filter(
-        (b): b is R2Bucket => Boolean(b),
-    )
+    const buckets = bucketsForRead(env)
     for (const key of keys) {
         for (const bucket of buckets) {
             const obj = await bucket.get(key).catch(() => null)
@@ -787,6 +871,7 @@ function renderStaffChatHtml(
     prefsMap: Record<string, UserChatPrefs>,
     sonolusUrl: string,
     initialMessages: ChatMessage[],
+    initialMedia: ChatMediaItem[],
 ): string {
     const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
         const pref = prefsMap[handle]
@@ -801,6 +886,7 @@ function renderStaffChatHtml(
     }).join('')
 
     const safeInitialMessagesJson = JSON.stringify(initialMessages).replace(/</g, '\\u003c')
+    const safeInitialMediaJson = JSON.stringify(initialMedia).replace(/</g, '\\u003c')
 
     return `<!doctype html>
 <html lang="en">
@@ -839,7 +925,7 @@ function renderStaffChatHtml(
     font-family:'Red Hat Display',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
     font-size:16px;
   }
-  h1,h2,.title-font,.header-title,.picker-title,.pick-name,.modal-title,.btn-primary{
+  h1,h2,.title-font,.header-title,.picker-title,.pick-name,.modal-title,.btn-primary,.tab-btn{
     font-family:'Montserrat',system-ui,-apple-system,sans-serif;
     font-weight:800;
     letter-spacing:-0.01em;
@@ -1033,7 +1119,7 @@ function renderStaffChatHtml(
     border-radius:999px;
   }
 
-  #chatView{
+  #appView{
     position:fixed;
     top:calc(var(--header-h) + env(safe-area-inset-top));
     left:0;
@@ -1044,7 +1130,45 @@ function renderStaffChatHtml(
     overflow:hidden;
     background:var(--bg);
   }
-  #chatView.open{display:flex}
+  #appView.open{display:flex}
+
+  .tab-bar{
+    flex:0 0 auto;
+    display:flex;
+    gap:8px;
+    padding:8px 16px;
+    background:var(--surface);
+    border-bottom:1.5px solid var(--blush-border);
+    align-items:center;
+    justify-content:space-between;
+  }
+  .tab-group{display:flex;gap:8px}
+  .tab-btn{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1.5px solid var(--blush-border);
+    border-radius:10px;
+    padding:6px 14px;
+    font-size:12px;
+    text-transform:uppercase;
+    letter-spacing:.03em;
+    cursor:pointer;
+    transition:all .12s ease;
+  }
+  .tab-btn.active{
+    background:var(--plum);
+    color:var(--blush);
+    border-color:var(--plum);
+  }
+
+  #chatTab{
+    flex:1 1 auto;
+    min-height:0;
+    display:none;
+    flex-direction:column;
+    overflow:hidden;
+  }
+  #chatTab.active{display:flex}
 
   #messages{
     flex:1 1 auto;
@@ -1118,7 +1242,7 @@ function renderStaffChatHtml(
     box-shadow:0 4px 14px rgba(158,75,118,.22);
   }
   .meta{
-    font-size:12.5px;
+    font-size:12px;
     font-weight:700;
     color:var(--plum);
     margin-bottom:5px;
@@ -1129,8 +1253,8 @@ function renderStaffChatHtml(
     flex-wrap:wrap;
   }
   .row.me .meta{color:var(--blush)}
-  .meta-actions{display:flex;align-items:center;gap:6px}
-  .reply-btn,.edit-btn{
+  .meta-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
+  .reply-btn{
     background:var(--blush-soft);
     color:var(--plum-dark);
     border:1px solid var(--blush-border);
@@ -1141,13 +1265,13 @@ function renderStaffChatHtml(
     cursor:pointer;
     font-family:inherit;
   }
-  .reply-btn:hover,.edit-btn:hover{background:var(--blush)}
-  .row.me .reply-btn,.row.me .edit-btn{
+  .reply-btn:hover{background:var(--blush)}
+  .row.me .reply-btn{
     background:rgba(244,220,230,.18);
     color:var(--blush);
     border-color:rgba(244,220,230,.35);
   }
-  .row.me .reply-btn:hover,.row.me .edit-btn:hover{background:rgba(244,220,230,.3)}
+  .row.me .reply-btn:hover{background:rgba(244,220,230,.3)}
   .del-btn{
     background:#FFF1F4;
     color:#BE123C;
@@ -1190,30 +1314,6 @@ function renderStaffChatHtml(
     white-space:pre-wrap;
     word-break:break-word;
   }
-  .edited-tag{
-    font-size:11.5px;
-    font-weight:600;
-    opacity:.78;
-    margin-left:6px;
-  }
-  .edit-box{
-    display:flex;
-    flex-direction:column;
-    gap:7px;
-    margin-top:4px;
-  }
-  .edit-input{
-    width:100%;
-    background:var(--bg);
-    color:var(--text);
-    border:1.5px solid var(--blush-border);
-    border-radius:9px;
-    padding:7px 10px;
-    font-size:14.5px;
-    font-family:inherit;
-    outline:none;
-  }
-  .edit-actions{display:flex;gap:6px;justify-content:flex-end}
   .msg-footer{margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:8px}
   .like-pill{
     display:inline-flex;
@@ -1241,6 +1341,74 @@ function renderStaffChatHtml(
     object-fit:cover;
     image-rendering:pixelated;
     border:1px solid rgba(158,75,118,.3);
+  }
+
+  #mediaTab{
+    flex:1 1 auto;
+    min-height:0;
+    display:none;
+    flex-direction:column;
+    overflow-y:auto;
+    -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain;
+    padding:14px 16px 28px;
+    gap:16px;
+  }
+  #mediaTab.active{display:flex}
+  .media-upload-card{
+    background:var(--surface);
+    border:1.5px solid var(--blush-border);
+    border-radius:16px;
+    padding:14px 16px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    box-shadow:0 4px 14px rgba(158,75,118,.08);
+  }
+  .media-feed{
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+  }
+  .media-card{
+    background:var(--surface);
+    border:1.5px solid var(--blush-border);
+    border-radius:16px;
+    overflow:hidden;
+    box-shadow:0 4px 16px rgba(45,27,37,.06);
+  }
+  .media-frame{
+    width:100%;
+    aspect-ratio:16/9;
+    background:var(--plum-deep);
+    display:block;
+  }
+  .media-frame img{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+  }
+  .media-meta{
+    padding:10px 14px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .media-link{
+    color:var(--plum-dark);
+    font-size:13.5px;
+    font-weight:700;
+    text-decoration:none;
+    word-break:break-all;
+  }
+  .media-link:hover{text-decoration:underline;color:var(--plum)}
+  .media-caption{
+    font-size:14px;
+    font-weight:600;
+    color:var(--text);
   }
 
   .bottom-bar{
@@ -1285,7 +1453,7 @@ function renderStaffChatHtml(
   .chip:hover{background:var(--blush);border-color:var(--plum)}
   .chip:active{background:var(--plum);color:var(--blush);border-color:var(--plum)}
   form{display:flex;gap:9px;align-items:center}
-  input[type=text],input[type=email],input[type=password],select{
+  input[type=text],input[type=email],input[type=password],input[type=url],select{
     flex:1;
     min-width:0;
     background:var(--bg);
@@ -1299,8 +1467,8 @@ function renderStaffChatHtml(
     font-family:inherit;
     transition:border-color .14s ease,background .14s ease;
   }
-  input[type=text]::placeholder,input[type=email]::placeholder,input[type=password]::placeholder{color:var(--muted)}
-  input[type=text]:focus,input[type=email]:focus,input[type=password]:focus,select:focus{border-color:var(--plum);background:var(--surface)}
+  input[type=text]::placeholder,input[type=email]::placeholder,input[type=password]::placeholder,input[type=url]::placeholder{color:var(--muted)}
+  input[type=text]:focus,input[type=email]:focus,input[type=password]:focus,input[type=url]:focus,select:focus{border-color:var(--plum);background:var(--surface)}
   button[type=submit]{
     background:var(--plum);
     color:var(--blush);
@@ -1434,19 +1602,40 @@ function renderStaffChatHtml(
     </div>
     <div class="picker-grid">${cardsHtml}</div>
   </div>
-  <div id="chatView">
-    <div id="messages"></div>
-    <footer class="bottom-bar">
-      <div id="replyBanner" class="reply-banner">
-        <span id="replyText"></span>
-        <button id="cancelReplyBtn" type="button" class="btn-sm">Cancel</button>
+  <div id="appView">
+    <div class="tab-bar">
+      <div class="tab-group">
+        <button id="tabChatBtn" type="button" class="tab-btn active">Chat</button>
+        <button id="tabMediaBtn" type="button" class="tab-btn">Media</button>
       </div>
-      <div id="shortcutsBar" class="shortcuts"></div>
-      <form id="chatForm">
-        <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
-        <button type="submit">Send</button>
-      </form>
-    </footer>
+    </div>
+    <div id="chatTab" class="active">
+      <div id="messages"></div>
+      <footer class="bottom-bar">
+        <div id="replyBanner" class="reply-banner">
+          <span id="replyText"></span>
+          <button id="cancelReplyBtn" type="button" class="btn-sm">Cancel</button>
+        </div>
+        <div id="shortcutsBar" class="shortcuts"></div>
+        <form id="chatForm">
+          <input id="chatInput" type="text" maxlength="500" placeholder="Send a message..." autocomplete="off"/>
+          <button type="submit">Send</button>
+        </form>
+      </footer>
+    </div>
+    <div id="mediaTab">
+      <div id="mediaUploadCard" class="media-upload-card" style="display:none">
+        <span class="field-label">Add 16:9 Media (#163292)</span>
+        <input id="mediaFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
+        <input id="mediaLinkInput" type="url" maxlength="400" placeholder="Optional link (https://...)"/>
+        <input id="mediaCaptionInput" type="text" maxlength="160" placeholder="Optional caption"/>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+          <span id="mediaStatus" class="auth-error"></span>
+          <button id="uploadMediaBtn" type="button" class="btn-primary">Upload Media</button>
+        </div>
+      </div>
+      <div id="mediaFeed" class="media-feed"></div>
+    </div>
   </div>
   <div id="passwordModal" class="modal-backdrop">
     <div class="modal-card">
@@ -1494,7 +1683,7 @@ function renderStaffChatHtml(
           <a id="openSonolusBtn" class="btn-sm" href="${escapeAttr(sonolusUrl)}">Open on Sonolus</a>
         </div>
         <div>
-          <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture (R2)</label>
+          <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture</label>
           <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
           <div id="cropWrap" style="display:none;margin-top:10px">
             <div id="cropBox" class="crop-box">
@@ -1518,6 +1707,7 @@ function renderStaffChatHtml(
   const STORAGE_KEY = 'xx_chat_handle';
   const UNLOCK_KEY = 'xx_chat_unlocked_163292';
   const PROTECTED_HANDLE = ${JSON.stringify(PROTECTED_CHAT_HANDLE)};
+  const MEDIA_ADMIN = ${JSON.stringify(MEDIA_ADMIN_HANDLE)};
   const COOKIE_NAME = ${JSON.stringify(CHAT_HANDLE_COOKIE)};
   const HOST_HANDLE = ${JSON.stringify(TOURNAMENT_HOST_HANDLE)};
   const knownHandles = ${JSON.stringify([...CHAT_PFP_HANDLES])};
@@ -1527,9 +1717,22 @@ function renderStaffChatHtml(
   const prefsMap = ${JSON.stringify(prefsMap)};
   const defaultsMap = ${JSON.stringify(DEFAULT_CHAT_PROFILES)};
   const initialMessages = ${safeInitialMessagesJson};
+  const initialMedia = ${safeInitialMediaJson};
 
   const pickerEl = document.getElementById('picker');
-  const chatViewEl = document.getElementById('chatView');
+  const appViewEl = document.getElementById('appView');
+  const tabChatBtn = document.getElementById('tabChatBtn');
+  const tabMediaBtn = document.getElementById('tabMediaBtn');
+  const chatTabEl = document.getElementById('chatTab');
+  const mediaTabEl = document.getElementById('mediaTab');
+  const mediaUploadCard = document.getElementById('mediaUploadCard');
+  const mediaFileInput = document.getElementById('mediaFileInput');
+  const mediaLinkInput = document.getElementById('mediaLinkInput');
+  const mediaCaptionInput = document.getElementById('mediaCaptionInput');
+  const mediaStatusEl = document.getElementById('mediaStatus');
+  const uploadMediaBtn = document.getElementById('uploadMediaBtn');
+  const mediaFeedEl = document.getElementById('mediaFeed');
+
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
   const logoutBtn = document.getElementById('logoutBtn');
@@ -1555,12 +1758,13 @@ function renderStaffChatHtml(
   const cropImg = document.getElementById('cropImg');
   const zoomRange = document.getElementById('zoomRange');
 
+  let activeTab = 'chat';
   let loggedOut = false;
   let pendingPasswordHandle = '';
   let selectedNotifyMode = 'mention';
   let activeReply = null;
-  let editingMessageId = '';
   let currentMessages = Array.isArray(initialMessages) ? [...initialMessages] : [];
+  let currentMedia = Array.isArray(initialMedia) ? [...initialMedia] : [];
   let socket = null;
   let reconnectTimer = null;
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
@@ -1568,7 +1772,7 @@ function renderStaffChatHtml(
   function syncViewportHeight() {
     const vv = window.visualViewport;
     if (!vv) return;
-    chatViewEl.style.height = Math.max(240, vv.height - headerHeightPx()) + 'px';
+    appViewEl.style.height = Math.max(240, vv.height - headerHeightPx()) + 'px';
   }
 
   function headerHeightPx() {
@@ -1745,6 +1949,167 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
+  function setActiveTab(tab) {
+    activeTab = tab === 'media' ? 'media' : 'chat';
+    tabChatBtn.classList.toggle('active', activeTab === 'chat');
+    tabMediaBtn.classList.toggle('active', activeTab === 'media');
+    chatTabEl.classList.toggle('active', activeTab === 'chat');
+    mediaTabEl.classList.toggle('active', activeTab === 'media');
+    if (activeTab === 'chat') {
+      box.scrollTop = box.scrollHeight;
+    } else {
+      void refreshMediaList();
+    }
+  }
+
+  tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
+  tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
+
+  function renderMedia(items) {
+    if (Array.isArray(items)) {
+      currentMedia = items;
+    }
+    const active = getActiveUser();
+    const canDelete = active && active.handle === MEDIA_ADMIN;
+
+    if (!currentMedia.length) {
+      mediaFeedEl.innerHTML = '<div class="empty-state">No media items yet.</div>';
+      return;
+    }
+
+    mediaFeedEl.innerHTML = currentMedia.map((item) => {
+      const imgSrc = '/api/chat/media/' + encodeURIComponent(item.id) + '?v=' + encodeURIComponent(String(item.createdAt || 0));
+      const safeLink = item.link && /^https?:\/\//i.test(item.link) ? item.link : '';
+      const linkHtml = safeLink
+        ? '<a class="media-link" href="' + escapeAttr(safeLink) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(safeLink) + '</a>'
+        : '';
+      const captionHtml = item.caption
+        ? '<div class="media-caption">' + escapeHtml(item.caption) + '</div>'
+        : '';
+      const delHtml = canDelete
+        ? '<button type="button" class="del-btn" data-delete-media="' + escapeAttr(item.id) + '">Delete</button>'
+        : '';
+
+      return '<article class="media-card">' +
+        '<div class="media-frame"><img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/></div>' +
+        '<div class="media-meta">' +
+          '<div style="display:flex;flex-direction:column;gap:4px;min-width:0">' + captionHtml + linkHtml + '</div>' +
+          delHtml +
+        '</div>' +
+      '</article>';
+    }).join('');
+  }
+
+  async function refreshMediaList() {
+    const active = getActiveUser();
+    if (!active) return;
+    const res = await fetch('/api/chat/media', {
+      headers: authHeaders(),
+      credentials: 'same-origin',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.items)) renderMedia(data.items);
+    }
+  }
+
+  async function fileTo16x9DataUrl(file) {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('Failed to read image'));
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error('Invalid image'));
+      el.src = dataUrl;
+    });
+
+    const targetW = 1280;
+    const targetH = 720;
+    const targetRatio = targetW / targetH;
+    const srcW = img.naturalWidth || targetW;
+    const srcH = img.naturalHeight || targetH;
+    const srcRatio = srcW / srcH;
+
+    let sx = 0;
+    let sy = 0;
+    let sw = srcW;
+    let sh = srcH;
+    if (srcRatio > targetRatio) {
+      sw = Math.round(srcH * targetRatio);
+      sx = Math.round((srcW - sw) / 2);
+    } else if (srcRatio < targetRatio) {
+      sh = Math.round(srcW / targetRatio);
+      sy = Math.round((srcH - sh) / 2);
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
+    return canvas.toDataURL('image/png');
+  }
+
+  uploadMediaBtn.addEventListener('click', async () => {
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    const file = mediaFileInput.files && mediaFileInput.files[0];
+    if (!file) {
+      mediaStatusEl.textContent = 'Select an image first.';
+      return;
+    }
+    mediaStatusEl.textContent = 'Uploading...';
+    uploadMediaBtn.disabled = true;
+    try {
+      const imageDataUrl = await fileTo16x9DataUrl(file);
+      const res = await fetch('/api/chat/media', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          handle: active.handle,
+          imageDataUrl,
+          link: mediaLinkInput.value.trim(),
+          caption: mediaCaptionInput.value.trim(),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        mediaStatusEl.textContent = data.message || 'Upload failed.';
+        return;
+      }
+      mediaFileInput.value = '';
+      mediaLinkInput.value = '';
+      mediaCaptionInput.value = '';
+      mediaStatusEl.textContent = '';
+      if (Array.isArray(data.items)) renderMedia(data.items);
+    } finally {
+      uploadMediaBtn.disabled = false;
+    }
+  });
+
+  mediaFeedEl.addEventListener('click', async (e) => {
+    const delBtn = e.target.closest('[data-delete-media]');
+    if (!delBtn) return;
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    const id = delBtn.getAttribute('data-delete-media') || '';
+    if (!id) return;
+    const res = await fetch('/api/chat/media?id=' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: authHeaders(),
+      credentials: 'same-origin',
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.items)) renderMedia(data.items);
+    }
+  });
+
   function render(messages, force = false) {
     const shouldStickBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90 || force;
     if (Array.isArray(messages)) {
@@ -1761,32 +2126,18 @@ function renderStaffChatHtml(
     box.innerHTML = currentMessages.map((m) => {
       const time = formatAuthorTime(m);
       const mine = m.handle === myHandle ? 'me' : '';
-      const canModify = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
+      const canDelete = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
       const pfpImg = '<img class="pfp" src="' + escapeHtml(pfpUrlFor(m.handle)) + '" alt=""/>';
       const replyHtml = m.replyTo
-        ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.author || m.replyTo.handle || '') + ': ' + escapeHtml(m.replyTo.text || '') + '</div>'
+        ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.text || '') + '</div>'
         : '';
-      const editBtn = canModify
-        ? '<button type="button" class="edit-btn" data-edit-id="' + escapeHtml(m.id) + '">Edit</button>'
-        : '';
-      const delHtml = canModify
+      const delHtml = canDelete
         ? '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>'
         : '';
 
-      const isEditing = editingMessageId === m.id;
-      const bodyHtml = isEditing
-        ? '<div class="edit-box">' +
-            '<input type="text" class="edit-input" data-edit-input="' + escapeHtml(m.id) + '" maxlength="500" value="' + escapeAttr(m.text) + '"/>' +
-            '<div class="edit-actions">' +
-              '<button type="button" class="btn-sm" data-cancel-edit="1">Cancel</button>' +
-              '<button type="button" class="btn-primary" data-save-edit="' + escapeHtml(m.id) + '">Save</button>' +
-            '</div>' +
-          '</div>'
-        : '<div class="text">' + escapeHtml(m.text) + (m.editedAt ? '<span class="edited-tag">(edited)</span>' : '') + '</div>';
-
       const likers = Array.isArray(m.likes) ? m.likes : [];
       const avatarsHtml = likers.map((h) =>
-        '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt="' + escapeHtml(h) + '"/>'
+        '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt=""/>'
       ).join('');
       const likeBadgeHtml = likers.length > 0
         ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span> ' + likers.length + '</span>'
@@ -1795,14 +2146,13 @@ function renderStaffChatHtml(
       return '<div class="row ' + mine + '" data-row-id="' + escapeHtml(m.id) + '">' +
         pfpImg +
         '<div class="msg" data-msg-id="' + escapeHtml(m.id) + '">' +
-          '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
+          '<div class="meta"><span>' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
-            editBtn +
             delHtml +
           '</span></div>' +
           replyHtml +
-          bodyHtml +
+          '<div class="text">' + escapeHtml(m.text) + '</div>' +
           (likeBadgeHtml ? '<div class="msg-footer">' + likeBadgeHtml + '</div>' : '') +
         '</div>' +
       '</div>';
@@ -1859,7 +2209,7 @@ function renderStaffChatHtml(
       badgeEl.textContent = 'Select profile';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
-      chatViewEl.classList.remove('open');
+      appViewEl.classList.remove('open');
       const saved = readSavedHandle();
       if (!loggedOut && saved === PROTECTED_HANDLE && !isProtectedUnlocked()) {
         openPasswordPrompt(PROTECTED_HANDLE);
@@ -1869,11 +2219,13 @@ function renderStaffChatHtml(
 
     badgeEl.textContent = formatTag(active.name, active.handle);
     settingsBtn.style.display = 'inline-block';
+    mediaUploadCard.style.display = active.handle === MEDIA_ADMIN ? 'flex' : 'none';
     pickerEl.classList.remove('open');
-    chatViewEl.classList.add('open');
+    appViewEl.classList.add('open');
     syncViewportHeight();
     renderKnownUserChips();
     render(currentMessages, true);
+    renderMedia(currentMedia);
     connectSocket();
   }
 
@@ -1928,7 +2280,6 @@ function renderStaffChatHtml(
 
   logoutBtn.addEventListener('click', () => {
     loggedOut = true;
-    editingMessageId = '';
     setProtectedUnlocked(false);
     persistHandle('');
     setReplyTarget(null);
@@ -1947,23 +2298,6 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      if (Array.isArray(data.messages)) render(data.messages, true);
-    }
-  }
-
-  async function saveEditedMessage(id, nextText) {
-    const active = getActiveUser();
-    const cleanText = String(nextText || '').trim();
-    if (!active || !id || !cleanText) return;
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      credentials: 'same-origin',
-      body: JSON.stringify({ action: 'edit', id, text: cleanText, handle: active.handle }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      editingMessageId = '';
       if (Array.isArray(data.messages)) render(data.messages, true);
     }
   }
@@ -2182,54 +2516,12 @@ function renderStaffChatHtml(
     }
   });
 
-  box.addEventListener('keydown', (e) => {
-    const editInp = e.target.closest('[data-edit-input]');
-    if (!editInp) return;
-    const id = editInp.getAttribute('data-edit-input') || '';
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      void saveEditedMessage(id, editInp.value);
-    } else if (e.key === 'Escape') {
-      editingMessageId = '';
-      render(currentMessages, true);
-    }
-  });
-
   box.addEventListener('click', async (e) => {
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
       const id = replyBtn.getAttribute('data-reply-id');
       const target = currentMessages.find((m) => m.id === id);
       if (target) setReplyTarget(target);
-      return;
-    }
-
-    const editBtn = e.target.closest('[data-edit-id]');
-    if (editBtn) {
-      const id = editBtn.getAttribute('data-edit-id') || '';
-      editingMessageId = id;
-      render(currentMessages, true);
-      const inp = box.querySelector('[data-edit-input="' + CSS.escape(id) + '"]');
-      if (inp) {
-        inp.focus();
-        inp.setSelectionRange(inp.value.length, inp.value.length);
-      }
-      return;
-    }
-
-    if (e.target.closest('[data-cancel-edit]')) {
-      editingMessageId = '';
-      render(currentMessages, true);
-      return;
-    }
-
-    const saveEditBtn = e.target.closest('[data-save-edit]');
-    if (saveEditBtn) {
-      const id = saveEditBtn.getAttribute('data-save-edit') || '';
-      const inp = box.querySelector('[data-edit-input="' + CSS.escape(id) + '"]');
-      if (inp) {
-        await saveEditedMessage(id, inp.value);
-      }
       return;
     }
 
@@ -2710,10 +3002,12 @@ self.addEventListener('fetch', (event) => {
 
         if (path === '/app-icon.png' && req.method === 'GET') {
             const obj = await getBucketImage(env, [
+                'sonolus-assets/XX!.png',
+                'community/chat/XX!.png',
                 'chat/XX!.png',
                 'XX!.png',
+                'community/chat/pfp/163292.png',
                 'chat/pfp/163292.png',
-                'chat/163292.png',
             ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
@@ -2727,9 +3021,9 @@ self.addEventListener('fetch', (event) => {
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
             const obj = await getBucketImage(env, [
-                'XX!.png',
                 'sonolus-assets/XX!.png',
-                'chat/XX!.png',
+                'XX!.png',
+                'community/chat/XX!.png',
             ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
@@ -2785,31 +3079,141 @@ self.addEventListener('fetch', (event) => {
         const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
         if (pfpMatch && req.method === 'GET') {
             const handle = decodeURIComponent(pfpMatch[1]!).trim()
-            if (!CHAT_PFP_HANDLE_SET.has(handle) || !env.COMMUNITY_BUCKET) {
+            if (!CHAT_PFP_HANDLE_SET.has(handle)) {
                 return new Response(null, { status: 404 })
             }
 
             const prefs = await getUserChatPrefs(env, handle)
             const keys = [
                 prefs.pfpKey,
+                `community/chat/pfp/${handle}.png`,
                 `chat/pfp/${handle}.png`,
                 `chat/${handle}.png`,
             ].filter((k): k is string => Boolean(k))
 
-            for (const key of keys) {
-                const obj = await env.COMMUNITY_BUCKET.get(key).catch(() => null)
-                if (obj) {
-                    return new Response(obj.body, {
-                        headers: {
-                            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-                            'Access-Control-Allow-Origin': '*',
-                            'Cache-Control': 'no-cache',
-                        },
-                    })
-                }
+            const obj = await getBucketImage(env, keys)
+            if (obj) {
+                return new Response(obj.body, {
+                    headers: {
+                        'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': 'no-cache',
+                    },
+                })
             }
 
             return new Response(null, { status: 404 })
+        }
+
+        const mediaAssetMatch = path.match(/^\/api\/chat\/media\/([^/]+)$/)
+        if (mediaAssetMatch && req.method === 'GET') {
+            const mediaId = decodeURIComponent(mediaAssetMatch[1]!).trim()
+            const items = await listChatMedia(env)
+            const target = items.find((m) => m.id === mediaId)
+            if (!target) return new Response(null, { status: 404 })
+
+            const obj = await getBucketImage(env, [
+                target.imageKey,
+                `community/chat/media/${mediaId}.png`,
+                `chat/media/${mediaId}.png`,
+            ])
+            if (!obj) return new Response(null, { status: 404 })
+
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? target.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
+        if (path === '/api/chat/media') {
+            let body: any = null
+            if (req.method === 'POST') {
+                try {
+                    body = await req.json()
+                } catch {
+                    return message(400, 'Invalid JSON.')
+                }
+            }
+
+            const resolved = await resolveChatUser(req, env, url, body)
+            if (!resolved) {
+                return message(403, 'Choose a valid handle.')
+            }
+
+            if (req.method === 'GET') {
+                const items = await listChatMedia(env)
+                return json({ items })
+            }
+
+            if (req.method === 'POST') {
+                if (!isMediaAdminHandle(resolved.user.handle)) {
+                    return message(403, 'Only 163292 can add media.')
+                }
+
+                const dataUrl = typeof body?.imageDataUrl === 'string' ? body.imageDataUrl : ''
+                const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
+                if (!match) {
+                    return message(400, 'Invalid image data.')
+                }
+
+                const mime = match[1]!
+                const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
+                if (rawBytes.byteLength > 4 * 1024 * 1024) {
+                    return message(400, 'Media image too large.')
+                }
+
+                const bucket = primaryCommunityBucket(env)
+                if (!bucket) {
+                    return message(500, 'Community R2 bucket is not configured.')
+                }
+
+                const id = randomId(12)
+                const imageKey = `community/chat/media/${id}.png`
+                await bucket.put(imageKey, rawBytes, {
+                    httpMetadata: { contentType: mime },
+                })
+
+                const safeLink = sanitizeHttpLink(body?.link)
+                const safeCaption = typeof body?.caption === 'string'
+                    ? body.caption.trim().slice(0, 160)
+                    : ''
+
+                const existing = await listChatMedia(env)
+                const nextItem: ChatMediaItem = {
+                    id,
+                    imageKey,
+                    contentType: mime,
+                    ...(safeLink ? { link: safeLink } : {}),
+                    ...(safeCaption ? { caption: safeCaption } : {}),
+                    createdAt: Date.now(),
+                    authorHandle: resolved.user.handle,
+                }
+                const updated = [nextItem, ...existing]
+                await saveChatMediaIndex(env, updated)
+                return json({ ok: true, item: nextItem, items: updated })
+            }
+
+            if (req.method === 'DELETE') {
+                if (!isMediaAdminHandle(resolved.user.handle)) {
+                    return message(403, 'Only 163292 can delete media.')
+                }
+                const id = (url.searchParams.get('id') ?? '').trim()
+                if (!id) return message(400, 'Missing media id.')
+
+                const existing = await listChatMedia(env)
+                const target = existing.find((m) => m.id === id)
+                if (!target) return message(404, 'Media item not found.')
+
+                for (const bucket of bucketsForRead(env)) {
+                    await bucket.delete(target.imageKey).catch(() => {})
+                }
+                const updated = existing.filter((m) => m.id !== id)
+                await saveChatMediaIndex(env, updated)
+                return json({ ok: true, items: updated })
+            }
         }
 
         if (path === '/api/chat/auth' && req.method === 'POST') {
@@ -2855,9 +3259,10 @@ self.addEventListener('fetch', (event) => {
                 if (rawBytes.byteLength > 2 * 1024 * 1024) {
                     return message(400, 'Profile image too large.')
                 }
-                if (env.COMMUNITY_BUCKET) {
-                    pfpKey = `chat/pfp/${handle}.png`
-                    await env.COMMUNITY_BUCKET.put(pfpKey, rawBytes, {
+                const bucket = primaryCommunityBucket(env)
+                if (bucket) {
+                    pfpKey = `community/chat/pfp/${handle}.png`
+                    await bucket.put(pfpKey, rawBytes, {
                         httpMetadata: { contentType: mime },
                     })
                 }
@@ -2896,11 +3301,12 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/chat' && req.method === 'GET') {
-            const [prefsEntries, initialMessages] = await Promise.all([
+            const [prefsEntries, initialMessages, initialMedia] = await Promise.all([
                 Promise.all(
                     CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
                 ),
                 chatStub(env).listMessages().catch(() => []),
+                listChatMedia(env).catch(() => []),
             ])
             const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
@@ -2914,11 +3320,12 @@ self.addEventListener('fetch', (event) => {
                         prefsMap,
                         sUrl,
                         initialMessages,
+                        initialMedia,
                     ),
                 )
             }
             return html(
-                renderStaffChatHtml(null, '', false, prefsMap, sUrl, initialMessages),
+                renderStaffChatHtml(null, '', false, prefsMap, sUrl, initialMessages, initialMedia),
             )
         }
 
@@ -2948,25 +3355,6 @@ self.addEventListener('fetch', (event) => {
             }
 
             if (req.method === 'POST') {
-                if (body?.action === 'edit') {
-                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
-                    const nextText = typeof body?.text === 'string' ? body.text.trim() : ''
-                    if (!targetId || !nextText) {
-                        return message(400, 'Missing message id or text.')
-                    }
-                    const messages = await chatStub(env).listMessages().catch(() => [])
-                    const target = messages.find((m) => m.id === targetId)
-                    if (!target) {
-                        return message(404, 'Message not found.')
-                    }
-                    if (!canModifyChatMessage(resolved.user.handle, target.handle)) {
-                        return message(403, 'You cannot edit this message.')
-                    }
-                    await chatStub(env).editMessage(targetId, nextText.slice(0, 500))
-                    const updated = await chatStub(env).listMessages().catch(() => [])
-                    return json({ ok: true, messages: updated, prefs: prefsMap })
-                }
-
                 if (body?.action === 'delete') {
                     const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
                     if (!targetId) {
@@ -2977,7 +3365,7 @@ self.addEventListener('fetch', (event) => {
                     if (!target) {
                         return message(404, 'Message not found.')
                     }
-                    if (!canModifyChatMessage(resolved.user.handle, target.handle)) {
+                    if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                         return message(403, 'Only 163292 can delete messages from other members.')
                     }
                     await chatStub(env).deleteMessage(targetId)
@@ -3026,7 +3414,7 @@ self.addEventListener('fetch', (event) => {
                 if (!target) {
                     return message(404, 'Message not found.')
                 }
-                if (!canModifyChatMessage(resolved.user.handle, target.handle)) {
+                if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                     return message(403, 'Only 163292 can delete messages from other members.')
                 }
                 await chatStub(env).deleteMessage(id)
@@ -3068,7 +3456,10 @@ self.addEventListener('fetch', (event) => {
             const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            const bannerObject = await env.POSTS_BUCKET.get('server/banner.png')
+            const bannerObject = await getBucketImage(env, [
+                'sonolus-assets/banner.png',
+                'server/banner.png',
+            ])
             let banner: { hash: string; url: string } | undefined
 
             if (bannerObject) {
@@ -3150,7 +3541,10 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object = await env.POSTS_BUCKET.get('server/banner.png')
+            const object = await getBucketImage(env, [
+                'sonolus-assets/banner.png',
+                'server/banner.png',
+            ])
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -3600,10 +3994,11 @@ self.addEventListener('fetch', (event) => {
             }
 
             await Promise.all([
-                env.POSTS_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
-                env.POSTS_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
-                env.COMMUNITY_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
-                env.COMMUNITY_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
+                ...[...bucketsForRead(env)].flatMap((b) => [
+                    b.delete(`community/${post.category}/${postName}/thumbnail`).catch(() => {}),
+                    b.delete(`${post.category}/${postName}/thumbnail`).catch(() => {}),
+                    b.delete(`posts/${postName}/thumbnail`).catch(() => {}),
+                ]),
                 lobby(env).removePost(postName),
             ])
 
@@ -3696,11 +4091,13 @@ self.addEventListener('fetch', (event) => {
                 return message(400, 'Image hash does not match.')
             }
 
-            const targetBucket = env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET
-            const objectKey = `${post.category}/${post.item.name}/thumbnail`
-            await targetBucket.put(objectKey, bytes, {
-                httpMetadata: { contentType },
-            })
+            const targetBucket = primaryCommunityBucket(env)
+            if (targetBucket) {
+                const objectKey = `community/${post.category}/${post.item.name}/thumbnail`
+                await targetBucket.put(objectKey, bytes, {
+                    httpMetadata: { contentType },
+                })
+            }
 
             await lobby(env).setPostThumbnail(
                 post.item.name,
@@ -3719,9 +4116,13 @@ self.addEventListener('fetch', (event) => {
             const cat = post?.category ?? 'posts'
 
             const object = await getBucketImage(env, [
+                `community/${cat}/${name}/thumbnail`,
                 `${cat}/${name}/thumbnail`,
+                `community/posts/${name}/thumbnail`,
                 `posts/${name}/thumbnail`,
+                `community/announcements/${name}/thumbnail`,
                 `announcements/${name}/thumbnail`,
+                `community/results/${name}/thumbnail`,
                 `results/${name}/thumbnail`,
             ])
 
