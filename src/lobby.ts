@@ -47,6 +47,7 @@ export type StoredChatMessage = ChatMessage & {
 }
 
 type LobbyState = {
+    rooms: string[]
     posts: StoredPost[]
     chat: StoredChatMessage[]
     pinnedChatId: string | null
@@ -127,8 +128,9 @@ function normalizeChatMessage(raw: any): StoredChatMessage {
 }
 
 export class Lobby extends DurableObject<Env> {
-    private rooms = new Map<string, { name: string }>()
+    private rooms = new Set<string>()
     private st: LobbyState = {
+        rooms: [],
         posts: [],
         chat: [],
         pinnedChatId: null,
@@ -180,7 +182,7 @@ export class Lobby extends DurableObject<Env> {
                 }
             }
 
-            return { posts, chat, pinnedChatId }
+            return { rooms: [], posts, chat, pinnedChatId }
         } catch (error) {
             console.error('Could not load lobby state from R2:', error)
             return null
@@ -221,7 +223,10 @@ export class Lobby extends DurableObject<Env> {
 
         const stored = await this.ctx.storage.get<LobbyState>('state')
         if (stored) {
+            const roomNames = Array.isArray(stored.rooms) ? stored.rooms.map(String).filter(Boolean) : []
+            this.rooms = new Set(roomNames)
             this.st = {
+                rooms: [...this.rooms],
                 posts: Array.isArray(stored.posts)
                     ? stored.posts.slice(-MAX_POSTS).map((post) => normalizePost(post))
                     : [],
@@ -246,6 +251,7 @@ export class Lobby extends DurableObject<Env> {
     }
 
     private async save(): Promise<void> {
+        this.st.rooms = [...this.rooms]
         this.st.posts = this.st.posts.slice(-MAX_POSTS)
         this.st.chat = this.st.chat.slice(-MAX_CHAT)
         if (
@@ -264,15 +270,22 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async list(): Promise<{ name: string }[]> {
-        return [...this.rooms.values()]
+        await this.ensureLoaded()
+        return [...this.rooms].map((name) => ({ name }))
     }
 
     async register(name: string): Promise<void> {
-        this.rooms.set(name, { name })
+        await this.ensureLoaded()
+        if (!name) return
+        this.rooms.add(name)
+        await this.save()
     }
 
     async remove(name: string): Promise<void> {
+        await this.ensureLoaded()
+        if (!name) return
         this.rooms.delete(name)
+        await this.save()
     }
 
     async listPosts(category?: PostCategory): Promise<StoredPost[]> {
