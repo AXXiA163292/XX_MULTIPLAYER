@@ -786,6 +786,7 @@ function renderStaffChatHtml(
     fromSonolus: boolean,
     prefsMap: Record<string, UserChatPrefs>,
     sonolusUrl: string,
+    initialMessages: ChatMessage[],
 ): string {
     const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
         const pref = prefsMap[handle]
@@ -798,6 +799,8 @@ function renderStaffChatHtml(
           ${lockBadge}
         </button>`
     }).join('')
+
+    const safeInitialMessagesJson = JSON.stringify(initialMessages).replace(/</g, '\\u003c')
 
     return `<!doctype html>
 <html lang="en">
@@ -1523,6 +1526,7 @@ function renderStaffChatHtml(
   const sessionToken = ${JSON.stringify(fromSonolus ? sessionToken : '')};
   const prefsMap = ${JSON.stringify(prefsMap)};
   const defaultsMap = ${JSON.stringify(DEFAULT_CHAT_PROFILES)};
+  const initialMessages = ${safeInitialMessagesJson};
 
   const pickerEl = document.getElementById('picker');
   const chatViewEl = document.getElementById('chatView');
@@ -1556,12 +1560,9 @@ function renderStaffChatHtml(
   let selectedNotifyMode = 'mention';
   let activeReply = null;
   let editingMessageId = '';
-  let currentMessages = [];
-  let lastRenderSig = '';
-  let hasLoadedOnce = false;
+  let currentMessages = Array.isArray(initialMessages) ? [...initialMessages] : [];
   let socket = null;
   let reconnectTimer = null;
-  let pollTimer = null;
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
 
   function syncViewportHeight() {
@@ -1745,13 +1746,12 @@ function renderStaffChatHtml(
   }
 
   function render(messages, force = false) {
-    const shouldStickBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90 || !hasLoadedOnce || force;
-    currentMessages = Array.isArray(messages) ? messages : [];
+    const shouldStickBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90 || force;
+    if (Array.isArray(messages)) {
+      currentMessages = messages;
+    }
     const active = getActiveUser();
     const myHandle = active ? active.handle : '';
-    const sig = JSON.stringify({ myHandle, prefsMap, editingMessageId, currentMessages });
-    if (!force && sig === lastRenderSig) return;
-    lastRenderSig = sig;
 
     if (currentMessages.length === 0) {
       box.innerHTML = '<div class="empty-state">No messages yet. Say hello!</div>';
@@ -1813,35 +1813,6 @@ function renderStaffChatHtml(
     }
   }
 
-  async function loadMessages(force = false) {
-    const active = getActiveUser();
-    if (!active) return;
-    if (!hasLoadedOnce) {
-      box.innerHTML = '<div class="empty-state">Loading messages...</div>';
-    }
-    try {
-      const qs = 'handle=' + encodeURIComponent(active.handle) + '&t=' + Date.now();
-      const res = await fetch('/api/chat?' + qs, {
-        headers: authHeaders(),
-        credentials: 'same-origin',
-        cache: 'no-store',
-      });
-      if (!res.ok) throw new Error(await res.text() || ('HTTP ' + res.status));
-      const data = await res.json();
-      if (data.prefs) {
-        Object.assign(prefsMap, data.prefs);
-        renderKnownUserChips();
-      }
-      hasLoadedOnce = true;
-      render(Array.isArray(data.messages) ? data.messages : [], force);
-    } catch (error) {
-      console.error('Could not load chat messages:', error);
-      if (!hasLoadedOnce) {
-        box.innerHTML = '<div class="empty-state">Could not load messages.</div>';
-      }
-    }
-  }
-
   function disconnectSocket() {
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -1864,15 +1835,10 @@ function renderStaffChatHtml(
     const ws = new WebSocket(proto + '//' + location.host + '/ws/chat?' + qs.toString());
     socket = ws;
 
-    ws.onopen = () => {
-      void loadMessages(true);
-    };
-
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(String(event.data || '{}'));
         if (data.type === 'chat' && Array.isArray(data.messages)) {
-          hasLoadedOnce = true;
           render(data.messages);
         }
       } catch {}
@@ -1907,7 +1873,7 @@ function renderStaffChatHtml(
     chatViewEl.classList.add('open');
     syncViewportHeight();
     renderKnownUserChips();
-    void loadMessages(true);
+    render(currentMessages, true);
     connectSocket();
   }
 
@@ -1937,8 +1903,6 @@ function renderStaffChatHtml(
     }
     setProtectedUnlocked(true);
     loggedOut = false;
-    hasLoadedOnce = false;
-    lastRenderSig = '';
     persistHandle(pendingPasswordHandle || PROTECTED_HANDLE);
     pendingPasswordHandle = '';
     passwordModal.classList.remove('open');
@@ -1964,13 +1928,9 @@ function renderStaffChatHtml(
 
   logoutBtn.addEventListener('click', () => {
     loggedOut = true;
-    hasLoadedOnce = false;
-    lastRenderSig = '';
     editingMessageId = '';
     setProtectedUnlocked(false);
     persistHandle('');
-    currentMessages = [];
-    render([], true);
     setReplyTarget(null);
     settingsModal.classList.remove('open');
     syncMode();
@@ -1987,7 +1947,7 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || [], true);
+      if (Array.isArray(data.messages)) render(data.messages, true);
     }
   }
 
@@ -2004,7 +1964,7 @@ function renderStaffChatHtml(
     if (res.ok) {
       const data = await res.json();
       editingMessageId = '';
-      render(data.messages || [], true);
+      if (Array.isArray(data.messages)) render(data.messages, true);
     }
   }
 
@@ -2154,8 +2114,6 @@ function renderStaffChatHtml(
         return;
       }
       loggedOut = false;
-      hasLoadedOnce = false;
-      lastRenderSig = '';
       persistHandle(picked);
       syncMode();
     });
@@ -2286,7 +2244,7 @@ function renderStaffChatHtml(
       });
       if (res.ok) {
         const data = await res.json();
-        render(data.messages || [], true);
+        if (Array.isArray(data.messages)) render(data.messages, true);
       }
       return;
     }
@@ -2317,7 +2275,7 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || [], true);
+      if (Array.isArray(data.messages)) render(data.messages, true);
     }
   });
 
@@ -2326,13 +2284,9 @@ function renderStaffChatHtml(
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) {
-      void loadMessages(true);
-      if (!socket) connectSocket();
-    }
+    if (!document.hidden && !socket) connectSocket();
   });
   window.addEventListener('focus', () => {
-    void loadMessages(true);
     if (!socket) connectSocket();
   });
   window.addEventListener('pageshow', () => {
@@ -2340,11 +2294,6 @@ function renderStaffChatHtml(
   });
 
   syncMode();
-  pollTimer = setInterval(() => {
-    if (!document.hidden) {
-      void loadMessages(false);
-    }
-  }, 5000);
 </script>
 </body>
 </html>`
@@ -2947,18 +2896,30 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/chat' && req.method === 'GET') {
-            const prefsEntries = await Promise.all(
-                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
-            )
+            const [prefsEntries, initialMessages] = await Promise.all([
+                Promise.all(
+                    CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
+                ),
+                chatStub(env).listMessages().catch(() => []),
+            ])
             const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
             const sUrl = sonolusDeepLinkUrl(req, env)
             if (resolved) {
                 return html(
-                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus, prefsMap, sUrl),
+                    renderStaffChatHtml(
+                        resolved.user,
+                        resolved.token,
+                        resolved.fromSonolus,
+                        prefsMap,
+                        sUrl,
+                        initialMessages,
+                    ),
                 )
             }
-            return html(renderStaffChatHtml(null, '', false, prefsMap, sUrl))
+            return html(
+                renderStaffChatHtml(null, '', false, prefsMap, sUrl, initialMessages),
+            )
         }
 
         if (path === '/api/chat') {
