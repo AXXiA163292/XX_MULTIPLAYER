@@ -62,6 +62,8 @@ type ChatMediaItem = {
 type WorkerEnv = Env & {
     COMMUNITY_BUCKET?: R2Bucket
     SONOLUS_ASSETS_BUCKET?: R2Bucket
+    RESEND_API_KEY?: string
+    RESEND_FROM_EMAIL?: string
 }
 
 const json = (data: unknown, status = 200) =>
@@ -264,6 +266,63 @@ async function saveUserChatPrefs(
     )
 
     return next
+}
+
+async function sendChatEmailNotifications(
+    env: WorkerEnv,
+    chatMessage: Pick<ChatMessage, 'handle' | 'author' | 'text'>,
+): Promise<void> {
+    const apiKey = env.RESEND_API_KEY
+    const from = env.RESEND_FROM_EMAIL
+
+    if (!apiKey || !from) {
+        console.warn('[Email] Resend configuration is missing.')
+        return
+    }
+
+    const messageText = chatMessage.text.toLowerCase()
+
+    const recipients = await Promise.all(
+        CHAT_PFP_HANDLES
+            .filter((handle) => handle !== chatMessage.handle)
+            .map(async (handle) => {
+                const prefs = await getUserChatPrefs(env, handle)
+                const email = String(prefs.notifyEmail ?? '').trim()
+
+                if (!email || !email.includes('@')) return null
+
+                const displayName = prefs.displayName.toLowerCase()
+                const mentioned =
+                    messageText.includes('@' + displayName) ||
+                    messageText.includes('@' + handle)
+
+                if (prefs.emailNotifyMode !== 'all' && !mentioned) return null
+
+                return { email, handle, displayName: prefs.displayName }
+            }),
+    )
+
+    await Promise.allSettled(
+        recipients.filter((r): r is NonNullable<typeof r> => r !== null).map(async (recipient) => {
+            const response = await fetch('https://api.resend.com/emails', {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    from,
+                    to: [recipient.email],
+                    subject: `New XX! Chat message from ${chatMessage.author}`,
+                    text: `Hello ${recipient.displayName},\n\n${chatMessage.author} sent a message in XX! Chat:\n\n${chatMessage.text}\n\nOpen the chat: ${env.PUBLIC_ADDRESS ?? ''}/chat`,
+                }),
+            })
+
+            if (!response.ok) {
+                console.error('[Email] Resend failed:', await response.text())
+            }
+        }),
+    )
 }
 
 const MEDIA_INDEX_KEY = 'chat/media/index.json'
@@ -725,8 +784,7 @@ function externalChatUrl(req: Request, env: WorkerEnv): string {
 }
 
 function sonolusChatLinkUrl(req: Request, env: WorkerEnv): string {
-    const hostAndBase = addressOf(req, env).replace(/^https?:\/\//, '')
-    return `sonolus://${hostAndBase}/sonolus/posts/chat`
+    return externalChatUrl(req, env)
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -1760,12 +1818,12 @@ function renderStaffChatHtml(
           <input id="notifyEmailInput" type="email" maxlength="120" placeholder="you@example.com"/>
         </div>
         <div class="sonolus-box">
-          <div>
-            <div class="sonolus-label">Sonolus App</div>
-            <div class="sonolus-sub">Open server chat in Sonolus</div>
-          </div>
-          <a id="openSonolusBtn" class="btn-sm" href="${escapeAttr(sonolusUrl)}">Open on Sonolus</a>
-        </div>
+    <div>
+        <div class="sonolus-label">XX! Web Chat</div>
+        <div class="sonolus-sub">Open the chat in your browser</div>
+    </div>
+    <a id="openSonolusBtn" class="btn-sm" href="${escapeAttr(sonolusUrl)}" target="_blank" rel="noopener noreferrer">Open Chat</a>
+</div>
         <div>
           <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture</label>
           <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
@@ -2039,13 +2097,21 @@ function renderStaffChatHtml(
   }
 
   function openMediaUploadModal() {
-    const active = getActiveUser();
-    if (!active || active.handle !== MEDIA_ADMIN) return;
-    setActiveTab('media');
-    mediaStatusEl.textContent = '';
-    mediaUploadModal.classList.add('open');
-    setTimeout(() => mediaFileInput.focus(), 20);
-  }
+    const active = getActiveUser()
+
+    if (!active || active.handle !== MEDIA_ADMIN) {
+        mediaStatusEl.textContent = 'Only #163292 can upload media.'
+        return
+    }
+
+    mediaStatusEl.textContent = ''
+    setActiveTab('media')
+    mediaUploadModal.classList.add('open')
+
+    requestAnimationFrame(() => {
+        mediaFileInput.focus()
+    })
+}
 
   function setActiveTab(tab) {
     activeTab = tab === 'media' ? 'media' : 'chat';
@@ -2064,11 +2130,11 @@ function renderStaffChatHtml(
   tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
   tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
 
-  addMediaBtn.addEventListener('click', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    openMediaUploadModal();
-  });
+  addMediaBtn.onclick = (e) => {
+    e.preventDefault()
+    e.stopPropagation()
+    openMediaUploadModal()
+};
 
   closeMediaModalBtn.addEventListener('click', () => {
     mediaUploadModal.classList.remove('open');
@@ -3571,15 +3637,21 @@ self.addEventListener('fetch', (event) => {
                     }
                     : undefined
 
-                await chatStub(env).addMessage({
-                    handle: resolved.user.handle,
-                    author: resolved.user.name || resolved.user.handle,
-                    text: text.slice(0, 500),
-                    ...(replyTo ? { replyTo } : {}),
-                })
+                const newMessage = {
+    handle: resolved.user.handle,
+    author: resolved.user.name || resolved.user.handle,
+    text: text.slice(0, 500),
+}
 
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                return json({ ok: true, messages, prefs: prefsMap })
+await chatStub(env).addMessage({
+    ...newMessage,
+    ...(replyTo ? { replyTo } : {}),
+})
+
+await sendChatEmailNotifications(env, newMessage)
+
+const messages = await chatStub(env).listMessages().catch(() => [])
+return json({ ok: true, messages, prefs: prefsMap })
             }
 
             if (req.method === 'DELETE') {
