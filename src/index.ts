@@ -3296,18 +3296,14 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-        if (path === '/refresh' || path === '/admin/refresh') {
-            const session = await sessionOf(req, env, url)
-            const authHeader = req.headers.get('Authorization') ?? ''
-            const expectedKey = (env as any).REFRESH_KEY as string | undefined
-            const authorized =
-                canManagePosts(session) ||
-                (Boolean(expectedKey) &&
-                    (authHeader === `Bearer ${expectedKey}` || url.searchParams.get('key') === expectedKey))
-
-            if (!authorized) {
-                return message(403, 'Refresh is restricted.')
-            }
+                if (path === '/refresh' || path === '/admin/refresh') {
+            const summary = await refreshDailyAssets(env)
+            await lobby(env).syncAllToR2().catch(() => {})
+            return json({
+                ok: summary.errors.length === 0,
+                ...summary,
+            })
+        }
 
             const summary = await refreshDailyAssets(env)
             await lobby(env).syncAllToR2().catch(() => {})
