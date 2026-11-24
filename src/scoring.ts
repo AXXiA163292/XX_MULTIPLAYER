@@ -1,5 +1,22 @@
 import type { GameplayResult, MatchMode, RoomMember } from './types.ts'
 
+export type RoundKind = 'tournament' | 'warmup' | 'rewind' | 'freeplay'
+
+export type RoundRecord = {
+    round: number
+    levelTitle: string
+    results: {
+        handle: string
+        name: string
+        score: number
+        accuracy: number
+        combo: number
+        grade: GameplayResult['grade']
+        pp: number
+        ratingDelta: number
+    }[]
+}
+
 export function calculateRatingDelta(
     ratingA: number,
     ratingB: number,
