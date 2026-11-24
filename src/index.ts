@@ -4037,11 +4037,14 @@ return json({ ok: true, messages, prefs: prefsMap })
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await chatStub(env).addMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
+                const newMessage = {
+    handle: session.user.handle,
+    author: session.user.name || session.user.handle,
+    text: text.slice(0, 500),
+}
+
+await chatStub(env).addMessage(newMessage)
+await sendChatEmailNotifications(env, newMessage)
 
                 return json({
                     key: '',
@@ -4196,11 +4199,14 @@ return json({ ok: true, messages, prefs: prefsMap })
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await chatStub(env).addMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
+                const newMessage = {
+    handle: session.user.handle,
+    author: session.user.name || session.user.handle,
+    text: text.slice(0, 500),
+}
+
+await chatStub(env).addMessage(newMessage)
+await sendChatEmailNotifications(env, newMessage)
 
                 return json({
                     key: '',
