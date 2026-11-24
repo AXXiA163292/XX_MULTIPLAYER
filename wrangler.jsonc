@@ -1,3 +1,4 @@
+
 {
   "name": "xx-multiplayer",
   "main": "src/index.ts",
@@ -11,6 +12,10 @@
       {
         "name": "LOBBY",
         "class_name": "Lobby"
+      },
+      {
+        "name": "CHAT",
+        "class_name": "Chat"
       }
     ]
   },
@@ -25,17 +30,16 @@
     }
   ],
   "triggers": {
-    "crons": [
-      "0 3 * * *"
-    ]
+    "crons": ["0 3 * * *"]
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": [
-        "Room",
-        "Lobby"
-      ]
+      "new_sqlite_classes": ["Room", "Lobby"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["Chat"]
     }
   ],
   "vars": {
