@@ -16,7 +16,7 @@
   },
   "r2_buckets": [
     {
-      "binding": "POSTS_BUCKET",
+      "binding": "SONOLUS_ASSETS_BUCKET",
       "bucket_name": "sonolus-assets"
     },
     {
