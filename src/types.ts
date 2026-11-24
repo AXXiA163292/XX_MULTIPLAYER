@@ -19,17 +19,6 @@ export type JoinSession = {
     exp: number
 }
 
-export type RoomUser = JoinSession['roomUser']
-
-export type Sil = {
-    address: string
-    name: string
-}
-
-export type RoomStatus = 'selecting' | 'preparing' | 'playing'
-
-export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
-
 export type RoomVisibility = 'public' | 'private'
 
 export type MatchMode = 'casual' | 'ranked'
@@ -39,12 +28,6 @@ export type RoomSettings = {
     master: boolean
     maxCount: number
     visibility: RoomVisibility
-    type?: string
-    scoring?: string
-    roundMode?: string
-    group?: string
-    tier?: string
-    customSongs?: string
     matchMode?: MatchMode
     roundCount?: number
     timeLimitSec?: number
@@ -60,18 +43,14 @@ export type RoomSettings = {
 }
 
 export type GameplayResult = {
-    grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
-    disqualified?: boolean
-    arcadeScore: number
-    accuracyScore: number
-    score?: number
+    score: number
     accuracy: number
     combo: number
     perfect: number
     great: number
     good: number
     miss: number
-    totalCount: number
+    grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
 }
 
 export type RoomMember = {
@@ -79,7 +58,6 @@ export type RoomMember = {
     user: UserProfile
     ready: boolean
     playing: boolean
-    status?: UserStatus
     lastResult?: GameplayResult
     previousResult?: GameplayResult
     lastPlayCount: number
@@ -140,7 +118,6 @@ export type Env = {
     SESSION_SECRET: string
     PUBLIC_ADDRESS?: string
     DEV_SKIP_SIGNATURE?: string
-    REFRESH_KEY?: string
     GOOGLE_SHEETS_SPREADSHEET_ID?: string
     GOOGLE_SHEETS_CUSTOM_RANGE?: string
     GOOGLE_SHEETS_PLAYLIST_RANGE?: string
