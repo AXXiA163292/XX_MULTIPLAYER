@@ -341,22 +341,22 @@ function resolveCategory(
     const urlSearchParams = parseEncodedParams(url.searchParams.get('searchValues'))
 
     const candidates: (string | null | undefined)[] = [
-        urlSearchParams?.get('category'),
-        bodySearchParams?.get('category'),
-        values?.get('category'),
-        bodyValueParams?.get('category'),
-        url.searchParams.get('category'),
-        body?.category,
-        body?.infoType,
-        body?.postType,
-        url.searchParams.get('infoType'),
-        url.searchParams.get('postType'),
-        urlSearchParams?.get('infoType'),
-        bodySearchParams?.get('infoType'),
         values?.get('type'),
         bodyValueParams?.get('type'),
         body?.type,
         url.searchParams.get('type'),
+        url.searchParams.get('infoType'),
+        url.searchParams.get('postType'),
+        body?.infoType,
+        body?.postType,
+        url.searchParams.get('category'),
+        values?.get('category'),
+        bodyValueParams?.get('category'),
+        body?.category,
+        urlSearchParams?.get('category'),
+        bodySearchParams?.get('category'),
+        urlSearchParams?.get('infoType'),
+        bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
         bodySearchParams?.get('type'),
     ]
@@ -493,13 +493,16 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
 function formatChatCommunityComments(
     messages: ChatMessage[],
     session: AuthSession | null,
-    _page = 0,
+    page = 0,
 ) {
     const ordered = [...messages].reverse()
+    const pageSize = 10
+    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
+    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
-        pageCount: 1,
-        comments: ordered.map((m) => ({
+        pageCount,
+        comments: slice.map((m) => ({
             name: m.id,
             author: formatAuthorTag(m.author, m.handle),
             time: m.time,
@@ -714,7 +717,7 @@ function renderStaffChatHtml(
   .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
   .msg-footer{margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:6px}
-  .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 6px;color:#fda4af}
+  .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 7px;font-size:11px;color:#fda4af}
   .like-avatars{display:inline-flex;align-items:center;gap:3px}
   .like-pfp{width:14px;height:14px;aspect-ratio:1/1;border-radius:4px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
   .reply-banner{display:none;align-items:center;justify-content:space-between;gap:8px;background:#1e293b;border:1px solid #3b82f6;border-radius:8px;padding:6px 10px;font-size:12px;color:#dbeafe}
@@ -750,7 +753,7 @@ function renderStaffChatHtml(
     </div>
   </header>
   <div id="picker">
-    <div class="picker-title">Hi, who is here?</div>
+    <div class="picker-title">Hi!, who are you?</div>
     <div class="picker-grid">${cardsHtml}</div>
   </div>
   <div id="chatView">
@@ -999,7 +1002,7 @@ function renderStaffChatHtml(
         '<img class="like-pfp" src="' + escapeHtml(pfpUrlFor(h)) + '" alt="' + escapeHtml(h) + '"/>'
       ).join('');
       const likeBadgeHtml = likers.length > 0
-        ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span></span>'
+        ? '<span class="like-pill">♥ <span class="like-avatars">' + avatarsHtml + '</span> ' + likers.length + '</span>'
         : '';
 
       return '<div class="row ' + mine + '" data-row-id="' + escapeHtml(m.id) + '">' +
@@ -1058,15 +1061,12 @@ function renderStaffChatHtml(
       return;
     }
 
-    const wasOpen = chatViewEl.classList.contains('open');
-
     badgeEl.textContent = formatTag(active.name, active.handle);
     settingsBtn.style.display = 'inline-block';
     pickerEl.classList.remove('open');
     chatViewEl.classList.add('open');
     renderKnownUserChips();
-
-    if (!wasOpen) void loadMessages();
+    void loadMessages();
   }
 
   logoutBtn.addEventListener('click', () => {
@@ -1231,6 +1231,8 @@ function renderStaffChatHtml(
   let swipeRow = null;
   let swipeStartX = 0;
   let swipeDeltaX = 0;
+  let lastTapId = '';
+  let lastTapAt = 0;
 
   box.addEventListener('touchstart', (e) => {
     const row = e.target.closest('[data-row-id]');
@@ -1262,6 +1264,13 @@ function renderStaffChatHtml(
     }
   });
 
+  box.addEventListener('dblclick', async (e) => {
+    const msgEl = e.target.closest('[data-msg-id]');
+    if (!msgEl) return;
+    const id = msgEl.getAttribute('data-msg-id');
+    if (id) await toggleLikeMessage(id);
+  });
+
   box.addEventListener('click', async (e) => {
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
@@ -1290,7 +1299,15 @@ function renderStaffChatHtml(
     const msgEl = e.target.closest('[data-msg-id]');
     if (msgEl) {
       const id = msgEl.getAttribute('data-msg-id') || '';
-      if (id) await toggleLikeMessage(id);
+      const now = Date.now();
+      if (id && id === lastTapId && now - lastTapAt < 320) {
+        lastTapId = '';
+        lastTapAt = 0;
+        await toggleLikeMessage(id);
+      } else {
+        lastTapId = id;
+        lastTapAt = now;
+      }
     }
   });
 
@@ -1319,7 +1336,20 @@ function renderStaffChatHtml(
     navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
   }
 
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) void loadMessages();
+  });
+  window.addEventListener('focus', () => {
+    void loadMessages();
+  });
+  window.addEventListener('pageshow', () => {
+    syncMode();
+  });
+
   syncMode();
+  setInterval(() => {
+    void loadMessages();
+  }, 2500);
 </script>
 </body>
 </html>`
@@ -1449,14 +1479,17 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
 function formatPostComments(
     post: StoredPost,
     session: AuthSession | null,
-    _page = 0,
+    page = 0,
 ) {
     const comments: PostComment[] = post.comments ?? []
     const ordered = [...comments].reverse()
+    const pageSize = 10
+    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
+    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
-        pageCount: 1,
-        comments: ordered.map((c) => ({
+        pageCount,
+        comments: slice.map((c) => ({
             name: c.id,
             author: formatAuthorTag(c.author, c.handle),
             time: c.time,
@@ -1530,6 +1563,16 @@ async function remoteLevelItem(
 ): Promise<RemoteLevelItem | null> {
     const details = await remoteLevelDetails(chart)
     return details?.item ?? null
+}
+
+function localizedTitle(value: any): string {
+    if (typeof value === 'string') return value
+    if (value && typeof value === 'object') {
+        if (typeof value.en === 'string') return value.en
+        const first = Object.values(value).find((entry) => typeof entry === 'string')
+        return typeof first === 'string' ? first : ''
+    }
+    return ''
 }
 
 async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
@@ -2099,6 +2142,7 @@ self.addEventListener('fetch', (event) => {
                             title: 'Chat',
                             itemType: 'post',
                             items: [buildChatPostItem(messages, pinnedId)],
+                            searchValues: new URLSearchParams({ category: 'chat' }).toString(),
                         },
                     ],
                 })
@@ -2120,6 +2164,7 @@ self.addEventListener('fetch', (event) => {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         items: posts.map(buildPostItemWithBadges),
+                        searchValues: new URLSearchParams({ category: kind }).toString(),
                     }
                 }),
             )
@@ -2137,6 +2182,7 @@ self.addEventListener('fetch', (event) => {
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
             const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+            const pageSize = 10
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -2179,10 +2225,13 @@ self.addEventListener('fetch', (event) => {
                 })
                 : allCategoryPosts
 
+            const pageCount = Math.max(1, Math.ceil(posts.length / pageSize))
+            const slice = posts.slice(page * pageSize, page * pageSize + pageSize)
+
             return json({
                 title: POST_LABELS[kind].section,
-                pageCount: 1,
-                items: posts.map(buildPostItemWithBadges),
+                pageCount,
+                items: slice.map(buildPostItemWithBadges),
                 searches: [],
             })
         }
