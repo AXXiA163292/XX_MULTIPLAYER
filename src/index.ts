@@ -1,99 +1,132 @@
-{
-  "level": "info",
-  "message": "GET https://xx-multiplayer.axxia163292.workers.dev/sonolus/info?localization=en&fallbackLocalization=en",
-  "$workers": {
-    "truncated": false,
-    "scriptName": "xx-multiplayer",
-    "scriptVersion": {
-      "id": "6716de56-1b23-4193-907f-0bf15e1c6430"
-    },
-    "eventType": "fetch",
-    "executionModel": "stateless",
-    "event": {
-      "request": {
-        "cf": {
-          "httpProtocol": "HTTP/1.1",
-          "clientAcceptEncoding": "gzip, deflate",
-          "requestPriority": "",
-          "requestHeaderNames": [
-            "Host",
-            "User-Agent",
-            "Accept",
-            "Accept-Encoding",
-            "Sonolus-Session",
-            "X-Unity-Version"
-          ],
-          "colo": "CDG",
-          "asOrganization": "Wifirst end users",
-          "country": "FR",
-          "isEUCountry": "1",
-          "city": "Paris",
-          "continent": "EU",
-          "region": "Île-de-France",
-          "regionCode": "IDF",
-          "timezone": "Europe/Paris",
-          "longitude": "2.3488",
-          "latitude": "48.85341",
-          "postalCode": "75000",
-          "tlsVersion": "TLSv1.2",
-          "tlsCipher": "ECDHE-ECDSA-CHACHA20-POLY1305",
-          "tlsClientCiphersSha1": "lJfNA+xYPvq4VT2OeZhqJeQhM00=",
-          "tlsClientExtensionsSha1": "nM0qEoYbvkJO+t7TFVbRS2S6AFo=",
-          "tlsClientExtensionsSha1Le": "/kPFM3yhuCvmPvbXq+lM7eYDJX4=",
-          "tlsClientHelloLength": "354",
-          "verifiedBotCategory": "",
-          "edgeRequestKeepAliveStatus": 1,
-          "clientTcpRtt": 9,
-          "clientQuicRtt": 0,
-          "asn": 52075,
-          "edgeL4": {
-            "deliveryRate": 327601
-          }
-        },
-        "headers": {
-          "accept": "*/*",
-          "accept-encoding": "gzip, br",
-          "cf-connecting-ip": "46.193.57.231",
-          "cf-ipcountry": "FR",
-          "cf-ray": "a5f888da0ad06f0e",
-          "cf-visitor": "{\"scheme\":\"https\"}",
-          "connection": "Keep-Alive",
-          "host": "xx-multiplayer.axxia163292.workers.dev",
-          "sonolus-session": "eyJ1c2VyIjp7ImlkIjoiYjM2NGI0YWIzOWVjNGI5MDg4ZjE5NTliNGE0OGJhYzg3MzIwZWIzNGI5YjZmYTMwYTVmMjM5ZmEyOTJlOWQ2YSIsImhhbmRsZSI6IjE2MzI5MiIsIm5hbWUiOiJBWFghQSJ9LCJleHAiOjE3OTU1ODU5NzIyNjh9.W3mCCgsT_6s_6EwlZ9iVaMloM1W7RZcOSpkS0QfVRc8",
-          "user-agent": "UnityPlayer/6000.0.60f1 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
-          "x-forwarded-proto": "https",
-          "x-real-ip": "46.193.57.231",
-          "x-unity-version": "6000.0.60f1"
-        },
-        "method": "GET",
-        "url": "https://xx-multiplayer.axxia163292.workers.dev/sonolus/info?localization=en&fallbackLocalization=en"
-      },
-      "path": "/sonolus/info",
-      "search": {
-        "localization": "en",
-        "fallbackLocalization": "en"
-      },
-      "response": {
-        "status": 200
-      }
-    },
-    "outcome": "ok",
-    "wallTimeMs": 0,
-    "cpuTimeMs": 0
-  },
-  "$metadata": {
-    "id": "01M86SNH380000000000000002",
-    "requestId": "eb7ba40e64010596be5b2fabe0fc49e7",
-    "rayId": "a5f888da0ad06f0e",
-    "traceId": "07b3bdea2787e1daa223711120481a9a",
-    "trigger": "GET /sonolus/info",
-    "timestampNs": "1795524576360000000",
-    "service": "xx-multiplayer",
-    "level": "info",
-    "message": "GET https://xx-multiplayer.axxia163292.workers.dev/sonolus/info?localization=en&fallbackLocalization=en",
-    "account": "7c44d7baf4b639352a19984e7352e6e9",
-    "type": "cf-worker-event",
-    "origin": "fetch",
-    "eventSize": 3806
-  }
+export type UserProfile = {
+    id: string
+    handle: string
+    name: string
+}
+
+export type AuthSession = {
+    user: UserProfile
+    exp: number
+}
+
+export type JoinSession = {
+    room: string
+    user: UserProfile
+    roomUser: {
+        authentication: string
+        signature: string
+    }
+    exp: number
+}
+
+export type RoomVisibility = 'public' | 'private' | 'locked'
+
+export type MatchMode = 'casual' | 'ranked'
+
+export type RoomStatus = 'selecting' | 'preparing' | 'playing'
+
+export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
+
+export interface Sil {
+    address: string
+    name: string
+}
+
+export type RoomCover = {
+    url: string
+    hash?: string
+}
+
+export interface GameplayResult {
+    grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
+    disqualified?: boolean
+    score?: number
+    accuracy?: number
+    arcadeScore: number
+    accuracyScore: number
+    combo: number
+    perfect: number
+    great: number
+    good: number
+    miss: number
+    totalCount: number
+}
+
+export type LevelItem = {
+    name: string
+    version: 1
+    title: string
+    artists: string
+    author: string
+    rating: number
+    engine: any
+    cover: any
+    bgm: any
+    data: any
+    source?: string
+    tags?: { title: string; icon?: string }[]
+}
+
+export type RoomMember = {
+    index: number
+    user: UserProfile
+    ready: boolean
+    playing: boolean
+    lastResult?: GameplayResult
+    previousResult?: GameplayResult
+    lastPlayCount: number
+    lastPlayLevel?: LevelItem
+    lastPlayAt?: number
+    pp?: number
+    rating?: number
+    wins?: number
+    losses?: number
+    draws?: number
+}
+
+export type ChatMessage = {
+    id: string
+    handle: string
+    author: string
+    text: string
+    time: number
+}
+
+export type RoomSummary = {
+    name: string
+    title: string
+    subtitle: string
+    /** Host display name. Must be text for the Sonolus RoomItem. */
+    master: string
+    hostId?: string
+    visibility: RoomVisibility
+    type?: 'groupStage' | 'final' | 'casualRoom' | 'rankedRoom'
+    tier?: string
+    level?: Sil | null
+    coverUrl?: string | null
+    matchMode?: MatchMode
+    roundCount?: number
+    ratingMin?: number
+    ratingMax?: number
+    grade?: string
+    accuracyMin?: number
+    accuracyMax?: number
+    fullCombo?: boolean
+    allPerfect?: boolean
+}
+
+export type Env = {
+    ROOM: DurableObjectNamespace<import('./room.ts').Room>
+    LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
+    POSTS_BUCKET: R2Bucket
+    COMMUNITY_BUCKET?: R2Bucket
+    SESSION_SECRET: string
+    PUBLIC_ADDRESS?: string
+    DEV_SKIP_SIGNATURE?: string
+    GOOGLE_SHEETS_SPREADSHEET_ID?: string
+    GOOGLE_SHEETS_CUSTOM_RANGE?: string
+    GOOGLE_SHEETS_PLAYLIST_RANGE?: string
+    GOOGLE_SHEETS_API_KEY?: string
+    GOOGLE_SERVICE_ACCOUNT_EMAIL?: string
+    GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string
 }
