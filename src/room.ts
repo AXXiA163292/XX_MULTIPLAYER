@@ -14,7 +14,6 @@ import type {
     RoomMember,
     RoomSettings,
     RoomSummary,
-    RoomVisibility,
     UserProfile,
 } from './types.ts'
 import { verifyToken } from './crypto.ts'
