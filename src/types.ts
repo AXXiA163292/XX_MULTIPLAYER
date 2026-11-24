@@ -32,16 +32,10 @@ export interface Sil {
     name: string
 }
 
-export type RoomCover = {
-    url: string
-    hash?: string
-}
-
 export interface GameplayResult {
     grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
-    disqualified?: boolean
-    score?: number
-    accuracy?: number
+    score: number
+    accuracy: number
     arcadeScore: number
     accuracyScore: number
     combo: number
@@ -98,12 +92,7 @@ export type RoomSummary = {
     subtitle: string
     /** Host display name. Must be text for the Sonolus RoomItem. */
     master: string
-    hostId?: string
     visibility: RoomVisibility
-    type?: 'groupStage' | 'final' | 'casualRoom' | 'rankedRoom'
-    tier?: string
-    level?: Sil | null
-    coverUrl?: string | null
     matchMode?: MatchMode
     roundCount?: number
     ratingMin?: number
