@@ -72,6 +72,78 @@ export type RankedPoolResult = {
     durationMs: number
 }
 
+export async function refreshDailyAssets(
+    env?: Env,
+): Promise<{
+    customLevelsCount: number
+    playlistsCount: number
+    errors: string[]
+}> {
+    const errors: string[] = []
+    let customLevelsCount = 0
+    let playlistsCount = 0
+
+    // Force fresh read from Google Sheets by clearing in-memory cache first
+    memoryCache.delete('custom-levels')
+    memoryCache.delete('playlists')
+    memoryCache.delete('edition-data')
+
+    try {
+        const rows = await customRows()
+
+        const freshCharts = sanitizeCharts(buildCustomLevels(rows))
+        if (freshCharts.length > 0) {
+            writeMemory('custom-levels', freshCharts)
+            customLevelsCount = freshCharts.length
+            if (env?.SONOLUS_ASSETS_BUCKET) {
+                await writeBucketJson(env, R2_LEVEL_LIST_KEY, freshCharts).catch((err) => {
+                    errors.push(`R2 level list write failed: ${err instanceof Error ? err.message : String(err)}`)
+                })
+            }
+        } else {
+            const fallbackCharts = await getCustomLevels(env)
+            customLevelsCount = fallbackCharts.length
+        }
+
+        const freshPlaylists = buildPlaylists(rows)
+        if (freshPlaylists.length > 0) {
+            writeMemory('playlists', freshPlaylists)
+            playlistsCount = freshPlaylists.length
+            if (env?.SONOLUS_ASSETS_BUCKET) {
+                await writeBucketJson(env, R2_PLAYLISTS_KEY, freshPlaylists).catch((err) => {
+                    errors.push(`R2 playlists write failed: ${err instanceof Error ? err.message : String(err)}`)
+                })
+            }
+        } else {
+            const fallbackPlaylists = await getPlaylists(env)
+            playlistsCount = fallbackPlaylists.length
+        }
+
+        const constantsMap = buildConstantsMap(rows)
+        if (Object.keys(constantsMap).length > 0 && env?.SONOLUS_ASSETS_BUCKET) {
+            await writeBucketJson(env, R2_CONSTANTS_KEY, constantsMap).catch((err) => {
+                errors.push(`R2 constants write failed: ${err instanceof Error ? err.message : String(err)}`)
+            })
+        }
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        errors.push(`Sheet refresh failed: ${msg}`)
+
+        const [fallbackCharts, fallbackPlaylists] = await Promise.all([
+            getCustomLevels(env).catch(() => []),
+            getPlaylists(env).catch(() => []),
+        ])
+        customLevelsCount = fallbackCharts.length
+        playlistsCount = fallbackPlaylists.length
+    }
+
+    return {
+        customLevelsCount,
+        playlistsCount,
+        errors,
+    }
+}
+
 type StoredSnapshot<T> = {
     updatedAt: number
     data: T
