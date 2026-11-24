@@ -66,9 +66,11 @@ type LobbyState = {
 
 const MAX_POSTS = 200
 const MAX_CHAT = 200
-const POSTS_INDEX_KEY = 'posts/index.json'
+const CATEGORIES: PostCategory[] = ['announcements', 'posts', 'results']
 const CHAT_INDEX_KEY = 'chat/index.json'
 const MIN_R2_WRITE_INTERVAL_MS = 1100
+
+const categoryIndexKey = (category: PostCategory) => `${category}/index.json`
 
 function normalizeCategory(raw: unknown): PostCategory {
     if (raw === 'announcements' || raw === 'results' || raw === 'posts') {
@@ -77,8 +79,8 @@ function normalizeCategory(raw: unknown): PostCategory {
     return 'posts'
 }
 
-function normalizePost(raw: any): StoredPost {
-    const category = normalizeCategory(raw?.category)
+function normalizePost(raw: any, forcedCategory?: PostCategory): StoredPost {
+    const category = forcedCategory ?? normalizeCategory(raw?.category)
     const item: PostItem = {
         name: String(raw?.item?.name ?? randomId(12)),
         version: 1,
@@ -165,23 +167,35 @@ export class Lobby extends DurableObject<Env> {
         if (!bucket) return null
 
         try {
-            const [postsObj, chatObj] = await Promise.all([
-                bucket.get(POSTS_INDEX_KEY),
+            const [annObj, postsObj, resObj, chatObj] = await Promise.all([
+                bucket.get(categoryIndexKey('announcements')),
+                bucket.get(categoryIndexKey('posts')),
+                bucket.get(categoryIndexKey('results')),
                 bucket.get(CHAT_INDEX_KEY),
             ])
 
-            let posts: StoredPost[] = []
-            let chat: StoredChatMessage[] = []
-            let pinnedChatId: string | null = null
+            const loadedPosts: StoredPost[] = []
+            const seenNames = new Set<string>()
 
-            if (postsObj) {
-                const parsedPosts = await postsObj.json() as { posts?: StoredPost[] }
-                if (Array.isArray(parsedPosts.posts)) {
-                    posts = parsedPosts.posts
-                        .slice(-MAX_POSTS)
-                        .map((post) => normalizePost(post))
+            for (const [category, obj] of [
+                ['announcements', annObj],
+                ['posts', postsObj],
+                ['results', resObj],
+            ] as const) {
+                if (!obj) continue
+                const parsed = await obj.json() as { posts?: StoredPost[] }
+                if (!Array.isArray(parsed.posts)) continue
+                for (const raw of parsed.posts) {
+                    const normalized = normalizePost(raw, category)
+                    if (!seenNames.has(normalized.item.name)) {
+                        seenNames.add(normalized.item.name)
+                        loadedPosts.push(normalized)
+                    }
                 }
             }
+
+            let chat: StoredChatMessage[] = []
+            let pinnedChatId: string | null = null
 
             if (chatObj) {
                 const parsedChat = await chatObj.json() as {
@@ -198,7 +212,13 @@ export class Lobby extends DurableObject<Env> {
                 }
             }
 
-            return { rooms: [], roomEntries: {}, posts, chat, pinnedChatId }
+            return {
+                rooms: [],
+                roomEntries: {},
+                posts: loadedPosts.slice(-MAX_POSTS),
+                chat,
+                pinnedChatId,
+            }
         } catch (error) {
             console.error('Could not load lobby state from R2:', error)
             return null
@@ -214,18 +234,27 @@ export class Lobby extends DurableObject<Env> {
             await new Promise((resolve) => setTimeout(resolve, MIN_R2_WRITE_INTERVAL_MS - elapsed))
         }
 
-        const postsPayload = JSON.stringify({
-            updatedAt: Date.now(),
-            posts: this.st.posts.slice(-MAX_POSTS),
-        })
+        const now = Date.now()
+        const allPosts = this.st.posts.slice(-MAX_POSTS)
 
         try {
-            await bucket.put(POSTS_INDEX_KEY, postsPayload, {
-                httpMetadata: { contentType: 'application/json' },
-            })
+            await Promise.all(
+                CATEGORIES.map((category) => {
+                    const categoryPosts = allPosts.filter((p) => p.category === category)
+                    return bucket.put(
+                        categoryIndexKey(category),
+                        JSON.stringify({
+                            updatedAt: now,
+                            category,
+                            posts: categoryPosts,
+                        }),
+                        { httpMetadata: { contentType: 'application/json' } },
+                    )
+                }),
+            )
             this.lastR2WriteAt = Date.now()
         } catch (error) {
-            console.error('Could not persist lobby state to R2:', error)
+            console.error('Could not persist category posts to R2:', error)
         }
     }
 
