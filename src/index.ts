@@ -146,7 +146,7 @@ function assetsBucket(env: WorkerEnv): R2Bucket | null {
 }
 
 function bucketsForRead(env: WorkerEnv): R2Bucket[] {
-    return [env.COMMUNITY_BUCKET, env.SONOLUS_ASSETS_BUCKET].filter(
+    return [env.SONOLUS_ASSETS_BUCKET, env.COMMUNITY_BUCKET].filter(
         (b): b is R2Bucket => Boolean(b),
     )
 }
@@ -163,6 +163,31 @@ function sanitizeHttpLink(raw?: unknown): string {
         // invalid link
     }
     return ''
+}
+
+async function getBucketObject(
+    bucket: R2Bucket | null,
+    keys: string[],
+): Promise<R2ObjectBody | null> {
+    if (!bucket) return null
+    for (const key of keys) {
+        const obj = await bucket.get(key).catch(() => null)
+        if (obj) return obj
+    }
+    return null
+}
+
+async function getCachedJsonFromAssets<T>(
+    env: WorkerEnv,
+    keys: string[],
+): Promise<T | null> {
+    const obj = await getBucketObject(assetsBucket(env), keys)
+    if (!obj) return null
+    try {
+        return await obj.json() as T
+    } catch {
+        return null
+    }
 }
 
 async function getUserChatPrefs(env: WorkerEnv, handle: string): Promise<UserChatPrefs> {
@@ -470,29 +495,33 @@ function resolveCategory(
 
     const candidates: (string | null | undefined)[] = [
         values?.get('type'),
+        values?.get('infoType'),
+        values?.get('postType'),
+        values?.get('section'),
+        values?.get('category'),
         bodyValueParams?.get('type'),
+        bodyValueParams?.get('infoType'),
+        bodyValueParams?.get('postType'),
+        bodyValueParams?.get('section'),
+        bodyValueParams?.get('category'),
         body?.type,
+        body?.infoType,
+        body?.postType,
+        body?.section,
+        body?.category,
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
         url.searchParams.get('section'),
-        url.searchParams.get('title'),
-        body?.infoType,
-        body?.postType,
-        body?.section,
-        body?.title,
         url.searchParams.get('category'),
-        values?.get('category'),
-        bodyValueParams?.get('category'),
-        body?.category,
         urlSearchParams?.get('category'),
-        bodySearchParams?.get('category'),
         urlSearchParams?.get('infoType'),
-        bodySearchParams?.get('infoType'),
         urlSearchParams?.get('type'),
-        bodySearchParams?.get('type'),
         urlSearchParams?.get('section'),
-        urlSearchParams?.get('title'),
+        bodySearchParams?.get('category'),
+        bodySearchParams?.get('infoType'),
+        bodySearchParams?.get('type'),
+        bodySearchParams?.get('section'),
     ]
 
     for (const c of candidates) {
@@ -691,10 +720,12 @@ function rawPostCategory(url: URL): string | null {
         url.searchParams.get('type'),
         url.searchParams.get('infoType'),
         url.searchParams.get('postType'),
+        url.searchParams.get('section'),
         url.searchParams.get('category'),
         searchParams?.get('category'),
         searchParams?.get('infoType'),
         searchParams?.get('type'),
+        searchParams?.get('section'),
     ]
 
     for (const candidate of candidates) {
@@ -800,18 +831,6 @@ const RANKED_TIERS_UPPER = new Set([
     'DIAMOND',
     'MASTER',
 ])
-
-async function getBucketObject(
-    bucket: R2Bucket | null,
-    keys: string[],
-): Promise<R2ObjectBody | null> {
-    if (!bucket) return null
-    for (const key of keys) {
-        const obj = await bucket.get(key).catch(() => null)
-        if (obj) return obj
-    }
-    return null
-}
 
 async function resolveRoomCover(
     env: WorkerEnv,
@@ -2868,6 +2887,40 @@ async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
     )
 }
 
+async function getCachedLevelItemsForCharts(
+    env: WorkerEnv,
+    charts: SheetChart[],
+): Promise<RemoteLevelItem[] | null> {
+    const cachedList = await getCachedJsonFromAssets<any>(env, [
+        'server/level-list/index.json',
+    ])
+    const rawItems: any[] = Array.isArray(cachedList)
+        ? cachedList
+        : Array.isArray(cachedList?.items)
+            ? cachedList.items
+            : []
+
+    if (!rawItems.length) return null
+
+    const byKey = new Map<string, RemoteLevelItem>()
+    for (const raw of rawItems) {
+        const item = raw?.item ?? raw
+        if (!item || typeof item.name !== 'string') continue
+        byKey.set(item.name, item)
+        if (typeof item.id === 'string' && item.id) {
+            byKey.set(item.id, item)
+        }
+    }
+
+    const matched: RemoteLevelItem[] = []
+    for (const chart of charts) {
+        const hit = byKey.get(chart.name) ?? byKey.get(chart.id)
+        if (!hit) return null
+        matched.push(hit)
+    }
+    return matched
+}
+
 const UNCH_HOST = 'untitledcharts.com'
 
 const isUnch = (chart: SheetChart) => {
@@ -3041,13 +3094,10 @@ self.addEventListener('fetch', (event) => {
         if (path === '/app-icon.png' && req.method === 'GET') {
             const obj =
                 (await getBucketObject(assetsBucket(env), [
-                    'XX!.png',
-                    'chat/XX!.png',
+                    'server/banner.png',
                     'chat/pfp/163292.png',
                 ])) ??
                 (await getBucketObject(communityBucket(env), [
-                    'XX!.png',
-                    'chat/XX!.png',
                     'chat/pfp/163292.png',
                 ]))
             if (!obj) return new Response(null, { status: 404 })
@@ -3061,9 +3111,10 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-            const obj =
-                (await getBucketObject(assetsBucket(env), ['XX!.png'])) ??
-                (await getBucketObject(communityBucket(env), ['XX!.png']))
+            const obj = await getBucketObject(assetsBucket(env), [
+                'server/banner.png',
+                'ranked-match/MASTER/MASTER.png',
+            ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -3082,7 +3133,6 @@ self.addEventListener('fetch', (event) => {
             }
             const obj = await getBucketObject(assetsBucket(env), [
                 `ranked-match/${tierUpper}/${tierUpper}.png`,
-                `${tierUpper}.png`,
             ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
@@ -3126,13 +3176,9 @@ self.addEventListener('fetch', (event) => {
             const keys = [
                 prefs.pfpKey,
                 `chat/pfp/${handle}.png`,
-                `chat/${handle}.png`,
-                `${handle}.png`,
             ].filter((k): k is string => Boolean(k))
 
-            const obj =
-                (await getBucketObject(communityBucket(env), keys)) ??
-                (await getBucketObject(assetsBucket(env), keys))
+            const obj = await getBucketObject(communityBucket(env), keys)
             if (obj) {
                 return new Response(obj.body, {
                     headers: {
@@ -3156,7 +3202,6 @@ self.addEventListener('fetch', (event) => {
             const obj = await getBucketObject(communityBucket(env), [
                 target.imageKey,
                 `chat/media/${mediaId}.png`,
-                `media/${mediaId}.png`,
             ])
             if (!obj) return new Response(null, { status: 404 })
 
@@ -3500,9 +3545,9 @@ self.addEventListener('fetch', (event) => {
             const session = await sessionOf(req, env, url)
             const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
 
-            const bannerObject =
-                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
-                (await getBucketObject(communityBucket(env), ['banner.png']))
+            const bannerObject = await getBucketObject(assetsBucket(env), [
+                'server/banner.png',
+            ])
             let banner: { hash: string; url: string } | undefined
 
             if (bannerObject) {
@@ -3584,9 +3629,9 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object =
-                (await getBucketObject(assetsBucket(env), ['banner.png'])) ??
-                (await getBucketObject(communityBucket(env), ['banner.png']))
+            const object = await getBucketObject(assetsBucket(env), [
+                'server/banner.png',
+            ])
             if (!object) return new Response(null, { status: 404 })
 
             return new Response(object.body, {
@@ -4215,10 +4260,11 @@ self.addEventListener('fetch', (event) => {
         if (path === '/sonolus/levels/info' && req.method === 'GET') {
             try {
                 const { charts, pageCount } = await getCustomLevelPage(0, env)
-                const loaded = await loadLevelItems(charts)
+                const cached = await getCachedLevelItemsForCharts(env, charts)
+                const items = cached ?? (await loadLevelItems(charts)).map((entry) => entry.item)
 
                 console.log(
-                    `[Levels] Info page 0: ${loaded.length}/${charts.length} levels loaded. ${pageCount} pages total.`,
+                    `[Levels] Info page 0: ${items.length}/${charts.length} levels loaded (${cached ? 'R2 cache' : 'live'}). ${pageCount} pages total.`,
                 )
 
                 return json({
@@ -4228,7 +4274,7 @@ self.addEventListener('fetch', (event) => {
                         {
                             title: 'Custom Levels',
                             itemType: 'level',
-                            items: loaded.map((entry) => entry.item),
+                            items,
                         },
                     ],
                 })
@@ -4255,11 +4301,12 @@ self.addEventListener('fetch', (event) => {
                     })
                 }
 
-                const loaded = await loadLevelItems(charts)
+                const cached = await getCachedLevelItemsForCharts(env, charts)
+                const items = cached ?? (await loadLevelItems(charts)).map((entry) => entry.item)
 
                 return json({
                     pageCount,
-                    items: loaded.map((entry) => entry.item),
+                    items,
                     searches: [],
                 })
             } catch (error) {
@@ -4323,14 +4370,42 @@ self.addEventListener('fetch', (event) => {
         }
 
         const makePlaylistItems = async () => {
-            const playlists = await getPlaylists(env)
+            const [playlists, cachedPlaylistsRaw] = await Promise.all([
+                getPlaylists(env),
+                getCachedJsonFromAssets<any>(env, ['server/playlists/index.json']),
+            ])
+
+            const cachedList: any[] = Array.isArray(cachedPlaylistsRaw)
+                ? cachedPlaylistsRaw
+                : Array.isArray(cachedPlaylistsRaw?.items)
+                    ? cachedPlaylistsRaw.items
+                    : []
+
+            const cachedBySlug = new Map<string, any>()
+            for (const entry of cachedList) {
+                const item = entry?.item ?? entry
+                if (item && typeof item.name === 'string') {
+                    cachedBySlug.set(item.name.toLowerCase(), item)
+                }
+            }
 
             return Promise.all(
                 playlists.map(async (playlist) => {
+                    const slug = playlistSlug(playlist.name)
+                    const cachedItem = cachedBySlug.get(slug.toLowerCase())
+                    if (cachedItem && Array.isArray(cachedItem.levels)) {
+                        return {
+                            ...cachedItem,
+                            name: slug,
+                            title: playlist.name,
+                            subtitle: `${cachedItem.levels.length} levels`,
+                        }
+                    }
+
                     const loaded = await loadLevelItems(playlist.charts)
 
                     return {
-                        name: playlistSlug(playlist.name),
+                        name: slug,
                         version: 1 as const,
                         title: playlist.name,
                         subtitle: `${loaded.length} levels`,
@@ -4391,17 +4466,8 @@ self.addEventListener('fetch', (event) => {
 
                 if (!playlist) return new Response(null, { status: 404 })
 
-                const loaded = await loadLevelItems(playlist.charts)
-
-                const item = {
-                    name: playlistSlug(playlist.name),
-                    version: 1 as const,
-                    title: playlist.name,
-                    subtitle: `${loaded.length} levels`,
-                    author: 'XX!',
-                    tags: [],
-                    levels: loaded.map((entry) => entry.item),
-                }
+                const allItems = await makePlaylistItems()
+                const item = allItems.find((entry) => samePlaylist(entry.name, playlistSlug(playlist.name)))
 
                 return json({
                     item,
@@ -4505,10 +4571,20 @@ self.addEventListener('fetch', (event) => {
             const key = req.headers.get('Sonolus-Room-Key')
 
             if (key) {
-                const settings = parseSettings(url.searchParams, undefined, user.name || user.handle)
-                if (!settings) {
+                const params = new URLSearchParams(url.searchParams)
+                const rawSettings = parseSettings(params, undefined, user.name || user.handle)
+                if (!rawSettings) {
                     return new Response(null, { status: 400 })
                 }
+
+                const existingSummary = await stub.summary().catch(() => null)
+                const isAlreadyOpened = Boolean(existingSummary)
+                const settings = rawSettings.type === 'rankedRoom' && isAlreadyOpened
+                    ? {
+                        ...rawSettings,
+                        title: existingSummary?.title || rawSettings.title,
+                    }
+                    : rawSettings
 
                 if (
                     (
