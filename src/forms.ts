@@ -100,7 +100,7 @@ const vocalTypeOption = {
     name: 'Vocal Type',
     required: false,
     type: 'select' as const,
-    def: 'virtualSinger' as RankedVocalType,
+    def: 'sekai' as RankedVocalType,
     values: [
         { name: 'virtualSinger', title: 'VIRTUAL SINGER' },
         { name: 'sekai', title: 'SEKAI' },
@@ -265,7 +265,7 @@ export function parseSettings(
     const customSongs: CustomSongsMode = type === 'rankedRoom'
         ? normalizeCustomSongsMode(p.get('customSongs') ?? existing?.customSongs)
         : 'off'
-        const rawVocalType = (p.get('vocalType') ?? existing?.vocalType ?? 'virtualSinger').trim()
+            const rawVocalType = (p.get('vocalType') ?? existing?.vocalType ?? 'sekai').trim()
     const vocalType: RankedVocalType = rawVocalType === 'sekai' ? 'sekai' : 'virtualSinger'
 
     if (!Object.prototype.hasOwnProperty.call(SCORING_MODES, scoring)) return null
