@@ -1,4 +1,3 @@
-
 import {
     SERVER_DESCRIPTION,
     SERVER_TITLE,
@@ -140,11 +139,11 @@ function communityBucket(env: WorkerEnv): R2Bucket | null {
 }
 
 function assetsBucket(env: WorkerEnv): R2Bucket | null {
-    return env.SONOLUS_ASSETS_BUCKET ?? null
+    return env.SONOLUS_ASSETS_BUCKET ?? env.POSTS_BUCKET ?? null
 }
 
 function bucketsForRead(env: WorkerEnv): R2Bucket[] {
-    return [env.SONOLUS_ASSETS_BUCKET, env.COMMUNITY_BUCKET].filter(
+    return [env.SONOLUS_ASSETS_BUCKET, env.POSTS_BUCKET, env.COMMUNITY_BUCKET].filter(
         (b): b is R2Bucket => Boolean(b),
     )
 }
@@ -3787,14 +3786,34 @@ self.addEventListener('fetch', (event) => {
             return json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
-                banner: {
-                    hash: '',
-                    url: '/sonolus/rooms/cover/xx',
+                buttons: [
+                    { type: 'authentication' },
+                    { type: 'multiplayer' },
+                    {
+                        type: 'post',
+                        title: 'Announcements',
+                        icon: 'announcement',
+                        infoType: 'announcements',
+                    },
+                    {
+                        type: 'post',
+                        title: 'Posts',
+                        icon: 'post',
+                        infoType: 'posts',
+                    },
+                    {
+                        type: 'post',
+                        title: 'Results',
+                        icon: 'award',
+                        infoType: 'results',
+                    },
+                    { type: 'playlist' },
+                    { type: 'level' },
+                    { type: 'configuration' },
+                ],
+                configuration: {
+                    options: [],
                 },
-                rooms: { items: [] },
-                posts: { items: [] },
-                playlists: { items: [] },
-                levels: { items: [] },
             })
         }
 
@@ -3826,10 +3845,6 @@ self.addEventListener('fetch', (event) => {
                         items: await roomItems(env, session),
                     },
                 ],
-                banner: {
-                    hash: '',
-                    url: '/sonolus/rooms/cover/xx',
-                },
             })
         }
 
@@ -4008,10 +4023,6 @@ self.addEventListener('fetch', (event) => {
                     : [],
                 searches: [],
                 sections,
-                banner: {
-                    hash: '',
-                    url: '/sonolus/rooms/cover/xx',
-                },
             })
         }
 
@@ -4341,10 +4352,6 @@ self.addEventListener('fetch', (event) => {
                         })),
                     },
                 ],
-                banner: {
-                    hash: '',
-                    url: '/sonolus/rooms/cover/xx',
-                },
             })
         }
 
@@ -4433,10 +4440,6 @@ self.addEventListener('fetch', (event) => {
                         })),
                     },
                 ],
-                banner: {
-                    hash: '',
-                    url: '/sonolus/rooms/cover/xx',
-                },
                 pageCount,
             })
         }
