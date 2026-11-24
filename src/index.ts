@@ -3198,18 +3198,17 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-            const obj = await getBucketObject(assetsBucket(env), [
-                'XX!.png',
-                'ranked-match/MASTER/MASTER.png',
-            ])
-            if (!obj) return new Response(null, { status: 404 })
-            return new Response(obj.body, {
-                headers: {
-                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': 'public, max-age=3600',
-                },
-            })
+    const obj = await getBucketObject(communityBucket(env), [
+        'chat/XX!.png',
+    ])
+    if (!obj) return new Response(null, { status: 404 })
+    return new Response(obj.body, {
+        headers: {
+            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=3600',
+        },
+    })
         }
 
         const rankedCoverMatch = path.match(/^\/sonolus\/rooms\/cover\/ranked\/([A-Z]+)$/)
