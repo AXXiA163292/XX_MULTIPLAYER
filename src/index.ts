@@ -13,7 +13,7 @@ import {
 } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
 import { parseSettings, roomForms } from './forms.ts'
-import type { AuthSession, ChatMessage, Env, JoinSession, UserProfile } from './types.ts'
+import type { AuthSession, ChatMessage, Env, JoinSession, RoomCover, UserProfile } from './types.ts'
 import type { PostCategory, PostComment, StoredPost } from './lobby.ts'
 
 export { Room } from './room.ts'
@@ -294,19 +294,19 @@ const POST_LABELS: Record<PostCategory, {
 }> = {
     announcements: {
         section: 'Announcements',
-        create: 'Post an announcement',
+        create: 'Create Announcement',
         titlePlaceholder: 'Announcement title',
         bodyPlaceholder: 'Write your announcement...',
     },
     posts: {
         section: 'Posts',
-        create: 'Create post',
+        create: 'Create Post',
         titlePlaceholder: 'Post title',
         bodyPlaceholder: 'Write your post...',
     },
     results: {
         section: 'Results',
-        create: 'Post results',
+        create: 'Publish Results',
         titlePlaceholder: 'Result title',
         bodyPlaceholder: 'Write the results...',
     },
@@ -652,6 +652,95 @@ function escapeAttr(str: string): string {
         .replace(/>/g, '&gt;')
 }
 
+const RANKED_TIERS_UPPER = new Set([
+    'BEGINNER',
+    'BRONZE',
+    'SILVER',
+    'GOLD',
+    'PLATINUM',
+    'DIAMOND',
+    'MASTER',
+])
+
+async function getBucketImage(
+    env: Env,
+    keys: string[],
+): Promise<R2ObjectBody | null> {
+    const buckets = [env.COMMUNITY_BUCKET, env.POSTS_BUCKET].filter(
+        (b): b is R2Bucket => Boolean(b),
+    )
+    for (const key of keys) {
+        for (const bucket of buckets) {
+            const obj = await bucket.get(key).catch(() => null)
+            if (obj) return obj
+        }
+    }
+    return null
+}
+
+async function resolveRoomCover(
+    env: Env,
+    summary: {
+        type?: string
+        tier?: string
+        level?: { address: string; name: string } | null
+        coverUrl?: string | null
+    },
+): Promise<RoomCover | undefined> {
+    const type = summary.type
+
+    if (type === 'casualRoom') {
+        if (summary.coverUrl) {
+            return { url: summary.coverUrl }
+        }
+        if (summary.level?.address && summary.level?.name) {
+            const base = summary.level.address.replace(/\/+$/, '')
+            const endpoint = `${base}/sonolus/levels/${encodeURIComponent(summary.level.name)}`
+            try {
+                const res = await fetch(endpoint, {
+                    headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+                    signal: AbortSignal.timeout(5000),
+                })
+                if (res.ok) {
+                    const data: any = await res.json()
+                    const item = data?.item ?? data
+                    const coverObj = item?.cover
+                    if (coverObj && typeof coverObj.url === 'string' && coverObj.url) {
+                        const fullUrl = coverObj.url.startsWith('/')
+                            ? `${base}${coverObj.url}`
+                            : coverObj.url
+                        return {
+                            url: fullUrl,
+                            ...(typeof coverObj.hash === 'string' && coverObj.hash
+                                ? { hash: coverObj.hash }
+                                : {}),
+                        }
+                    }
+                }
+            } catch {
+                // fallback to undefined if song jacket unavailable
+            }
+        }
+        return undefined
+    }
+
+    if (type === 'rankedRoom') {
+        const tierUpper = String(summary.tier ?? 'master').toUpperCase()
+        const safeTier = RANKED_TIERS_UPPER.has(tierUpper) ? tierUpper : 'MASTER'
+        return {
+            url: `/sonolus/rooms/cover/ranked/${safeTier}`,
+        }
+    }
+
+    if (type === 'groupStage' || type === 'final') {
+        return {
+            url: '/sonolus/rooms/cover/xx',
+        }
+    }
+
+    return undefined
+}
+
 function renderStaffChatHtml(
     user: UserProfile | null,
     sessionToken: string,
@@ -677,68 +766,71 @@ function renderStaffChatHtml(
 <link rel="manifest" href="/manifest.webmanifest"/>
 <link rel="icon" type="image/png" href="/app-icon.png"/>
 <link rel="apple-touch-icon" href="/app-icon.png"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;600;700;800&display=swap" rel="stylesheet"/>
 <title>XX! Chat</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#0d0f14;color:#f3f4f6;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100dvh}
-  header{padding:12px 16px;background:#151922;border-bottom:1px solid #242b3a;font-weight:700;font-size:15px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-  .header-brand{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .app-logo{width:24px;height:24px;border-radius:6px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
-  .header-right{display:flex;align-items:center;gap:8px}
-  .badge{font-size:12px;color:#9ca3af;font-weight:500}
-  .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:4px 9px;font-size:11px;font-weight:600;cursor:pointer}
+  body{background:#0d0f14;color:#f3f4f6;font-family:'Red Hat Display',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;font-size:28px;display:flex;flex-direction:column;height:100dvh}
+  header{padding:24px 32px;background:#151922;border-bottom:2px solid #242b3a;font-weight:700;font-size:30px;display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  .header-brand{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  .app-logo{width:48px;height:48px;border-radius:12px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
+  .header-right{display:flex;align-items:center;gap:16px}
+  .badge{font-size:24px;color:#9ca3af;font-weight:600}
+  .btn-sm{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:16px;padding:10px 18px;font-size:22px;font-weight:700;cursor:pointer;font-family:inherit}
   .btn-sm:hover{border-color:#3b82f6}
   .btn-danger{color:#fca5a5;border-color:rgba(248,113,113,.45)}
-  #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px 16px;gap:18px}
+  #picker{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:48px 32px;gap:36px}
   #picker.open{display:flex}
-  .picker-title{font-size:18px;font-weight:700;text-align:center}
-  .picker-grid{display:grid;grid-template-columns:repeat(3,minmax(92px,130px));gap:14px}
-  .pick-card{background:#151922;border:1px solid #283042;border-radius:14px;padding:12px;display:flex;flex-direction:column;align-items:center;gap:8px;color:#f3f4f6;cursor:pointer}
+  .picker-title{font-size:36px;font-weight:700;text-align:center}
+  .picker-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,260px));gap:28px}
+  .pick-card{background:#151922;border:1px solid #283042;border-radius:28px;padding:24px;display:flex;flex-direction:column;align-items:center;gap:16px;color:#f3f4f6;cursor:pointer;font-family:inherit}
   .pick-card:hover{border-color:#3b82f6;background:#192131}
-  .pick-pfp{width:64px;height:64px;aspect-ratio:1/1;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
-  .pick-name{font-size:13px;font-weight:700;text-align:center}
-  .pick-handle{font-size:11px;color:#9ca3af}
+  .pick-pfp{width:128px;height:128px;aspect-ratio:1/1;border-radius:20px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#0d0f14}
+  .pick-name{font-size:26px;font-weight:700;text-align:center}
+  .pick-handle{font-size:22px;color:#9ca3af}
   #chatView{flex:1;display:none;flex-direction:column;min-height:0}
   #chatView.open{display:flex}
-  #messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
-  .empty-state{color:#9ca3af;font-size:13px;text-align:center;margin:auto}
-  .row{display:flex;align-items:flex-start;gap:8px;max-width:92%;transition:transform .14s ease;touch-action:pan-y}
+  #messages{flex:1;overflow-y:auto;padding:28px 32px;display:flex;flex-direction:column;gap:24px}
+  .empty-state{color:#9ca3af;font-size:26px;text-align:center;margin:auto}
+  .row{display:flex;align-items:flex-start;gap:16px;max-width:94%;transition:transform .14s ease;touch-action:pan-y;cursor:pointer;user-select:none;-webkit-user-select:none}
   .row.me{align-self:flex-end;flex-direction:row-reverse}
   .row:not(.me){align-self:flex-start}
-  .pfp{width:44px;height:44px;min-width:44px;min-height:44px;aspect-ratio:1/1;flex-shrink:0;border-radius:10px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
-  .msg{background:#191e2a;border:1px solid #283042;border-radius:12px;padding:9px 12px;flex:1;min-width:0;user-select:none}
+  .pfp{width:88px;height:88px;min-width:88px;min-height:88px;aspect-ratio:1/1;flex-shrink:0;border-radius:20px;object-fit:cover;image-rendering:pixelated;border:1px solid #283042;background:#151922}
+  .msg{background:#191e2a;border:1px solid #283042;border-radius:24px;padding:18px 24px;flex:1;min-width:0;user-select:none;-webkit-user-select:none}
   .row.me .msg{background:#1d2b45;border-color:#3b82f6}
-  .meta{font-size:11px;color:#9ca3af;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
-  .meta-actions{display:flex;align-items:center;gap:6px}
-  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.3);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .meta{font-size:22px;color:#9ca3af;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .meta-actions{display:flex;align-items:center;gap:12px}
+  .reply-btn{background:transparent;color:#93c5fd;border:1px solid rgba(147,197,253,.35);border-radius:12px;padding:4px 12px;font-size:20px;font-weight:600;cursor:pointer;font-family:inherit}
   .reply-btn:hover{background:rgba(59,130,246,.18)}
-  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:6px;padding:1px 6px;font-size:10px;cursor:pointer}
+  .del-btn{background:transparent;color:#f87171;border:1px solid rgba(248,113,113,.35);border-radius:12px;padding:4px 12px;font-size:20px;font-weight:600;cursor:pointer;font-family:inherit}
   .del-btn:hover{background:rgba(248,113,113,.15)}
-  .reply-quote{font-size:11px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:2px solid #60a5fa;padding:3px 7px;border-radius:4px;margin-bottom:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .text{font-size:14px;line-height:1.4;white-space:pre-wrap;word-break:break-word}
-  .msg-footer{margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:6px}
-  .like-pill{display:inline-flex;align-items:center;gap:4px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:2px 7px;font-size:11px;color:#fda4af}
-  .like-avatars{display:inline-flex;align-items:center;gap:3px}
-  .like-pfp{width:14px;height:14px;aspect-ratio:1/1;border-radius:4px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
-  .reply-banner{display:none;align-items:center;justify-content:space-between;gap:8px;background:#1e293b;border:1px solid #3b82f6;border-radius:8px;padding:6px 10px;font-size:12px;color:#dbeafe}
+  .reply-quote{font-size:22px;color:#cbd5e1;background:rgba(13,15,20,.45);border-left:4px solid #60a5fa;padding:6px 14px;border-radius:8px;margin-bottom:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .text{font-size:28px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+  .msg-footer{margin-top:12px;display:flex;align-items:center;flex-wrap:wrap;gap:12px}
+  .like-pill{display:inline-flex;align-items:center;gap:8px;background:rgba(244,63,94,.12);border:1px solid rgba(244,63,94,.35);border-radius:999px;padding:4px 14px;font-size:22px;color:#fda4af}
+  .like-avatars{display:inline-flex;align-items:center;gap:6px}
+  .like-pfp{width:28px;height:28px;aspect-ratio:1/1;border-radius:8px;object-fit:cover;image-rendering:pixelated;border:1px solid rgba(255,255,255,.2)}
+  .reply-banner{display:none;align-items:center;justify-content:space-between;gap:16px;background:#1e293b;border:1px solid #3b82f6;border-radius:16px;padding:12px 20px;font-size:24px;color:#dbeafe}
   .reply-banner.open{display:flex}
-  .bottom-bar{background:#151922;border-top:1px solid #242b3a;padding:8px 12px 12px;display:flex;flex-direction:column;gap:8px}
-  .shortcuts{display:flex;gap:8px;flex-wrap:wrap}
-  .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;cursor:pointer}
+  .bottom-bar{background:#151922;border-top:2px solid #242b3a;padding:16px 24px 24px;display:flex;flex-direction:column;gap:16px}
+  .shortcuts{display:flex;gap:16px;flex-wrap:wrap}
+  .chip{background:#232938;color:#e5e7eb;border:1px solid #374151;border-radius:999px;padding:10px 24px;font-size:26px;font-weight:600;cursor:pointer;font-family:inherit}
   .chip:active{background:#3b82f6;color:#fff;border-color:#3b82f6}
-  form{display:flex;gap:8px}
-  input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
+  form{display:flex;gap:16px}
+  input{flex:1;background:#0d0f14;color:#fff;border:1px solid #374151;border-radius:20px;padding:20px 24px;font-size:28px;outline:none;font-family:inherit}
   input:focus{border-color:#3b82f6}
-  button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:10px;padding:0 16px;font-weight:700;font-size:14px;cursor:pointer}
-  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:16px;z-index:20}
+  button[type=submit]{background:#3b82f6;color:#fff;border:none;border-radius:20px;padding:0 32px;font-weight:700;font-size:28px;cursor:pointer;font-family:inherit}
+  #settingsModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:32px;z-index:20}
   #settingsModal.open{display:flex}
-  .modal-card{width:100%;max-width:400px;background:#151922;border:1px solid #283042;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px}
-  .modal-title{font-size:16px;font-weight:700}
-  .field-label{font-size:12px;color:#9ca3af;margin-bottom:4px;display:block}
-  .crop-box{position:relative;width:180px;height:180px;margin:6px auto;border-radius:12px;overflow:hidden;border:2px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
+  .modal-card{width:100%;max-width:780px;background:#151922;border:1px solid #283042;border-radius:28px;padding:32px;display:flex;flex-direction:column;gap:24px}
+  .modal-title{font-size:32px;font-weight:700}
+  .field-label{font-size:24px;color:#9ca3af;margin-bottom:8px;display:block}
+  .crop-box{position:relative;width:360px;height:360px;margin:12px auto;border-radius:24px;overflow:hidden;border:4px solid #3b82f6;background:#0d0f14;touch-action:none;cursor:grab}
   .crop-box img{position:absolute;top:0;left:0;transform-origin:top left;user-select:none;-webkit-user-drag:none}
-  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap}
-  .modal-actions-right{display:flex;gap:8px}
+  .modal-actions{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-top:8px;flex-wrap:wrap}
+  .modal-actions-right{display:flex;gap:16px}
 </style>
 </head>
 <body>
@@ -780,7 +872,7 @@ function renderStaffChatHtml(
       <div>
         <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture (R2)</label>
         <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
-        <div id="cropWrap" style="display:none;margin-top:8px">
+        <div id="cropWrap" style="display:none;margin-top:16px">
           <div id="cropBox" class="crop-box">
             <img id="cropImg" alt="Crop preview"/>
           </div>
@@ -897,7 +989,7 @@ function renderStaffChatHtml(
         name: displayNameFor(saved, defaultsMap[saved].name),
       };
     }
-    return null;
+    return null
   }
 
   function authHeaders(extra = {}) {
@@ -1097,7 +1189,7 @@ function renderStaffChatHtml(
 
   function updateCropTransform() {
     if (!cropState.loaded) return;
-    const boxSize = 180;
+    const boxSize = 360;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
     const scaledW = cropState.imgW * totalScale;
@@ -1117,8 +1209,8 @@ function renderStaffChatHtml(
       cropImg.onload = () => {
         cropState = {
           loaded: true,
-          imgW: cropImg.naturalWidth || 180,
-          imgH: cropImg.naturalHeight || 180,
+          imgW: cropImg.naturalWidth || 360,
+          imgH: cropImg.naturalHeight || 360,
           scale: Number(zoomRange.value) || 1,
           x: 0,
           y: 0,
@@ -1163,7 +1255,7 @@ function renderStaffChatHtml(
   async function buildCroppedSquareDataUrl() {
     if (!cropState.loaded) return null;
     const outSize = 512;
-    const boxSize = 180;
+    const boxSize = 360;
     const baseScale = Math.max(boxSize / cropState.imgW, boxSize / cropState.imgH);
     const totalScale = baseScale * cropState.scale;
     const sx = Math.max(0, (-cropState.x) / totalScale);
@@ -1233,6 +1325,7 @@ function renderStaffChatHtml(
   let swipeDeltaX = 0;
   let lastTapId = '';
   let lastTapAt = 0;
+  let suppressNextClickId = '';
 
   box.addEventListener('touchstart', (e) => {
     const row = e.target.closest('[data-row-id]');
@@ -1246,7 +1339,7 @@ function renderStaffChatHtml(
     if (!swipeRow || e.touches.length !== 1) return;
     const dx = e.touches[0].clientX - swipeStartX;
     if (dx > 0) {
-      swipeDeltaX = Math.min(80, dx);
+      swipeDeltaX = Math.min(120, dx);
       swipeRow.style.transform = 'translateX(' + swipeDeltaX + 'px)';
     }
   }, { passive: true });
@@ -1255,20 +1348,39 @@ function renderStaffChatHtml(
     if (!swipeRow) return;
     const rowId = swipeRow.getAttribute('data-row-id') || '';
     swipeRow.style.transform = '';
-    const triggered = swipeDeltaX >= 48;
+    const triggered = swipeDeltaX >= 64;
     swipeRow = null;
     swipeDeltaX = 0;
     if (triggered && rowId) {
+      suppressNextClickId = rowId;
       const target = currentMessages.find((m) => m.id === rowId);
       if (target) setReplyTarget(target);
+      return;
+    }
+    if (rowId) {
+      const now = Date.now();
+      if (rowId === lastTapId && now - lastTapAt < 420) {
+        lastTapId = '';
+        lastTapAt = 0;
+        suppressNextClickId = rowId;
+        void toggleLikeMessage(rowId);
+      } else {
+        lastTapId = rowId;
+        lastTapAt = now;
+      }
     }
   });
 
   box.addEventListener('dblclick', async (e) => {
-    const msgEl = e.target.closest('[data-msg-id]');
-    if (!msgEl) return;
-    const id = msgEl.getAttribute('data-msg-id');
-    if (id) await toggleLikeMessage(id);
+    if (e.target.closest('button')) return;
+    const rowEl = e.target.closest('[data-row-id]');
+    if (!rowEl) return;
+    const id = rowEl.getAttribute('data-row-id');
+    if (id) {
+      lastTapId = '';
+      lastTapAt = 0;
+      await toggleLikeMessage(id);
+    }
   });
 
   box.addEventListener('click', async (e) => {
@@ -1296,17 +1408,11 @@ function renderStaffChatHtml(
       return;
     }
 
-    const msgEl = e.target.closest('[data-msg-id]');
-    if (msgEl) {
-      const id = msgEl.getAttribute('data-msg-id') || '';
-      const now = Date.now();
-      if (id && id === lastTapId && now - lastTapAt < 320) {
-        lastTapId = '';
-        lastTapAt = 0;
-        await toggleLikeMessage(id);
-      } else {
-        lastTapId = id;
-        lastTapAt = now;
+    const rowEl = e.target.closest('[data-row-id]');
+    if (rowEl) {
+      const id = rowEl.getAttribute('data-row-id') || '';
+      if (suppressNextClickId === id) {
+        suppressNextClickId = '';
       }
     }
   });
@@ -1369,11 +1475,14 @@ async function roomItems(env: Env, _session: AuthSession | null) {
 
             if (current.visibility === 'private') return null
 
+            const cover = await resolveRoomCover(env, current)
+
             return {
                 name: current.name,
                 title: current.title,
                 subtitle: current.subtitle,
                 master: current.master,
+                ...(cover ? { cover } : {}),
                 tags: [],
             }
         }),
@@ -1395,7 +1504,7 @@ function postForm(category: PostCategory) {
         requireConfirmation: false,
         options: [
             {
-                name: 'title',
+                name: 'Title',
                 query: 'title',
                 required: false,
                 type: 'text',
@@ -1405,7 +1514,7 @@ function postForm(category: PostCategory) {
                 shortcuts: [],
             },
             {
-                name: 'description',
+                name: 'Description',
                 query: 'description',
                 required: false,
                 type: 'textArea',
@@ -1415,7 +1524,7 @@ function postForm(category: PostCategory) {
                 shortcuts: [],
             },
             {
-                name: 'thumbnail',
+                name: 'Thumbnail',
                 query: 'thumbnail',
                 description: 'Optional image.',
                 required: false,
@@ -1563,16 +1672,6 @@ async function remoteLevelItem(
 ): Promise<RemoteLevelItem | null> {
     const details = await remoteLevelDetails(chart)
     return details?.item ?? null
-}
-
-function localizedTitle(value: any): string {
-    if (typeof value === 'string') return value
-    if (value && typeof value === 'object') {
-        if (typeof value.en === 'string') return value.en
-        const first = Object.values(value).find((entry) => typeof entry === 'string')
-        return typeof first === 'string' ? first : ''
-    }
-    return ''
 }
 
 async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
@@ -1772,25 +1871,56 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/app-icon.png' && req.method === 'GET') {
-            if (!env.COMMUNITY_BUCKET) {
+            const obj = await getBucketImage(env, [
+                'chat/XX!.png',
+                'XX!.png',
+                'chat/pfp/163292.png',
+                'chat/163292.png',
+            ])
+            if (!obj) return new Response(null, { status: 404 })
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
+        if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
+            const obj = await getBucketImage(env, [
+                'XX!.png',
+                'sonolus-assets/XX!.png',
+                'chat/XX!.png',
+            ])
+            if (!obj) return new Response(null, { status: 404 })
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
+        }
+
+        const rankedCoverMatch = path.match(/^\/sonolus\/rooms\/cover\/ranked\/([A-Z]+)$/)
+        if (rankedCoverMatch && req.method === 'GET') {
+            const tierUpper = rankedCoverMatch[1]!
+            if (!RANKED_TIERS_UPPER.has(tierUpper)) {
                 return new Response(null, { status: 404 })
             }
-
-            const keys = ['chat/XX!.png', 'chat/pfp/163292.png', 'chat/163292.png']
-            for (const key of keys) {
-                const obj = await env.COMMUNITY_BUCKET.get(key).catch(() => null)
-                if (obj) {
-                    return new Response(obj.body, {
-                        headers: {
-                            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-                            'Access-Control-Allow-Origin': '*',
-                            'Cache-Control': 'public, max-age=3600',
-                        },
-                    })
-                }
-            }
-
-            return new Response(null, { status: 404 })
+            const obj = await getBucketImage(env, [
+                `sonolus-assets/ranked-match/${tierUpper}/${tierUpper}.png`,
+                `ranked-match/${tierUpper}/${tierUpper}.png`,
+            ])
+            if (!obj) return new Response(null, { status: 404 })
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
         }
 
         if (path === '/refresh' || path === '/admin/refresh') {
@@ -2142,7 +2272,6 @@ self.addEventListener('fetch', (event) => {
                             title: 'Chat',
                             itemType: 'post',
                             items: [buildChatPostItem(messages, pinnedId)],
-                            searchValues: new URLSearchParams({ category: 'chat' }).toString(),
                         },
                     ],
                 })
@@ -2164,7 +2293,6 @@ self.addEventListener('fetch', (event) => {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         items: posts.map(buildPostItemWithBadges),
-                        searchValues: new URLSearchParams({ category: kind }).toString(),
                     }
                 }),
             )
@@ -2561,8 +2689,10 @@ self.addEventListener('fetch', (event) => {
             }
 
             await Promise.all([
+                env.POSTS_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
                 env.POSTS_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
                 env.COMMUNITY_BUCKET?.delete(`${post.category}/${postName}/thumbnail`) ?? Promise.resolve(),
+                env.COMMUNITY_BUCKET?.delete(`posts/${postName}/thumbnail`) ?? Promise.resolve(),
                 lobby(env).removePost(postName),
             ])
 
@@ -2655,11 +2785,11 @@ self.addEventListener('fetch', (event) => {
                 return message(400, 'Image hash does not match.')
             }
 
-            await env.POSTS_BUCKET.put(
-                `posts/${post.item.name}/thumbnail`,
-                bytes,
-                { httpMetadata: { contentType } },
-            )
+            const targetBucket = env.COMMUNITY_BUCKET ?? env.POSTS_BUCKET
+            const objectKey = `${post.category}/${post.item.name}/thumbnail`
+            await targetBucket.put(objectKey, bytes, {
+                httpMetadata: { contentType },
+            })
 
             await lobby(env).setPostThumbnail(
                 post.item.name,
@@ -2675,12 +2805,14 @@ self.addEventListener('fetch', (event) => {
         if (thumbnailPath && req.method === 'GET') {
             const name = thumbnailPath[1]!
             const post = await lobby(env).getPost(name).catch(() => null)
+            const cat = post?.category ?? 'posts'
 
-            const object =
-                (await env.POSTS_BUCKET?.get(`posts/${name}/thumbnail`).catch(() => null)) ??
-                (post && env.COMMUNITY_BUCKET
-                    ? await env.COMMUNITY_BUCKET.get(`${post.category}/${name}/thumbnail`).catch(() => null)
-                    : null)
+            const object = await getBucketImage(env, [
+                `${cat}/${name}/thumbnail`,
+                `posts/${name}/thumbnail`,
+                `announcements/${name}/thumbnail`,
+                `results/${name}/thumbnail`,
+            ])
 
             if (!object) return new Response(null, { status: 404 })
 
@@ -2983,15 +3115,18 @@ self.addEventListener('fetch', (event) => {
         const roomPath = path.match(/^\/sonolus\/rooms\/([\w-]+)$/)
 
         if (roomPath && req.method === 'GET') {
-            const item = await roomStub(env, roomPath[1]!).summary()
-            if (!item) return new Response(null, { status: 404 })
+            const current = await roomStub(env, roomPath[1]!).summary()
+            if (!current) return new Response(null, { status: 404 })
+
+            const cover = await resolveRoomCover(env, current)
 
             return json({
                 item: {
-                    name: item.name,
-                    title: item.title,
-                    subtitle: item.subtitle,
-                    master: item.master,
+                    name: current.name,
+                    title: current.title,
+                    subtitle: current.subtitle,
+                    master: current.master,
+                    ...(cover ? { cover } : {}),
                     tags: [],
                 },
                 actions: [],
