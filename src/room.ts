@@ -716,7 +716,88 @@ export class Room extends DurableObject {
             if (!text) return
 
             const entry = {
-                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, author: member.user.name \vert{}\vert{} member.user.handle, handle: member.user.handle, text, time: Date.now(), }  this.state.chat.push(entry) this.state.chat = this.state.chat.slice(-100) await this.save() this.broadcast({ type: 'chat', message: entry }) } }  private async dropSocket(ws: WebSocket): Promise<void> { const att = ws.deserializeAttachment() as ConnectionMeta \vert{} null if (!att \vert{}\vert{} !this.state) return  const remainingForIndex = this.ctx .getWebSockets() .filter((s) => s !== ws) .some((s) => (s.deserializeAttachment() as ConnectionMeta \vert{} null)?.index === att.index)  if (remainingForIndex) return  const member = this.state.members.find((m) => m.index === att.index) if (member) { if (member.playing && !member.lastResult) { member.lastResult = normalizeResult({ score: 0, accuracy: 0, combo: 0, perfect: 0, great: 0, good: 0, miss: 0, grade: 'X', }) } member.playing = false member.ready = false }  this.state.members = this.state.members.filter((m) => m.index !== att.index)  if (this.state.members.length === 0) { this.clearRoundTimer() } else if (this.state.members.every((m) => !m.playing) && this.roundTimer !== null) { await this.finishRound('allFinished') return }  await this.save() await this.syncLobby() this.broadcastRoomState() }  async webSocketClose(ws: WebSocket): Promise<void> { await this.dropSocket(ws) }  async webSocketError(ws: WebSocket): Promise<void> { await this.dropSocket(ws) }  async fetch(req: Request): Promise<Response> { if (!this.state) { return new Response('Room not found', { status: 404 }) }  const joinHeader = req.headers.get('x-join') let join: JoinSession \vert{} null = null  if (joinHeader) { try { join = JSON.parse(decodeURIComponent(joinHeader)) } catch { join = null } }  if (!join) { const url = new URL(req.url)
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                author: member.user.name || member.user.handle,
+                handle: member.user.handle,
+                text,
+                time: Date.now(),
+            }
+            this.state.chat.push(entry)
+            this.state.chat = this.state.chat.slice(-100)
+            await this.save()
+            this.broadcast({ type: 'chat', message: entry })
+        }
+    }
+
+    private async dropSocket(ws: WebSocket): Promise<void> {
+        const att = ws.deserializeAttachment() as ConnectionMeta | null
+        if (!att || !this.state) return
+
+        const remainingForIndex = this.ctx
+            .getWebSockets()
+            .filter((s) => s !== ws)
+            .some((s) => (s.deserializeAttachment() as ConnectionMeta | null)?.index === att.index)
+
+        if (remainingForIndex) return
+
+        const member = this.state.members.find((m) => m.index === att.index)
+        if (member) {
+            if (member.playing && !member.lastResult) {
+                member.lastResult = normalizeResult({
+                    score: 0,
+                    accuracy: 0,
+                    combo: 0,
+                    perfect: 0,
+                    great: 0,
+                    good: 0,
+                    miss: 0,
+                    grade: 'X',
+                })
+            }
+            member.playing = false
+            member.ready = false
+        }
+
+        this.state.members = this.state.members.filter((m) => m.index !== att.index)
+
+        if (this.state.members.length === 0) {
+            this.clearRoundTimer()
+        } else if (this.state.members.every((m) => !m.playing) && this.roundTimer !== null) {
+            await this.finishRound('allFinished')
+            return
+        }
+
+        await this.save()
+        await this.syncLobby()
+        this.broadcastRoomState()
+    }
+
+    async webSocketClose(ws: WebSocket): Promise<void> {
+        await this.dropSocket(ws)
+    }
+
+    async webSocketError(ws: WebSocket): Promise<void> {
+        await this.dropSocket(ws)
+    }
+
+    async fetch(req: Request): Promise<Response> {
+        if (!this.state) {
+            return new Response('Room not found', { status: 404 })
+        }
+
+        const joinHeader = req.headers.get('x-join')
+        let join: JoinSession | null = null
+
+        if (joinHeader) {
+            try {
+                join = JSON.parse(decodeURIComponent(joinHeader))
+            } catch {
+                join = null
+            }
+        }
+
+        if (!join) {
+            const url = new URL(req.url)
             const token =
                 req.headers.get('Sonolus-Room-Session') ??
                 url.searchParams.get('session')
