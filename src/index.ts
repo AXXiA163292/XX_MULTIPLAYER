@@ -59,10 +59,7 @@ type ChatMediaItem = {
     authorHandle: string
 }
 
-type WorkerEnv = Env & {
-    COMMUNITY_BUCKET?: R2Bucket
-    SONOLUS_ASSETS_BUCKET?: R2Bucket
-}
+type WorkerEnv = Env
 
 const json = (data: unknown, status = 200) =>
     new Response(JSON.stringify(data), {
@@ -237,16 +234,22 @@ async function saveUserChatPrefs(
     env: WorkerEnv,
     handle: string,
     displayName: string,
-    pfpKey?: string,
+    pfpKey?: string | null,
     notifyEmail?: string,
     emailNotifyMode?: EmailNotifyMode,
 ): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
     const current = await getUserChatPrefs(env, clean)
+    const nextPfpKey = pfpKey === null
+        ? undefined
+        : pfpKey !== undefined
+            ? pfpKey
+            : current.pfpKey
+
     const next: UserChatPrefs = {
         handle: clean,
         displayName: String(displayName ?? '').trim().slice(0, 40) || current.displayName,
-        pfpKey: pfpKey ?? current.pfpKey,
+        ...(nextPfpKey ? { pfpKey: nextPfpKey } : {}),
         notifyEmail: notifyEmail !== undefined ? notifyEmail.trim().slice(0, 120) : (current.notifyEmail ?? ''),
         emailNotifyMode: emailNotifyMode ?? current.emailNotifyMode ?? 'mention',
         updatedAt: Date.now(),
@@ -1585,6 +1588,19 @@ function renderStaffChatHtml(
   .modal-title{font-size:17px;text-transform:uppercase;letter-spacing:.03em}
   .modal-body{padding:18px 20px 20px;display:flex;flex-direction:column;gap:14px}
   .field-label{font-size:13px;font-weight:700;color:var(--plum-dark);margin-bottom:6px;display:block}
+  .field-row-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}
+  .subtle-link-btn{
+    background:none;
+    border:none;
+    padding:0;
+    font-size:11.5px;
+    font-weight:700;
+    color:var(--muted);
+    cursor:pointer;
+    text-decoration:underline;
+    font-family:inherit;
+  }
+  .subtle-link-btn:hover{color:#BE123C}
   .mode-row{
     display:grid;
     grid-template-columns:1fr 1fr;
@@ -1767,7 +1783,10 @@ function renderStaffChatHtml(
           <a id="openSonolusBtn" class="btn-sm" href="${escapeAttr(sonolusUrl)}">Open on Sonolus</a>
         </div>
         <div>
-          <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture</label>
+          <div class="field-row-top">
+            <label class="field-label" for="pfpFileInput" style="margin-bottom:0">Square 1:1 Profile Picture</label>
+            <button id="removePfpBtn" type="button" class="subtle-link-btn">Remove picture</button>
+          </div>
           <input id="pfpFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
           <div id="cropWrap" style="display:none;margin-top:10px">
             <div id="cropBox" class="crop-box">
@@ -1822,6 +1841,7 @@ function renderStaffChatHtml(
 
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
+  const removePfpBtn = document.getElementById('removePfpBtn');
   const logoutBtn = document.getElementById('logoutBtn');
   const saveSettingsBtn = document.getElementById('saveSettingsBtn');
   const settingsStatusEl = document.getElementById('settingsStatus');
@@ -2496,6 +2516,40 @@ function renderStaffChatHtml(
     settingsModal.classList.remove('open');
   });
 
+  removePfpBtn.addEventListener('click', async () => {
+    const active = getActiveUser();
+    if (!active) return;
+    settingsStatusEl.textContent = 'Removing picture...';
+    removePfpBtn.disabled = true;
+    try {
+      const res = await fetch('/api/chat/settings', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          handle: active.handle,
+          displayName: displayNameInput.value.trim() || active.name,
+          notifyEmail: notifyEmailInput.value.trim(),
+          emailNotifyMode: selectedNotifyMode,
+          removePfp: true,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        settingsStatusEl.textContent = data.message || 'Could not remove picture.';
+        return;
+      }
+      if (data.prefs) prefsMap[active.handle] = data.prefs;
+      pfpFileInput.value = '';
+      cropWrap.style.display = 'none';
+      cropState.loaded = false;
+      settingsStatusEl.textContent = 'Picture removed.';
+      render(currentMessages, true);
+    } finally {
+      removePfpBtn.disabled = false;
+    }
+  });
+
   saveSettingsBtn.addEventListener('click', async () => {
     const active = getActiveUser();
     if (!active) {
@@ -2838,6 +2892,15 @@ function makePinPostForm(pinned: boolean) {
     }
 }
 
+const removeThumbnailForm = {
+    name: 'Remove Image',
+    type: 'removeThumbnail',
+    title: 'Remove Image',
+    icon: 'delete',
+    requireConfirmation: true,
+    options: [],
+}
+
 const deletePostForm = {
     name: 'Delete',
     type: 'deletePost',
@@ -2854,7 +2917,11 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
         makeLikePostForm(liked),
     ]
     if (canManagePosts(session)) {
-        actions.push(makeEditPostForm(post), makePinPostForm(pinned), deletePostForm)
+        actions.push(makeEditPostForm(post), makePinPostForm(pinned))
+        if (post.item?.thumbnail || post.thumbnailHash) {
+            actions.push(removeThumbnailForm)
+        }
+        actions.push(deletePostForm)
     }
     return actions
 }
@@ -3337,8 +3404,13 @@ self.addEventListener('fetch', (event) => {
                 const mime = match[1]!
                 const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
                 const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
-                if (rawBytes.byteLength > 8 * 1024 * 1024) {
-                    return message(400, 'Media image too large.')
+                if (rawBytes.byteLength === 0 || rawBytes.byteLength > 8_000_000) {
+                    return message(400, 'Image must be between 1B and 8MB.')
+                }
+
+                const dims = getImageDimensions(rawBytes, mime)
+                if (!dims || dims.width <= 0 || dims.height <= 0) {
+                    return message(400, 'Could not read image dimensions.')
                 }
 
                 const bucket = communityBucket(env)
@@ -3346,51 +3418,64 @@ self.addEventListener('fetch', (event) => {
                     return message(500, 'COMMUNITY_BUCKET is not configured.')
                 }
 
-                const id = randomId(12)
+                const id = randomId()
                 const imageKey = `chat/media/${id}.${ext}`
                 await bucket.put(imageKey, rawBytes, {
                     httpMetadata: { contentType: mime },
                 })
 
-                const safeLink = sanitizeHttpLink(body?.link)
-                const safeCaption = typeof body?.caption === 'string'
+                const link = sanitizeHttpLink(body?.link)
+                const caption = typeof body?.caption === 'string'
                     ? body.caption.trim().slice(0, 160)
                     : ''
 
                 const existing = await listChatMedia(env)
-                const nextItem: ChatMediaItem = {
-                    id,
-                    imageKey,
-                    contentType: mime,
-                    ...(safeLink ? { link: safeLink } : {}),
-                    ...(safeCaption ? { caption: safeCaption } : {}),
-                    createdAt: Date.now(),
-                    authorHandle: resolved.user.handle,
-                }
-                const updated = [nextItem, ...existing]
-                await saveChatMediaIndex(env, updated)
-                return json({ ok: true, item: nextItem, items: updated })
+                const nextItems: ChatMediaItem[] = [
+                    {
+                        id,
+                        imageKey,
+                        contentType: mime,
+                        ...(link ? { link } : {}),
+                        ...(caption ? { caption } : {}),
+                        createdAt: Date.now(),
+                        authorHandle: MEDIA_ADMIN_HANDLE,
+                    },
+                    ...existing,
+                ]
+                await saveChatMediaIndex(env, nextItems)
+
+                return json({ items: nextItems })
             }
 
             if (req.method === 'DELETE') {
                 if (!isMediaAdminHandle(resolved.user.handle)) {
-                    return message(403, 'Only 163292 can delete media.')
+                    return message(403, 'Only 163292 can remove media.')
                 }
-                const id = (url.searchParams.get('id') ?? '').trim()
-                if (!id) return message(400, 'Missing media id.')
+                const mediaId = String(url.searchParams.get('id') ?? '').trim()
+                if (!mediaId) return message(400, 'Missing media id.')
 
                 const existing = await listChatMedia(env)
-                const target = existing.find((m) => m.id === id)
-                if (!target) return message(404, 'Media item not found.')
+                const target = existing.find((m) => m.id === mediaId)
+                const nextItems = existing.filter((m) => m.id !== mediaId)
+                await saveChatMediaIndex(env, nextItems)
 
                 const bucket = communityBucket(env)
                 if (bucket) {
-                    await bucket.delete(target.imageKey).catch(() => {})
+                    const keysToDelete = new Set<string>([
+                        `chat/media/${mediaId}.png`,
+                        `chat/media/${mediaId}.jpg`,
+                        `chat/media/${mediaId}.webp`,
+                    ])
+                    if (target?.imageKey) keysToDelete.add(target.imageKey)
+                    for (const k of keysToDelete) {
+                        await bucket.delete(k).catch(() => {})
+                    }
                 }
-                const updated = existing.filter((m) => m.id !== id)
-                await saveChatMediaIndex(env, updated)
-                return json({ ok: true, items: updated })
+
+                return json({ items: nextItems })
             }
+
+            return message(405, 'Method not allowed.')
         }
 
         if (path === '/api/chat/auth' && req.method === 'POST') {
@@ -3400,14 +3485,17 @@ self.addEventListener('fetch', (event) => {
             } catch {
                 return message(400, 'Invalid JSON.')
             }
+
             const handle = String(body?.handle ?? '').trim()
             if (!requiresProfilePassword(handle)) {
-                return json({ ok: true })
+                return json({ ok: true, handle })
             }
+
             if (!matchesSessionSecretPassword(env, body?.password)) {
                 return message(401, 'Invalid password.')
             }
-            return json({ ok: true })
+
+            return json({ ok: true, handle })
         }
 
         if (path === '/api/chat/settings' && req.method === 'POST') {
@@ -3423,31 +3511,8 @@ self.addEventListener('fetch', (event) => {
                 return message(403, 'Choose a valid handle to update settings.')
             }
 
-            const bucket = communityBucket(env)
-            if (!bucket) {
-                return message(500, 'COMMUNITY_BUCKET is not configured.')
-            }
-
-            const handle = resolved.user.handle
-            let pfpKey: string | undefined
-
-            if (typeof body?.pfpDataUrl === 'string' && body.pfpDataUrl.startsWith('data:image/')) {
-                const match = body.pfpDataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
-                if (!match) {
-                    return message(400, 'Invalid image data.')
-                }
-                const mime = match[1]!
-                const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
-                if (rawBytes.byteLength > 2 * 1024 * 1024) {
-                    return message(400, 'Profile image too large.')
-                }
-                pfpKey = `chat/pfp/${handle}.png`
-                await bucket.put(pfpKey, rawBytes, {
-                    httpMetadata: { contentType: mime },
-                })
-            }
-
-            const nextDisplayName = typeof body?.displayName === 'string' && body.displayName.trim()
+            const removePfp = body?.removePfp === true || body?.removePfp === 'true'
+            const displayName = typeof body?.displayName === 'string' && body.displayName.trim()
                 ? body.displayName.trim().slice(0, 40)
                 : resolved.user.name
 
@@ -3460,52 +3525,102 @@ self.addEventListener('fetch', (event) => {
                     ? body.emailNotifyMode
                     : undefined
 
-            const savedPrefs = await saveUserChatPrefs(
+            const currentPrefs = await getUserChatPrefs(env, resolved.user.handle)
+            let pfpKey: string | null | undefined = undefined
+
+            if (removePfp) {
+                const bucket = communityBucket(env)
+                if (bucket) {
+                    const keysToRemove = new Set<string>([
+                        `chat/pfp/${resolved.user.handle}.png`,
+                    ])
+                    if (currentPrefs.pfpKey) keysToRemove.add(currentPrefs.pfpKey)
+                    for (const key of keysToRemove) {
+                        await bucket.delete(key).catch(() => {})
+                    }
+                }
+                pfpKey = null
+            } else {
+                const dataUrl = typeof body?.pfpDataUrl === 'string' ? body.pfpDataUrl : ''
+                if (dataUrl) {
+                    const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
+                    if (!match) {
+                        return message(400, 'Invalid image data.')
+                    }
+
+                    const mime = match[1]!
+                    const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
+                    if (rawBytes.byteLength === 0 || rawBytes.byteLength > 2_500_000) {
+                        return message(400, 'Image size must be between 1B and 2.5MB.')
+                    }
+
+                    const dims = getImageDimensions(rawBytes, mime)
+                    if (!dims || dims.width <= 0 || dims.height <= 0 || dims.width !== dims.height) {
+                        return message(400, 'Profile picture must have a 1:1 square aspect ratio.')
+                    }
+
+                    const bucket = communityBucket(env)
+                    if (!bucket) {
+                        return message(500, 'COMMUNITY_BUCKET is not configured.')
+                    }
+
+                    pfpKey = `chat/pfp/${resolved.user.handle}.png`
+                    await bucket.put(pfpKey, rawBytes, {
+                        httpMetadata: { contentType: 'image/png' },
+                    })
+                }
+            }
+
+            const updated = await saveUserChatPrefs(
                 env,
-                handle,
-                nextDisplayName,
+                resolved.user.handle,
+                displayName,
                 pfpKey,
                 notifyEmail,
                 emailNotifyMode,
             )
-            return json({ ok: true, prefs: savedPrefs })
+
+            return json({
+                ok: true,
+                prefs: updated,
+            })
         }
 
-        if (path === '/ws/chat' && req.headers.get('Upgrade') === 'websocket') {
+        if (path === '/chat' || path === '/staff-chat') {
             const resolved = await resolveChatUser(req, env, url)
-            if (!resolved) {
-                return new Response('Unauthorized', { status: 401 })
-            }
-            return chatStub(env).fetch(req)
-        }
-
-        if (path === '/chat' && req.method === 'GET') {
-            const [prefsEntries, initialMessages, initialMedia] = await Promise.all([
-                Promise.all(
-                    CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
-                ),
-                chatStub(env).listMessages().catch(() => []),
+            const prefsEntries = await Promise.all(
+                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
+            )
+            const prefsMap = Object.fromEntries(prefsEntries) as Record<string, UserChatPrefs>
+            const [initialMessages, initialMedia] = await Promise.all([
+                chatStub(env).list().catch(() => []),
                 listChatMedia(env).catch(() => []),
             ])
-            const prefsMap = Object.fromEntries(prefsEntries)
-            const resolved = await resolveChatUser(req, env, url)
-            const sUrl = sonolusChatLinkUrl(req, env)
-            if (resolved) {
-                return html(
-                    renderStaffChatHtml(
-                        resolved.user,
-                        resolved.token,
-                        resolved.fromSonolus,
-                        prefsMap,
-                        sUrl,
-                        initialMessages,
-                        initialMedia,
-                    ),
-                )
+
+            return html(renderStaffChatHtml(
+                resolved?.user ?? null,
+                resolved?.token ?? '',
+                resolved?.fromSonolus ?? false,
+                prefsMap,
+                sonolusChatLinkUrl(req, env),
+                initialMessages,
+                initialMedia,
+            ))
+        }
+
+        if (path === '/ws/chat') {
+            if (req.headers.get('Upgrade') !== 'websocket') {
+                return new Response('Expected WebSocket', { status: 426 })
             }
-            return html(
-                renderStaffChatHtml(null, '', false, prefsMap, sUrl, initialMessages, initialMedia),
-            )
+
+            const resolved = await resolveChatUser(req, env, url)
+            if (!resolved) {
+                return new Response('Forbidden', { status: 403 })
+            }
+
+            const headers = new Headers(req.headers)
+            headers.set('x-chat-user', encodeURIComponent(JSON.stringify(resolved.user)))
+            return chatStub(env).fetch(new Request(req.url, { headers }))
         }
 
         if (path === '/api/chat') {
@@ -3520,49 +3635,24 @@ self.addEventListener('fetch', (event) => {
 
             const resolved = await resolveChatUser(req, env, url, body)
             if (!resolved) {
-                return message(403, 'Choose a valid handle to use chat.')
+                return message(403, 'Choose a valid handle to access chat.')
             }
 
-            const prefsEntries = await Promise.all(
-                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
-            )
-            const prefsMap = Object.fromEntries(prefsEntries)
-
             if (req.method === 'GET') {
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                return json({ messages, prefs: prefsMap })
+                const messages = await chatStub(env).list()
+                return json({ messages })
             }
 
             if (req.method === 'POST') {
-                if (body?.action === 'delete') {
-                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
-                    if (!targetId) {
-                        return message(400, 'Missing message id.')
-                    }
-                    const messages = await chatStub(env).listMessages().catch(() => [])
-                    const target = messages.find((m) => m.id === targetId)
-                    if (!target) {
-                        return message(404, 'Message not found.')
-                    }
-                    if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
-                        return message(403, 'Only 163292 can delete messages from other members.')
-                    }
-                    await chatStub(env).deleteMessage(targetId)
-                    const updated = await chatStub(env).listMessages().catch(() => [])
-                    return json({ ok: true, messages: updated, prefs: prefsMap })
-                }
-
                 if (body?.action === 'like') {
-                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
-                    if (!targetId) return message(400, 'Missing message id.')
-                    await chatStub(env).toggleLike(targetId, resolved.user.handle)
-                    const updated = await chatStub(env).listMessages().catch(() => [])
-                    return json({ ok: true, messages: updated, prefs: prefsMap })
+                    const id = String(body?.id ?? '').trim()
+                    if (!id) return message(400, 'Missing message id.')
+                    const messages = await chatStub(env).toggleLike(id, resolved.user.handle)
+                    return json({ messages })
                 }
 
-                const text = typeof body?.text === 'string' ? body.text.trim() : ''
+                const text = String(body?.text ?? '').trim()
                 if (!text) return message(400, 'Message cannot be empty.')
-
                 const replyTo = body?.replyTo && typeof body.replyTo === 'object'
                     ? {
                         id: String(body.replyTo.id ?? ''),
@@ -3572,1103 +3662,154 @@ self.addEventListener('fetch', (event) => {
                     }
                     : undefined
 
-                await chatStub(env).addMessage({
-                    handle: resolved.user.handle,
-                    author: resolved.user.name || resolved.user.handle,
-                    text: text.slice(0, 500),
-                    ...(replyTo ? { replyTo } : {}),
-                })
-
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                return json({ ok: true, messages, prefs: prefsMap })
+                const messages = await chatStub(env).post(resolved.user, text, replyTo)
+                return json({ messages })
             }
 
             if (req.method === 'DELETE') {
-                const id = (url.searchParams.get('id') ?? '').trim()
-                if (!id) {
-                    return message(400, 'Missing message id.')
-                }
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                const target = messages.find((m) => m.id === id)
-                if (!target) {
-                    return message(404, 'Message not found.')
-                }
+                const id = String(url.searchParams.get('id') ?? '').trim()
+                if (!id) return message(400, 'Missing message id.')
+                const current = await chatStub(env).list()
+                const target = current.find((m) => m.id === id)
+                if (!target) return message(404, 'Message not found.')
                 if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
-                    return message(403, 'Only 163292 can delete messages from other members.')
+                    return message(403, 'Cannot delete this message.')
                 }
-                await chatStub(env).deleteMessage(id)
-                const updated = await chatStub(env).listMessages().catch(() => [])
-                return json({ ok: true, messages: updated, prefs: prefsMap })
-            }
-        }
-
-        const ws = path.match(/^\/ws\/([\w-]+)$/)
-
-        if (ws) {
-            const token =
-                req.headers.get('Sonolus-Room-Session') ??
-                (isDevSkipSignature(env)
-                    ? url.searchParams.get('session')
-                    : null)
-
-            const join = token
-                ? await verifyToken<JoinSession>(env.SESSION_SECRET, token)
-                : null
-
-            if (!join || join.room !== ws[1]) {
-                return new Response('Unauthorized', { status: 401 })
+                const messages = await chatStub(env).remove(id)
+                return json({ messages })
             }
 
-            const headers = new Headers(req.headers)
-            headers.set('x-join', encodeURIComponent(JSON.stringify(join)))
-
-            return roomStub(env, ws[1]!).fetch(
-                new Request(req, { headers }),
-            )
-        }
-
-        if (path === '/' || path === '/sonolus') {
-            return new Response('AXX! Sonolus multiplayer server')
+            return message(405, 'Method not allowed.')
         }
 
         if (path === '/sonolus/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-            const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
-
-            const bannerObject = await getBucketObject(assetsBucket(env), [
-                'server/banner.png',
-            ])
-            let banner: { hash: string; url: string } | undefined
-
-            if (bannerObject) {
-                const bytes = await bannerObject.arrayBuffer()
-                const digest = await crypto.subtle.digest('SHA-1', bytes)
-                const hash = Array.from(
-                    new Uint8Array(digest),
-                    (byte) => byte.toString(16).padStart(2, '0'),
-                ).join('')
-
-                banner = {
-                    hash,
-                    url: '/sonolus/server/banner',
-                }
-            }
-
             return json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
-                ...(banner ? { banner } : {}),
-                buttons: [
-                    { type: 'authentication' },
-                    { type: 'room' },
-                    {
-                        type: 'post',
-                        title: 'Announcements',
-                        icon: 'announcement',
-                        infoType: 'announcements',
-                    },
-                    {
-                        type: 'post',
-                        title: 'Posts',
-                        icon: 'post',
-                        infoType: 'posts',
-                    },
-                    {
-                        type: 'post',
-                        title: 'Results',
-                        icon: 'medal',
-                        infoType: 'results',
-                    },
-                    ...(canChat
-                        ? [
-                            {
-                                type: 'post',
-                                title: 'Chat',
-                                icon: 'comment',
-                                infoType: 'chat',
-                            },
-                        ]
-                        : []),
-                    { type: 'level' },
-                    { type: 'playlist' },
-                    { type: 'configuration' },
-                ],
-                configuration: {
-                    options: [],
+                banner: {
+                    hash: '',
+                    url: '/sonolus/rooms/cover/xx',
                 },
+                rooms: { items: [] },
+                posts: { items: [] },
+                playlists: { items: [] },
+                levels: { items: [] },
             })
         }
 
         if (path === '/sonolus/authenticate' && req.method === 'POST') {
-            const body = await verifySigned(
-                req,
-                env,
-                new Uint8Array(await req.arrayBuffer()),
-                'authenticateServer',
-            )
+            const raw = new Uint8Array(await req.arrayBuffer())
+            const body = await verifySigned(req, env, raw, 'authenticate')
+            if (!body) return message(401, 'Authentication failed.')
 
-            if (!body) return new Response(null, { status: 401 })
-
-            const expiration = Date.now() + 24 * 60 * 60_000
-            const session = await signToken(env.SESSION_SECRET, {
-                user: profileOf(body.userProfile),
-                exp: expiration,
-            } satisfies AuthSession)
-
-            return json({ session, expiration })
-        }
-
-        if (path === '/sonolus/server/banner' && req.method === 'GET') {
-            const object = await getBucketObject(assetsBucket(env), [
-                'server/banner.png',
-            ])
-            if (!object) return new Response(null, { status: 404 })
-
-            return new Response(object.body, {
-                headers: {
-                    'Content-Type': object.httpMetadata?.contentType ?? 'image/png',
-                    'Cache-Control': 'public, max-age=31536000, immutable',
-                },
-            })
-        }
-
-        if (path === '/sonolus/posts/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-
-            if (isChatCategory(url)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ title: 'Chat', creates: [], searches: [], sections: [] })
-                }
-
-                const [messages, pinnedId] = await Promise.all([
-                    chatStub(env).listMessages().catch(() => []),
-                    chatStub(env).getPinnedId().catch(() => null),
-                ])
-
-                return json({
-                    title: 'Chat',
-                    creates: [],
-                    searches: [],
-                    sections: [
-                        {
-                            title: 'Chat',
-                            itemType: 'post',
-                            items: [buildChatPostItem(messages, pinnedId)],
-                        },
-                    ],
-                })
-            }
-
-            const explicit = resolveCategory(url, req)
-            const kinds: PostCategory[] = explicit
-                ? [explicit]
-                : ['announcements', 'posts', 'results']
-
-            const sections = await Promise.all(
-                kinds.map(async (kind) => {
-                    const posts = sortPostsPinnedFirst(
-                        (await lobby(env).listPosts(kind).catch(() => [])).filter(
-                            (p) => p.category === kind,
-                        ),
-                    )
-                    return {
-                        title: POST_LABELS[kind].section,
-                        itemType: 'post',
-                        items: posts.map(buildPostItemWithBadges),
-                    }
-                }),
-            )
+            const user = profileOf(body.userProfile)
+            const exp = Date.now() + 86_400_000
+            const session = await signToken(env.SESSION_SECRET, { user, exp })
 
             return json({
-                title: explicit ? POST_LABELS[explicit].section : 'Posts',
-                creates: canManagePosts(session) && explicit
-                    ? [postForm(explicit)]
-                    : [],
-                searches: [],
-                sections,
+                session,
+                expiration: exp,
             })
-        }
-
-        if (path === '/sonolus/posts/list' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
-            const pageSize = 10
-
-            if (isChatCategory(url)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ title: 'Chat', pageCount: 1, items: [], searches: [] })
-                }
-
-                const [messages, pinnedId] = await Promise.all([
-                    chatStub(env).listMessages().catch(() => []),
-                    chatStub(env).getPinnedId().catch(() => null),
-                ])
-
-                return json({
-                    title: 'Chat',
-                    pageCount: 1,
-                    items: page === 0 ? [buildChatPostItem(messages, pinnedId)] : [],
-                    searches: [],
-                })
-            }
-
-            const kind = resolveCategory(url, req) ?? 'posts'
-            const keywords = resolveKeywords(url)
-
-            const allCategoryPosts = sortPostsPinnedFirst(
-                (await lobby(env).listPosts(kind).catch(() => [])).filter(
-                    (p) => p.category === kind,
-                ),
-            )
-
-            const posts = keywords
-                ? allCategoryPosts.filter((p) => {
-                    const hay = [
-                        String(p.item?.title ?? ''),
-                        String(p.item?.author ?? ''),
-                        String(p.description ?? ''),
-                    ].join(' ').toLowerCase()
-                    return keywords
-                        .split(/\s+/)
-                        .filter(Boolean)
-                        .every((term) => hay.includes(term))
-                })
-                : allCategoryPosts
-
-            const pageCount = Math.max(1, Math.ceil(posts.length / pageSize))
-            const slice = posts.slice(page * pageSize, page * pageSize + pageSize)
-
-            return json({
-                title: POST_LABELS[kind].section,
-                pageCount,
-                items: slice.map(buildPostItemWithBadges),
-                searches: [],
-            })
-        }
-
-        if (path === '/sonolus/posts/create' && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
-            if (!session) return new Response(null, { status: 401 })
-
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can publish posts.')
-            }
-
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid post data.')
-            }
-
-            const values = new URLSearchParams(String(body.values ?? ''))
-            const category = resolveCategory(url, req, body, values)
-            if (!category) {
-                return message(400, 'Invalid or missing post category.')
-            }
-
-            const title = (values.get('title') ?? '').trim()
-            const description = (values.get('description') ?? '').trim()
-            const thumbnailHash = (values.get('thumbnail') ?? '').trim()
-
-            if (!title || !description) {
-                return message(400, 'A title and content are required.')
-            }
-
-            if (title.length > 100 || description.length > 2000) {
-                return message(400, 'Post title or description exceeds maximum length.')
-            }
-
-            const name = randomId(12)
-            const key = randomId(24)
-
-            await lobby(env).createPost({
-                category,
-                item: {
-                    name,
-                    version: 1,
-                    title,
-                    time: Date.now(),
-                    author: formatAuthorTag(session.user.name, session.user.handle),
-                    tags: [],
-                },
-                description,
-                uploadKey: key,
-                thumbnailHash,
-                likes: [],
-                comments: [],
-                pinned: false,
-            })
-
-            return json({
-                key,
-                hashes: thumbnailHash ? [thumbnailHash] : [],
-                shouldUpdateInfo: true,
-                shouldNavigateToItem: name,
-            })
-        }
-
-        const postCommunityInfo = path.match(/^\/sonolus\/posts\/([\w-]+)\/community\/info$/)
-
-        if (postCommunityInfo && req.method === 'GET') {
-            const itemName = postCommunityInfo[1]!
-            const session = await sessionOf(req, env, url)
-
-            if (isChatItemName(itemName)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ creates: [], actions: [], topComments: [] })
-                }
-
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                return json({
-                    creates: [],
-                    actions: [chatActionForm],
-                    topComments: formatChatCommunityComments(messages, session, 0).comments.slice(0, 3),
-                })
-            }
-
-            const post = await lobby(env).getPost(itemName).catch(() => null)
-            if (!post) {
-                return json({ creates: [], actions: [], topComments: [] })
-            }
-
-            return json({
-                creates: [],
-                actions: [postCommentForm],
-                topComments: formatPostComments(post, session, 0).comments.slice(0, 3),
-            })
-        }
-
-        const postCommunitySubmit = path.match(/^\/sonolus\/posts\/([\w-]+)\/community\/submit$/)
-
-        if (postCommunitySubmit && req.method === 'POST') {
-            const itemName = postCommunitySubmit[1]!
-            const session = await sessionOf(req, env, url)
-            if (!session) return new Response(null, { status: 401 })
-
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid community action.')
-            }
-
-            const values = new URLSearchParams(String(body.values ?? ''))
-            const actionType = values.get('type')
-
-            if (isChatItemName(itemName)) {
-                if (!isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const text = extractCommentText(values)
-                if (!text) {
-                    return message(400, 'Message cannot be empty.')
-                }
-
-                await chatStub(env).addMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
-
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateCommunity: true,
-                    shouldUpdateComments: true,
-                })
-            }
-
-            const post = await lobby(env).getPost(itemName).catch(() => null)
-            if (!post) return new Response(null, { status: 404 })
-
-            if (actionType === 'likePost') {
-                await lobby(env).togglePostLike(itemName, session.user.handle)
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateCommunity: true,
-                    shouldUpdateComments: true,
-                })
-            }
-
-            if (actionType === 'pinPost') {
-                if (!canManagePosts(session)) {
-                    return message(403, 'Only handle 163292 can pin posts.')
-                }
-                await lobby(env).togglePostPin(itemName)
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateCommunity: true,
-                    shouldUpdateComments: true,
-                })
-            }
-
-            const text = extractCommentText(values)
-            if (!text) {
-                return message(400, 'Comment cannot be empty.')
-            }
-
-            await lobby(env).addPostComment(itemName, {
-                handle: session.user.handle,
-                author: session.user.name || session.user.handle,
-                text: text.slice(0, 500),
-            })
-
-            return json({
-                key: '',
-                hashes: [],
-                shouldUpdateCommunity: true,
-                shouldUpdateComments: true,
-            })
-        }
-
-        const postCommentsList = path.match(/^\/sonolus\/posts\/([\w-]+)\/community\/comments\/list$/)
-
-        if (postCommentsList && req.method === 'GET') {
-            const itemName = postCommentsList[1]!
-            const session = await sessionOf(req, env, url)
-            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
-
-            if (isChatItemName(itemName)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return json({ pageCount: 1, comments: [] })
-                }
-
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                return json(formatChatCommunityComments(messages, session, page))
-            }
-
-            const post = await lobby(env).getPost(itemName).catch(() => null)
-            if (!post) {
-                return json({ pageCount: 1, comments: [] })
-            }
-
-            return json(formatPostComments(post, session, page))
-        }
-
-        const postCommentSubmit = path.match(
-            /^\/sonolus\/posts\/([\w-]+)\/community\/comments\/([^/]+)\/submit$/,
-        )
-
-        if (postCommentSubmit && req.method === 'POST') {
-            const itemName = postCommentSubmit[1]!
-            const session = await sessionOf(req, env, url)
-            if (!session) return new Response(null, { status: 401 })
-
-            const commentName = decodeURIComponent(postCommentSubmit[2]!)
-
-            if (isChatItemName(itemName)) {
-                if (!isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                const target = messages.find((m) => m.id === commentName)
-                if (!target || !canDeleteComment(session, target.handle)) {
-                    return message(403, 'You cannot delete this comment.')
-                }
-
-                await chatStub(env).deleteMessage(commentName)
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateCommunity: true,
-                    shouldUpdateComments: true,
-                })
-            }
-
-            const post = await lobby(env).getPost(itemName).catch(() => null)
-            if (!post) return new Response(null, { status: 404 })
-
-            const target = (post.comments ?? []).find((c) => c.id === commentName)
-            if (!target || !canDeleteComment(session, target.handle)) {
-                return message(403, 'You cannot delete this comment.')
-            }
-
-            await lobby(env).deletePostComment(itemName, commentName)
-            return json({
-                key: '',
-                hashes: [],
-                shouldUpdateCommunity: true,
-                shouldUpdateComments: true,
-            })
-        }
-
-        const postSubmitPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/submit$/)
-
-        if (postSubmitPath && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
-            if (!session) return new Response(null, { status: 401 })
-
-            const postName = postSubmitPath[1]!
-
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid post action.')
-            }
-
-            const values = new URLSearchParams(String(body.values ?? ''))
-            const actionType = values.get('type')
-
-            if (isChatItemName(postName)) {
-                if (!isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const text = extractCommentText(values)
-                if (!text) {
-                    return message(400, 'Message cannot be empty.')
-                }
-
-                await chatStub(env).addMessage({
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                })
-
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateItem: true,
-                })
-            }
-
-            const post = await lobby(env).getPost(postName).catch(() => null)
-            if (!post) return new Response(null, { status: 404 })
-
-            if (actionType === 'likePost') {
-                await lobby(env).togglePostLike(postName, session.user.handle)
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateItem: true,
-                })
-            }
-
-            if (actionType === 'editPost') {
-                if (!canManagePosts(session)) {
-                    return message(403, 'Only handle 163292 can edit posts.')
-                }
-
-                const nextTitle = (values.get('title') ?? String(post.item?.title ?? '')).trim()
-                const nextDescription = (values.get('description') ?? String(post.description ?? '')).trim()
-                const nextThumbHash = (values.get('thumbnail') ?? '').trim()
-
-                if (!nextTitle || !nextDescription) {
-                    return message(400, 'A title and content are required.')
-                }
-
-                if (nextTitle.length > 100 || nextDescription.length > 2000) {
-                    return message(400, 'Post title or description exceeds maximum length.')
-                }
-
-                const uploadKey = nextThumbHash ? (post.uploadKey || randomId(24)) : post.uploadKey
-
-                await lobby(env).createPost({
-                    ...post,
-                    item: {
-                        ...post.item,
-                        title: nextTitle,
-                    },
-                    description: nextDescription,
-                    uploadKey,
-                    ...(nextThumbHash ? { thumbnailHash: nextThumbHash } : {}),
-                })
-
-                return json({
-                    key: nextThumbHash ? uploadKey : '',
-                    hashes: nextThumbHash ? [nextThumbHash] : [],
-                    shouldUpdateItem: true,
-                })
-            }
-
-            if (actionType === 'pinPost') {
-                if (!canManagePosts(session)) {
-                    return message(403, 'Only handle 163292 can pin posts.')
-                }
-                await lobby(env).togglePostPin(postName)
-                return json({
-                    key: '',
-                    hashes: [],
-                    shouldUpdateItem: true,
-                })
-            }
-
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can delete posts.')
-            }
-
-            if (actionType !== 'deletePost') {
-                return message(400, 'Unknown post action.')
-            }
-
-            await Promise.all([
-                ...[...bucketsForRead(env)].flatMap((b) => [
-                    b.delete(`${post.category}/${postName}/thumbnail`).catch(() => {}),
-                    b.delete(`posts/${postName}/thumbnail`).catch(() => {}),
-                ]),
-                lobby(env).removePost(postName),
-            ])
-
-            return json({
-                key: '',
-                hashes: [],
-                shouldRemoveItem: true,
-            })
-        }
-
-        if (path === '/sonolus/posts/upload' && req.method === 'POST') {
-            const session = await sessionOf(req, env, url)
-            if (!session) return new Response(null, { status: 401 })
-
-            if (!canManagePosts(session)) {
-                return message(403, 'Only handle 163292 can upload post images.')
-            }
-
-            const key = req.headers.get('Sonolus-Upload-Key')
-            if (!key) return message(400, 'Missing upload key.')
-
-            const post = await lobby(env).findPostByUploadKey(key)
-            if (!post || !post.thumbnailHash) {
-                return message(403, 'Invalid upload key.')
-            }
-
-            let form: FormData
-            try {
-                form = await req.formData()
-            } catch {
-                return message(400, 'Invalid image upload.')
-            }
-
-            const file = form
-                .getAll('files')
-                .find((value): value is File => value instanceof File)
-
-            if (!file) return message(400, 'No image was uploaded.')
-            if (file.size > 5 * 1024 * 1024) return message(400, 'Image is too large.')
-
-            const bytes = await file.arrayBuffer()
-            const image = new Uint8Array(bytes)
-
-            const isPng =
-                image.length >= 8 &&
-                image[0] === 0x89 &&
-                image[1] === 0x50 &&
-                image[2] === 0x4e &&
-                image[3] === 0x47 &&
-                image[4] === 0x0d &&
-                image[5] === 0x0a &&
-                image[6] === 0x1a &&
-                image[7] === 0x0a
-
-            const isJpeg =
-                image.length >= 3 &&
-                image[0] === 0xff &&
-                image[1] === 0xd8 &&
-                image[2] === 0xff
-
-            const isWebp =
-                image.length >= 12 &&
-                String.fromCharCode(...image.slice(0, 4)) === 'RIFF' &&
-                String.fromCharCode(...image.slice(8, 12)) === 'WEBP'
-
-            const contentType = isPng
-                ? 'image/png'
-                : isJpeg
-                    ? 'image/jpeg'
-                    : isWebp
-                        ? 'image/webp'
-                        : null
-
-            if (!contentType) {
-                return message(400, 'Unsupported image format. Use PNG, JPEG, or WebP.')
-            }
-
-            const dims = getImageDimensions(image, contentType)
-            if (!dims || dims.width < 1 || dims.height < 1 || dims.width > 2048 || dims.height > 2048) {
-                return message(400, 'Image dimensions must be between 1×1 and 2048×2048 px.')
-            }
-
-            const digest = await crypto.subtle.digest('SHA-1', bytes)
-            const hash = Array.from(
-                new Uint8Array(digest),
-                (byte) => byte.toString(16).padStart(2, '0'),
-            ).join('')
-
-            if (hash.toLowerCase() !== post.thumbnailHash.toLowerCase()) {
-                return message(400, 'Image hash does not match.')
-            }
-
-            const targetBucket = communityBucket(env)
-            if (targetBucket) {
-                const objectKey = `${post.category}/${post.item.name}/thumbnail`
-                await targetBucket.put(objectKey, bytes, {
-                    httpMetadata: { contentType },
-                })
-            }
-
-            await lobby(env).setPostThumbnail(
-                post.item.name,
-                hash,
-                `/sonolus/posts/${post.item.name}/thumbnail`,
-            )
-
-            return json({})
-        }
-
-        const thumbnailPath = path.match(/^\/sonolus\/posts\/([\w-]+)\/thumbnail$/)
-
-        if (thumbnailPath && req.method === 'GET') {
-            const name = thumbnailPath[1]!
-            const post = await lobby(env).getPost(name).catch(() => null)
-            const cat = post?.category ?? 'posts'
-
-            const object = await getBucketObject(communityBucket(env), [
-                `${cat}/${name}/thumbnail`,
-                `posts/${name}/thumbnail`,
-                `announcements/${name}/thumbnail`,
-                `results/${name}/thumbnail`,
-            ])
-
-            if (!object) return new Response(null, { status: 404 })
-
-            return new Response(object.body, {
-                headers: {
-                    'Content-Type': object.httpMetadata?.contentType ?? 'image/png',
-                    'Cache-Control': 'public, max-age=31536000, immutable',
-                },
-            })
-        }
-
-        const postPath = path.match(/^\/sonolus\/posts\/([\w-]+)$/)
-
-        if (postPath && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-
-            if (isChatItemName(postPath[1]!)) {
-                if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Chat is restricted.')
-                }
-
-                const [messages, pinnedId] = await Promise.all([
-                    chatStub(env).listMessages().catch(() => []),
-                    chatStub(env).getPinnedId().catch(() => null),
-                ])
-                const extUrl = externalChatUrl(req, env)
-
-                return json({
-                    item: buildChatPostItem(messages, pinnedId),
-                    description: extUrl ? `External chat:\n${extUrl}` : '',
-                    actions: [],
-                    hasCommunity: true,
-                    leaderboards: [],
-                    sections: [],
-                })
-            }
-
-            const postId = postPath[1]!
-            const post = await lobby(env).getPost(postId).catch(() => null)
-            if (!post) return new Response(null, { status: 404 })
-
-            return json({
-                item: buildPostItemWithBadges(post),
-                description: post.description,
-                actions: postActionsFor(post, session),
-                hasCommunity: true,
-                leaderboards: [],
-                sections: [],
-            })
-        }
-
-        if (path === '/sonolus/levels/info' && req.method === 'GET') {
-            try {
-                const { charts, pageCount } = await getCustomLevelPage(0, env)
-                const cached = await getCachedLevelItemsForCharts(env, charts)
-                const items = cached ?? (await loadLevelItems(charts)).map((entry) => entry.item)
-
-                console.log(
-                    `[Levels] Info page 0: ${items.length}/${charts.length} levels loaded (${cached ? 'R2 cache' : 'live'}). ${pageCount} pages total.`,
-                )
-
-                return json({
-                    creates: [],
-                    searches: [],
-                    sections: [
-                        {
-                            title: 'Custom Levels',
-                            itemType: 'level',
-                            items,
-                        },
-                    ],
-                })
-            } catch (error) {
-                console.error('Could not read custom levels sheet:', error)
-                return message(502, 'Could not read the custom levels sheet.')
-            }
-        }
-
-        if (path === '/sonolus/levels/list' && req.method === 'GET') {
-            try {
-                const requestedPage = Number(url.searchParams.get('page') ?? '0')
-                const page = Number.isInteger(requestedPage) && requestedPage >= 0
-                    ? requestedPage
-                    : 0
-
-                const { charts, pageCount } = await getCustomLevelPage(page, env)
-
-                if (page >= pageCount) {
-                    return json({
-                        pageCount,
-                        items: [],
-                        searches: [],
-                    })
-                }
-
-                const cached = await getCachedLevelItemsForCharts(env, charts)
-                const items = cached ?? (await loadLevelItems(charts)).map((entry) => entry.item)
-
-                return json({
-                    pageCount,
-                    items,
-                    searches: [],
-                })
-            } catch (error) {
-                console.error('Could not read custom levels sheet:', error)
-                return message(502, 'Could not read the custom levels sheet.')
-            }
-        }
-
-        const levelSub = path.match(
-            /^\/sonolus\/levels\/([^/]+)\/((?:community|leaderboards|submit|upload)(?:\/.*)?)$/,
-        )
-
-        if (levelSub) {
-            const chart = await findChart(decodeURIComponent(levelSub[1]!), env).catch(() => null)
-            if (!chart || !isUnch(chart)) return new Response(null, { status: 404 })
-            return proxyToUnch(req, url, chart, levelSub[2]!)
-        }
-
-        const levelPath = path.match(/^\/sonolus\/levels\/([^/]+)$/)
-
-        if (levelPath && req.method === 'GET') {
-            const requestedName = decodeURIComponent(levelPath[1]!)
-
-            try {
-                const [customCharts, playlists] = await Promise.all([
-                    getCustomLevels(env),
-                    getPlaylists(env),
-                ])
-
-                const allCharts = [
-                    ...customCharts,
-                    ...playlists.flatMap((playlist) => playlist.charts),
-                ]
-
-                const chart = allCharts.find(
-                    (entry) =>
-                        entry.name === requestedName ||
-                        entry.id === requestedName,
-                )
-
-                if (!chart) return new Response(null, { status: 404 })
-
-                const details = await remoteLevelDetails(chart)
-                if (!details) return new Response(null, { status: 502 })
-
-                return json({
-                    ...details,
-                    item: details.item,
-                    description: details.description ?? details.item.description ?? '',
-                    actions: isUnch(chart) && Array.isArray(details.actions) ? details.actions : [],
-                    hasCommunity: isUnch(chart) ? details.hasCommunity ?? false : false,
-                    leaderboards: isUnch(chart) && Array.isArray(details.leaderboards)
-                        ? details.leaderboards
-                        : [],
-                    sections: Array.isArray(details.sections) ? details.sections : [],
-                })
-            } catch (error) {
-                console.error('Could not load level details:', error)
-                return message(502, 'Could not load level details.')
-            }
-        }
-
-        const makePlaylistItems = async () => {
-            const [playlists, cachedPlaylistsRaw] = await Promise.all([
-                getPlaylists(env),
-                getCachedJsonFromAssets<any>(env, ['server/playlists/index.json']),
-            ])
-
-            const cachedList: any[] = Array.isArray(cachedPlaylistsRaw)
-                ? cachedPlaylistsRaw
-                : Array.isArray(cachedPlaylistsRaw?.items)
-                    ? cachedPlaylistsRaw.items
-                    : []
-
-            const cachedBySlug = new Map<string, any>()
-            for (const entry of cachedList) {
-                const item = entry?.item ?? entry
-                if (item && typeof item.name === 'string') {
-                    cachedBySlug.set(item.name.toLowerCase(), item)
-                }
-            }
-
-            return Promise.all(
-                playlists.map(async (playlist) => {
-                    const slug = playlistSlug(playlist.name)
-                    const cachedItem = cachedBySlug.get(slug.toLowerCase())
-                    if (cachedItem && Array.isArray(cachedItem.levels)) {
-                        return {
-                            ...cachedItem,
-                            name: slug,
-                            title: playlist.name,
-                            subtitle: `${cachedItem.levels.length} levels`,
-                        }
-                    }
-
-                    const loaded = await loadLevelItems(playlist.charts)
-
-                    return {
-                        name: slug,
-                        version: 1 as const,
-                        title: playlist.name,
-                        subtitle: `${loaded.length} levels`,
-                        author: 'XX!',
-                        tags: [],
-                        levels: loaded.map((entry) => entry.item),
-                    }
-                }),
-            )
-        }
-
-        if (path === '/sonolus/playlists/info' && req.method === 'GET') {
-            try {
-                const items = await makePlaylistItems()
-
-                return json({
-                    creates: [],
-                    searches: [],
-                    sections: [
-                        {
-                            title: 'Playlists',
-                            itemType: 'playlist',
-                            items,
-                        },
-                    ],
-                })
-            } catch (error) {
-                console.error('Could not read playlists sheet:', error)
-                return message(502, 'Could not read the playlists sheet.')
-            }
-        }
-
-        if (path === '/sonolus/playlists/list' && req.method === 'GET') {
-            try {
-                const items = await makePlaylistItems()
-
-                return json({
-                    pageCount: 1,
-                    items,
-                    searches: [],
-                })
-            } catch (error) {
-                console.error('Could not read playlists sheet:', error)
-                return message(502, 'Could not read the playlists sheet.')
-            }
-        }
-
-        const playlistPath = path.match(/^\/sonolus\/playlists\/([\w-]+)$/)
-
-        if (playlistPath && req.method === 'GET') {
-            const requestedName = decodeURIComponent(playlistPath[1]!)
-
-            try {
-                const playlists = await getPlaylists(env)
-                const playlist = playlists.find(
-                    (entry) => samePlaylist(playlistSlug(entry.name), requestedName),
-                )
-
-                if (!playlist) return new Response(null, { status: 404 })
-
-                const allItems = await makePlaylistItems()
-                const item = allItems.find((entry) => samePlaylist(entry.name, playlistSlug(playlist.name)))
-
-                return json({
-                    item,
-                    description: '',
-                    actions: [],
-                    hasCommunity: false,
-                    leaderboards: [],
-                    sections: [],
-                })
-            } catch (error) {
-                console.error('Could not load playlist details:', error)
-                return message(502, 'Could not load playlist details.')
-            }
         }
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
-            const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
+            const isTournamentHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
             return json({
-                creates: session ? roomForms(isHost) : [],
+                creates: roomForms(isTournamentHost),
                 searches: [],
                 sections: [
                     {
                         title: 'Rooms',
-                        itemType: 'room',
                         items: await roomItems(env, session),
                     },
                 ],
+                banner: {
+                    hash: '',
+                    url: '/sonolus/rooms/cover/xx',
+                },
+            })
+        }
+
+        if (path === '/sonolus/rooms/create' && req.method === 'POST') {
+            const raw = new Uint8Array(await req.arrayBuffer())
+            const body = await verifySigned(req, env, raw, 'roomCreate')
+            if (!body) return message(401, 'Authentication failed.')
+
+            const user = profileOf(body.userProfile)
+            const parsed = parseSettings(
+                String(body.values ?? ''),
+                undefined,
+                user.name,
+            )
+
+            if (!parsed) return message(400, 'Invalid room settings.')
+
+            if (
+                user.handle !== TOURNAMENT_HOST_HANDLE &&
+                parsed.type !== 'casualRoom' &&
+                parsed.type !== 'rankedRoom'
+            ) {
+                return message(403, 'Only the tournament host can create tournament rooms.')
+            }
+
+            const name = randomId()
+            const key = randomId()
+            const exp = Date.now() + 3_600_000
+
+            await roomStub(env, name).reserve(name, {
+                key,
+                hostId: user.id,
+                hostName: user.name,
+                hostHandle: user.handle,
+            })
+
+            const joinSession = await signToken(env.SESSION_SECRET, {
+                room: name,
+                user,
+                roomUser: {
+                    authentication: '',
+                    signature: '',
+                },
+                exp,
+            } satisfies JoinSession)
+
+            return json({
+                name,
+                key,
+                address: addressOf(req, env).replace(/^https?:\/\//, 'wss://') + `/rooms/${name}`,
+                session: joinSession,
+                expiration: exp,
             })
         }
 
         if (path === '/sonolus/rooms/list' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
-
             return json({
                 pageCount: 1,
                 items: await roomItems(env, session),
-                searches: [],
             })
         }
 
-        if (path === '/sonolus/rooms/create' && req.method === 'POST') {
+        const roomMatch = path.match(/^\/sonolus\/rooms\/([^/]+)$/)
+        if (roomMatch && req.method === 'GET') {
+            const name = decodeURIComponent(roomMatch[1]!)
             const session = await sessionOf(req, env, url)
-            if (!session) return new Response(null, { status: 401 })
+            const summary = await roomStub(env, name).summary()
 
-            const name = randomId(8)
-            const key = randomId(24)
+            if (!summary) {
+                return message(404, 'Room not found.')
+            }
 
-            await roomStub(env, name).reserve(name, {
-                key,
-                hostId: session.user.id,
-                hostName: session.user.name,
-                hostHandle: session.user.handle,
-            })
-
-            return json({ name, key })
-        }
-
-        const roomPath = path.match(/^\/sonolus\/rooms\/([\w-]+)$/)
-
-        if (roomPath && req.method === 'GET') {
-            const current = await roomStub(env, roomPath[1]!).summary()
-            if (!current) return new Response(null, { status: 404 })
-
-            const cover = await resolveRoomCover(env, current)
+            const cover = await resolveRoomCover(env, summary)
 
             return json({
                 item: {
-                    name: current.name,
-                    title: current.title,
-                    subtitle: current.subtitle,
-                    master: current.master,
+                    name: summary.name,
+                    title: summary.title,
+                    subtitle: summary.subtitle,
+                    master: summary.master,
                     ...(cover ? { cover } : {}),
                     tags: [],
                 },
@@ -4676,83 +3817,599 @@ self.addEventListener('fetch', (event) => {
                 hasCommunity: false,
                 leaderboards: [],
                 sections: [],
+                ...(session ? {} : { externalUrl: `${addressOf(req, env)}/sonolus/rooms/${encodeURIComponent(name)}` }),
             })
         }
 
-        if (roomPath && req.method === 'POST') {
-            const name = roomPath[1]!
+        const roomJoinMatch = path.match(/^\/sonolus\/rooms\/([^/]+)\/join$/)
+        if (roomJoinMatch && req.method === 'POST') {
+            const name = decodeURIComponent(roomJoinMatch[1]!)
             const raw = new Uint8Array(await req.arrayBuffer())
-
-            const body = await verifySigned(
-                req,
-                env,
-                raw,
-                'authenticateMultiplayer',
-            )
-
-            if (!body || body.room !== name) {
-                return new Response(null, { status: 400 })
-            }
+            const body = await verifySigned(req, env, raw, 'roomJoin')
+            if (!body) return message(401, 'Authentication failed.')
 
             const user = profileOf(body.userProfile)
-            const stub = roomStub(env, name)
-            const key = req.headers.get('Sonolus-Room-Key')
+            const reason = await roomStub(env, name).canJoin(user)
+            if (reason) return message(403, reason)
 
-            if (key) {
-                const params = new URLSearchParams(url.searchParams)
-                const rawSettings = parseSettings(params, undefined, user.name || user.handle)
-                if (!rawSettings) {
-                    return new Response(null, { status: 400 })
-                }
-
-                const existingSummary = await stub.summary().catch(() => null)
-                const isAlreadyOpened = Boolean(existingSummary)
-                const settings = rawSettings.type === 'rankedRoom' && isAlreadyOpened
-                    ? {
-                        ...rawSettings,
-                        title: existingSummary?.title || rawSettings.title,
-                    }
-                    : rawSettings
-
-                if (
-                    (
-                        user.handle !== TOURNAMENT_HOST_HANDLE &&
-                        settings.type !== 'casualRoom' &&
-                        settings.type !== 'rankedRoom'
-                    ) ||
-                    !(await stub.configure(key, settings, user))
-                ) {
-                    return message(403, 'You can only create Custom or Ranked Match rooms.')
-                }
-            } else {
-                if (!(await stub.isOpen())) {
-                    return new Response(null, { status: 404 })
-                }
-
-                const denied = await stub.canJoin(user)
-                if (denied) return message(403, denied)
+            const exp = Date.now() + 3_600_000
+            const roomUser = {
+                authentication: b64encode(crypto.getRandomValues(new Uint8Array(16))),
+                signature: b64encode(crypto.getRandomValues(new Uint8Array(32))),
             }
 
-            const session = await signToken(env.SESSION_SECRET, {
+            const joinSession = await signToken(env.SESSION_SECRET, {
                 room: name,
                 user,
-                roomUser: {
-                    authentication: b64encode(raw),
-                    signature: req.headers.get('Sonolus-Signature') ?? '',
-                },
-                exp: Date.now() + 2 * 60_000,
+                roomUser,
+                exp,
             } satisfies JoinSession)
 
-            const wsUrl =
-                addressOf(req, env).replace(/^http/, 'ws') + `/ws/${name}`
-
             return json({
-                url: wsUrl,
-                type: 'round',
-                session,
+                address: addressOf(req, env).replace(/^https?:\/\//, 'wss://') + `/rooms/${name}`,
+                session: joinSession,
+                expiration: exp,
             })
         }
 
-        return new Response('Not found', { status: 404 })
+        const roomWsMatch = path.match(/^\/rooms\/([^/]+)$/)
+        if (roomWsMatch && req.headers.get('Upgrade') === 'websocket') {
+            const name = decodeURIComponent(roomWsMatch[1]!)
+            const sessionTokenParam = url.searchParams.get('session') ?? ''
+            const join = sessionTokenParam
+                ? await verifyToken<JoinSession>(env.SESSION_SECRET, sessionTokenParam)
+                : null
+
+            if (!join || join.room !== name || join.exp < Date.now()) {
+                return new Response('Unauthorized', { status: 401 })
+            }
+
+            const headers = new Headers(req.headers)
+            headers.set('x-join', encodeURIComponent(JSON.stringify(join)))
+            return roomStub(env, name).fetch(new Request(req.url, { headers }))
+        }
+
+        if (path === '/sonolus/posts/info' && req.method === 'GET') {
+            const session = await sessionOf(req, env, url)
+            const [announcements, posts, results, chatState] = await Promise.all([
+                lobby(env).listPosts('announcements'),
+                lobby(env).listPosts('posts'),
+                lobby(env).listPosts('results'),
+                chatStub(env).state(),
+            ])
+
+            const sections: any[] = [
+                {
+                    title: 'Chat',
+                    items: [buildChatPostItem(chatState.messages, chatState.pinnedId)],
+                },
+                {
+                    title: 'Announcements',
+                    items: sortPostsPinnedFirst(announcements).map(buildPostItemWithBadges),
+                },
+                {
+                    title: 'Posts',
+                    items: sortPostsPinnedFirst(posts).map(buildPostItemWithBadges),
+                },
+                {
+                    title: 'Results',
+                    items: sortPostsPinnedFirst(results).map(buildPostItemWithBadges),
+                },
+            ]
+
+            return json({
+                creates: canManagePosts(session)
+                    ? [
+                        postForm('announcements'),
+                        postForm('posts'),
+                        postForm('results'),
+                    ]
+                    : [],
+                searches: [],
+                sections,
+                banner: {
+                    hash: '',
+                    url: '/sonolus/rooms/cover/xx',
+                },
+            })
+        }
+
+        if (path === '/sonolus/posts/create' && req.method === 'POST') {
+            const raw = new Uint8Array(await req.arrayBuffer())
+            const body = await verifySigned(req, env, raw, 'postCreate')
+            if (!body) return message(401, 'Authentication failed.')
+
+            const user = profileOf(body.userProfile)
+            if (user.handle !== TOURNAMENT_HOST_HANDLE) {
+                return message(403, 'Only the tournament host can create posts.')
+            }
+
+            const values = new URLSearchParams(String(body.values ?? ''))
+            const category = resolveCategory(url, req, body, values) ?? 'posts'
+            const labels = POST_LABELS[category]
+            const title = String(values.get('title') ?? '').trim() || labels.section
+            const description = String(values.get('description') ?? '').trim()
+
+            const created = await lobby(env).createPost(
+                category,
+                title,
+                description,
+                user.name || user.handle,
+                user.handle,
+            )
+
+            return json({
+                name: created.item.name,
+                item: buildPostItemWithBadges(created),
+            })
+        }
+
+        if (path === '/sonolus/posts/list' && req.method === 'GET') {
+            const keywords = resolveKeywords(url)
+            const [announcements, posts, results, chatState] = await Promise.all([
+                lobby(env).listPosts('announcements'),
+                lobby(env).listPosts('posts'),
+                lobby(env).listPosts('results'),
+                chatStub(env).state(),
+            ])
+
+            if (isChatCategory(url)) {
+                const chatItem = buildChatPostItem(chatState.messages, chatState.pinnedId)
+                const matches = !keywords ||
+                    chatItem.title.toLowerCase().includes(keywords) ||
+                    chatItem.subtitle.toLowerCase().includes(keywords)
+                return json({
+                    pageCount: 1,
+                    items: matches ? [chatItem] : [],
+                })
+            }
+
+            const specificCategory = resolveCategory(url)
+            const combined = specificCategory
+                ? sortPostsPinnedFirst(
+                    specificCategory === 'announcements'
+                        ? announcements
+                        : specificCategory === 'results'
+                            ? results
+                            : posts,
+                )
+                : sortPostsPinnedFirst([...announcements, ...posts, ...results])
+
+            const filtered = keywords
+                ? combined.filter((p) => {
+                    const t = String(p.item?.title ?? '').toLowerCase()
+                    const d = String(p.description ?? '').toLowerCase()
+                    return t.includes(keywords) || d.includes(keywords)
+                })
+                : combined
+
+            return json({
+                pageCount: 1,
+                items: filtered.map(buildPostItemWithBadges),
+            })
+        }
+
+        const postMatch = path.match(/^\/sonolus\/posts\/([^/]+)$/)
+        if (postMatch && req.method === 'GET') {
+            const name = decodeURIComponent(postMatch[1]!)
+            const session = await sessionOf(req, env, url)
+
+            if (isChatItemName(name)) {
+                const chatState = await chatStub(env).state()
+                const page = Number(url.searchParams.get('page') ?? '0') || 0
+                const { pageCount, comments } = formatChatCommunityComments(
+                    chatState.messages,
+                    session,
+                    page,
+                )
+                return json({
+                    item: buildChatPostItem(chatState.messages, chatState.pinnedId),
+                    description: `Web chat: ${externalChatUrl(req, env)}`,
+                    actions: [chatActionForm],
+                    hasCommunity: true,
+                    leaderboards: [],
+                    sections: [],
+                    comments,
+                    pageCount,
+                    externalUrl: externalChatUrl(req, env),
+                })
+            }
+
+            const post = await lobby(env).getPost(name)
+            if (!post) {
+                return message(404, 'Post not found.')
+            }
+
+            const page = Number(url.searchParams.get('page') ?? '0') || 0
+            const { pageCount, comments } = formatPostComments(post, session, page)
+
+            return json({
+                item: buildPostItemWithBadges(post),
+                description: post.description ?? '',
+                actions: postActionsFor(post, session),
+                hasCommunity: true,
+                leaderboards: [],
+                sections: [],
+                comments,
+                pageCount,
+            })
+        }
+
+        const postCommentPostMatch = path.match(/^\/sonolus\/posts\/([^/]+)\/comments$/)
+        if (postCommentPostMatch && req.method === 'POST') {
+            const name = decodeURIComponent(postCommentPostMatch[1]!)
+            const raw = new Uint8Array(await req.arrayBuffer())
+            const body = await verifySigned(req, env, raw, 'postComment')
+            if (!body) return message(401, 'Authentication failed.')
+
+            const user = profileOf(body.userProfile)
+            const values = new URLSearchParams(String(body.values ?? ''))
+            const text = extractCommentText(values)
+            if (!text) return message(400, 'Comment cannot be empty.')
+
+            if (isChatItemName(name)) {
+                if (!isStaffChatHandle(user.handle)) {
+                    return message(403, 'Chat is restricted to staff.')
+                }
+                const prefs = await getUserChatPrefs(env, user.handle)
+                const chatUser: UserProfile = {
+                    ...user,
+                    name: prefs.displayName || defaultDisplayName(user.handle, user.name),
+                }
+                const messages = await chatStub(env).post(chatUser, text)
+                const { pageCount, comments } = formatChatCommunityComments(
+                    messages,
+                    { user: chatUser, exp: Date.now() + 86_400_000 },
+                    0,
+                )
+                return json({ comments, pageCount })
+            }
+
+            const updated = await lobby(env).addComment(name, user.handle, user.name || user.handle, text)
+            if (!updated) return message(404, 'Post not found.')
+
+            const { pageCount, comments } = formatPostComments(
+                updated,
+                { user, exp: Date.now() + 86_400_000 },
+                0,
+            )
+            return json({ comments, pageCount })
+        }
+
+        const postCommentDelMatch = path.match(/^\/sonolus\/posts\/([^/]+)\/comments\/([^/]+)$/)
+        if (postCommentDelMatch && req.method === 'DELETE') {
+            const name = decodeURIComponent(postCommentDelMatch[1]!)
+            const commentId = decodeURIComponent(postCommentDelMatch[2]!)
+            const session = await sessionOf(req, env, url)
+            if (!session) return message(401, 'Authentication required.')
+
+            if (isChatItemName(name)) {
+                const state = await chatStub(env).state()
+                const target = state.messages.find((m) => m.id === commentId)
+                if (!target) return message(404, 'Comment not found.')
+                if (!canDeleteComment(session, target.handle)) {
+                    return message(403, 'Cannot delete this comment.')
+                }
+                const messages = await chatStub(env).remove(commentId)
+                const { pageCount, comments } = formatChatCommunityComments(messages, session, 0)
+                return json({ comments, pageCount })
+            }
+
+            const post = await lobby(env).getPost(name)
+            if (!post) return message(404, 'Post not found.')
+            const target = (post.comments ?? []).find((c) => c.id === commentId)
+            if (!target) return message(404, 'Comment not found.')
+            if (!canDeleteComment(session, target.handle)) {
+                return message(403, 'Cannot delete this comment.')
+            }
+            const updated = await lobby(env).deleteComment(name, commentId)
+            if (!updated) return message(404, 'Post not found.')
+            const { pageCount, comments } = formatPostComments(updated, session, 0)
+            return json({ comments, pageCount })
+        }
+
+        const postSubmitMatch = path.match(/^\/sonolus\/posts\/([^/]+)\/submit$/)
+        if (postSubmitMatch && req.method === 'POST') {
+            const name = decodeURIComponent(postSubmitMatch[1]!)
+            const raw = new Uint8Array(await req.arrayBuffer())
+            const body = await verifySigned(req, env, raw, 'postSubmit')
+            if (!body) return message(401, 'Authentication failed.')
+
+            const user = profileOf(body.userProfile)
+            const values = new URLSearchParams(String(body.values ?? ''))
+            const actionType = String(body.action ?? values.get('type') ?? '').trim()
+
+            if (isChatItemName(name)) {
+                if (!isStaffChatHandle(user.handle)) {
+                    return message(403, 'Chat is restricted to staff.')
+                }
+                const text = extractCommentText(values)
+                if (text) {
+                    const prefs = await getUserChatPrefs(env, user.handle)
+                    await chatStub(env).post({
+                        ...user,
+                        name: prefs.displayName || defaultDisplayName(user.handle, user.name),
+                    }, text)
+                }
+                const chatState = await chatStub(env).state()
+                return json({
+                    item: buildChatPostItem(chatState.messages, chatState.pinnedId),
+                })
+            }
+
+            const existing = await lobby(env).getPost(name)
+            if (!existing) return message(404, 'Post not found.')
+
+            if (actionType === 'likePost') {
+                const updated = await lobby(env).toggleLike(name, user.handle)
+                if (!updated) return message(404, 'Post not found.')
+                return json({ item: buildPostItemWithBadges(updated) })
+            }
+
+            if (user.handle !== TOURNAMENT_HOST_HANDLE) {
+                return message(403, 'Only the tournament host can perform this action.')
+            }
+
+            if (actionType === 'deletePost') {
+                const bucket = communityBucket(env)
+                if (bucket && existing.thumbnailHash) {
+                    await bucket.delete(`posts/thumbnails/${existing.thumbnailHash}`).catch(() => {})
+                }
+                await lobby(env).deletePost(name)
+                return json({ deleted: true })
+            }
+
+            if (actionType === 'removeThumbnail') {
+                const bucket = communityBucket(env)
+                if (bucket && existing.thumbnailHash) {
+                    await bucket.delete(`posts/thumbnails/${existing.thumbnailHash}`).catch(() => {})
+                }
+                const updated = await lobby(env).updatePost(name, {
+                    clearThumbnail: true,
+                })
+                if (!updated) return message(404, 'Post not found.')
+                return json({ item: buildPostItemWithBadges(updated) })
+            }
+
+            if (actionType === 'pinPost') {
+                const updated = await lobby(env).updatePost(name, {
+                    pinned: !existing.pinned,
+                })
+                if (!updated) return message(404, 'Post not found.')
+                return json({ item: buildPostItemWithBadges(updated) })
+            }
+
+            if (actionType === 'editPost') {
+                const nextTitle = values.has('title')
+                    ? (String(values.get('title') ?? '').trim() || String(existing.item?.title ?? ''))
+                    : undefined
+                const nextDescription = values.has('description')
+                    ? String(values.get('description') ?? '').trim()
+                    : undefined
+
+                const updated = await lobby(env).updatePost(name, {
+                    ...(nextTitle !== undefined ? { title: nextTitle } : {}),
+                    ...(nextDescription !== undefined ? { description: nextDescription } : {}),
+                })
+                if (!updated) return message(404, 'Post not found.')
+                return json({ item: buildPostItemWithBadges(updated) })
+            }
+
+            const text = extractCommentText(values)
+            if (text) {
+                const updated = await lobby(env).addComment(name, user.handle, user.name || user.handle, text)
+                if (!updated) return message(404, 'Post not found.')
+                return json({ item: buildPostItemWithBadges(updated) })
+            }
+
+            return json({ item: buildPostItemWithBadges(existing) })
+        }
+
+        if (path === '/sonolus/playlists/info' && req.method === 'GET') {
+            const playlists = await getPlaylists(env)
+
+            return json({
+                creates: [],
+                searches: [],
+                sections: [
+                    {
+                        title: 'Playlists',
+                        items: playlists.map((playlist) => ({
+                            name: playlistSlug(playlist.name) || playlist.name,
+                            title: playlist.name,
+                            subtitle: `${playlist.charts.length} charts`,
+                            tags: [],
+                        })),
+                    },
+                ],
+                banner: {
+                    hash: '',
+                    url: '/sonolus/rooms/cover/xx',
+                },
+            })
+        }
+
+        if (path === '/sonolus/playlists/list' && req.method === 'GET') {
+            const keywords = url.searchParams.get('keywords')?.trim().toLowerCase() ?? ''
+            const playlists = await getPlaylists(env)
+
+            const filtered = keywords
+                ? playlists.filter((playlist) =>
+                    playlist.name.toLowerCase().includes(keywords))
+                : playlists
+
+            return json({
+                pageCount: 1,
+                items: filtered.map((playlist) => ({
+                    name: playlistSlug(playlist.name) || playlist.name,
+                    title: playlist.name,
+                    subtitle: `${playlist.charts.length} charts`,
+                    tags: [],
+                })),
+            })
+        }
+
+        const playlistMatch = path.match(/^\/sonolus\/playlists\/([^/]+)$/)
+        if (playlistMatch && req.method === 'GET') {
+            const slug = decodeURIComponent(playlistMatch[1]!)
+            const playlists = await getPlaylists(env)
+
+            const playlist = playlists.find(
+                (entry) =>
+                    samePlaylist(playlistSlug(entry.name), slug) ||
+                    samePlaylist(entry.name, slug),
+            )
+
+            if (!playlist) {
+                return message(404, 'Playlist not found.')
+            }
+
+            const cachedItems = await getCachedLevelItemsForCharts(env, playlist.charts)
+            const levels = cachedItems ?? (await loadLevelItems(playlist.charts)).map((x) => x.item)
+
+            return json({
+                item: {
+                    name: playlistSlug(playlist.name) || playlist.name,
+                    title: playlist.name,
+                    subtitle: `${levels.length} charts`,
+                    tags: [],
+                },
+                description: `${playlist.name} (${levels.length} charts).`,
+                actions: [],
+                hasCommunity: false,
+                leaderboards: [],
+                sections: [
+                    {
+                        title: 'Charts',
+                        items: levels,
+                    },
+                ],
+            })
+        }
+
+        if (path === '/sonolus/levels/info' && req.method === 'GET') {
+            const [{ charts, pageCount }, playlists] = await Promise.all([
+                getCustomLevelPage(0, env),
+                getPlaylists(env),
+            ])
+
+            const cachedItems = await getCachedLevelItemsForCharts(env, charts)
+            const levels = cachedItems ?? (await loadLevelItems(charts)).map((x) => x.item)
+
+            return json({
+                creates: [],
+                searches: [],
+                sections: [
+                    {
+                        title: 'Custom Levels',
+                        items: levels,
+                    },
+                    {
+                        title: 'Playlists',
+                        items: playlists.map((playlist) => ({
+                            name: playlistSlug(playlist.name) || playlist.name,
+                            title: playlist.name,
+                            subtitle: `${playlist.charts.length} charts`,
+                            tags: [],
+                        })),
+                    },
+                ],
+                banner: {
+                    hash: '',
+                    url: '/sonolus/rooms/cover/xx',
+                },
+                pageCount,
+            })
+        }
+
+        if (path === '/sonolus/levels/list' && req.method === 'GET') {
+            const page = Number(url.searchParams.get('page') ?? '0') || 0
+            const keywords = url.searchParams.get('keywords')?.trim().toLowerCase() ?? ''
+
+            const { charts, pageCount } = await getCustomLevelPage(page, env)
+            const cachedItems = await getCachedLevelItemsForCharts(env, charts)
+            const loaded = cachedItems
+                ? cachedItems.map((item) => ({ item }))
+                : await loadLevelItems(charts)
+
+            const items = loaded
+                .map(({ item }) => item)
+                .filter((item) => {
+                    if (!keywords) return true
+                    const title = String(item.title ?? '').toLowerCase()
+                    const artists = String(item.artists ?? '').toLowerCase()
+                    const author = String(item.author ?? '').toLowerCase()
+                    return (
+                        title.includes(keywords) ||
+                        artists.includes(keywords) ||
+                        author.includes(keywords)
+                    )
+                })
+
+            return json({
+                pageCount,
+                items,
+            })
+        }
+
+        const levelMatch = path.match(/^\/sonolus\/levels\/([^/]+)$/)
+        if (levelMatch && req.method === 'GET') {
+            const name = decodeURIComponent(levelMatch[1]!)
+            const chart = await findChart(name, env)
+
+            if (!chart) {
+                return message(404, 'Level not found.')
+            }
+
+            if (isUnch(chart)) {
+                return proxyToUnch(req, url, chart, '')
+            }
+
+            const details = await remoteLevelDetails(chart)
+            if (!details) {
+                return message(502, 'Could not load level data.')
+            }
+
+            return json({
+                ...details,
+                actions: [],
+                hasCommunity: false,
+                leaderboards: [],
+                sections: [],
+            })
+        }
+
+        const levelSubMatch = path.match(/^\/sonolus\/levels\/([^/]+)\/(.+)$/)
+        if (levelSubMatch) {
+            const name = decodeURIComponent(levelSubMatch[1]!)
+            const rest = levelSubMatch[2]!
+            const chart = await findChart(name, env)
+
+            if (!chart) {
+                return message(404, 'Level not found.')
+            }
+
+            return proxyToUnch(req, url, chart, rest)
+        }
+
+        const r2AssetMatch = path.match(/^\/(?:assets|r2)\/(.+)$/)
+        if (r2AssetMatch && req.method === 'GET') {
+            const key = decodeURIComponent(r2AssetMatch[1]!)
+            for (const bucket of bucketsForRead(env)) {
+                const obj = await bucket.get(key).catch(() => null)
+                if (obj) {
+                    return new Response(obj.body, {
+                        headers: {
+                            'Content-Type': obj.httpMetadata?.contentType ?? 'application/octet-stream',
+                            'Access-Control-Allow-Origin': '*',
+                            'Cache-Control': 'public, max-age=3600',
+                        },
+                    })
+                }
+            }
+            return new Response(null, { status: 404 })
+        }
+
+        return message(404, 'Not found.')
     },
-} satisfies ExportedHandler<WorkerEnv>
+}
