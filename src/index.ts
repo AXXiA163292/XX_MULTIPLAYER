@@ -3296,21 +3296,16 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-                        if (path === '/refresh' || path === '/admin/refresh') {
+                                if (path === '/refresh' || path === '/admin/refresh') {
             const summary = await refreshDailyAssets(env)
             await lobby(env).syncAllToR2().catch(() => {})
             return json({
                 ok: summary.errors.length === 0,
                 ...summary,
             })
-                        }
+        }
 
         const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
-        if (pfpMatch && req.method === 'GET') {
-            const handle = decodeURIComponent(pfpMatch[1]!).trim()
-            if (!CHAT_PFP_HANDLE_SET.has(handle)) {
-                return new Response(null, { status: 404 })
-            }
 
             const prefs = await getUserChatPrefs(env, handle)
             const keys = [
