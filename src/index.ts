@@ -1024,6 +1024,7 @@ function renderStaffChatHtml(
     cursor:pointer;
   }
   .btn-primary:hover{background:var(--plum-dark);color:#FFFFFF}
+  .btn-primary:disabled{opacity:.6;cursor:not-allowed}
 
   #picker{
     position:fixed;
@@ -1148,8 +1149,8 @@ function renderStaffChatHtml(
     color:var(--plum-dark);
     border:1.5px solid var(--blush-border);
     border-radius:10px;
-    padding:6px 14px;
-    font-size:12px;
+    padding:7px 16px;
+    font-size:12.5px;
     text-transform:uppercase;
     letter-spacing:.03em;
     cursor:pointer;
@@ -1346,12 +1347,13 @@ function renderStaffChatHtml(
   #mediaTab{
     flex:1 1 auto;
     min-height:0;
+    width:100%;
     display:none;
     flex-direction:column;
     overflow-y:auto;
     -webkit-overflow-scrolling:touch;
     overscroll-behavior:contain;
-    padding:14px 16px 28px;
+    padding:12px 12px 32px;
     gap:16px;
   }
   #mediaTab.active{display:flex}
@@ -1368,13 +1370,15 @@ function renderStaffChatHtml(
   .media-feed{
     display:flex;
     flex-direction:column;
-    gap:18px;
+    gap:20px;
+    width:100%;
   }
   .media-card{
     background:var(--surface);
     border:1.5px solid var(--blush-border);
     border-radius:16px;
     overflow:hidden;
+    width:100%;
     box-shadow:0 4px 16px rgba(45,27,37,.06);
   }
   .media-frame{
@@ -1556,6 +1560,7 @@ function renderStaffChatHtml(
   .sonolus-label{font-size:13px;font-weight:700;color:var(--plum-dark)}
   .sonolus-sub{font-size:12px;color:var(--muted)}
   .auth-error{font-size:13px;font-weight:700;color:#BE123C;min-height:18px}
+  .save-status{font-size:13px;font-weight:700;color:var(--plum-dark);min-height:18px}
   input[type=file]{font-size:13.5px;color:var(--muted);font-family:inherit}
   input[type=range]{width:100%;accent-color:var(--plum)}
   .crop-box{
@@ -1693,6 +1698,7 @@ function renderStaffChatHtml(
             <input id="zoomRange" type="range" min="1" max="3" step="0.02" value="1"/>
           </div>
         </div>
+        <div id="settingsStatus" class="save-status"></div>
         <div class="modal-actions">
           <button id="logoutBtn" type="button" class="btn-sm btn-danger">Log out</button>
           <div class="modal-actions-right">
@@ -1736,6 +1742,8 @@ function renderStaffChatHtml(
   const badgeEl = document.getElementById('userBadge');
   const settingsBtn = document.getElementById('settingsBtn');
   const logoutBtn = document.getElementById('logoutBtn');
+  const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+  const settingsStatusEl = document.getElementById('settingsStatus');
   const box = document.getElementById('messages');
   const shortcutsBar = document.getElementById('shortcutsBar');
   const input = document.getElementById('chatInput');
@@ -1958,6 +1966,7 @@ function renderStaffChatHtml(
     if (activeTab === 'chat') {
       box.scrollTop = box.scrollHeight;
     } else {
+      renderMedia(currentMedia);
       void refreshMediaList();
     }
   }
@@ -2222,6 +2231,7 @@ function renderStaffChatHtml(
     mediaUploadCard.style.display = active.handle === MEDIA_ADMIN ? 'flex' : 'none';
     pickerEl.classList.remove('open');
     appViewEl.classList.add('open');
+    setActiveTab(activeTab);
     syncViewportHeight();
     renderKnownUserChips();
     render(currentMessages, true);
@@ -2397,8 +2407,9 @@ function renderStaffChatHtml(
     const active = getActiveUser();
     if (!active) return;
     const p = prefsMap[active.handle] || {};
-    displayNameInput.value = active.name;
+    displayNameInput.value = p.displayName || active.name;
     notifyEmailInput.value = p.notifyEmail || '';
+    settingsStatusEl.textContent = '';
     applyNotifyModeUi(p.emailNotifyMode === 'all' ? 'all' : 'mention');
     pfpFileInput.value = '';
     zoomRange.value = '1';
@@ -2411,31 +2422,45 @@ function renderStaffChatHtml(
     settingsModal.classList.remove('open');
   });
 
-  document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
+  saveSettingsBtn.addEventListener('click', async () => {
     const active = getActiveUser();
-    if (!active) return;
-    const displayName = displayNameInput.value.trim() || active.name;
-    const notifyEmail = notifyEmailInput.value.trim();
-    const croppedPng = await buildCroppedSquareDataUrl();
-    const res = await fetch('/api/chat/settings', {
-      method: 'POST',
-      headers: authHeaders({ 'Content-Type': 'application/json' }),
-      credentials: 'same-origin',
-      body: JSON.stringify({
-        handle: active.handle,
-        displayName,
-        notifyEmail,
-        emailNotifyMode: selectedNotifyMode,
-        pfpDataUrl: croppedPng,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
+    if (!active) {
+      settingsStatusEl.textContent = 'Session expired. Re-select profile.';
+      return;
+    }
+    settingsStatusEl.textContent = 'Saving...';
+    saveSettingsBtn.disabled = true;
+    try {
+      const displayName = displayNameInput.value.trim() || active.name;
+      const notifyEmail = notifyEmailInput.value.trim();
+      const croppedPng = await buildCroppedSquareDataUrl();
+      const res = await fetch('/api/chat/settings', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          handle: active.handle,
+          displayName,
+          notifyEmail,
+          emailNotifyMode: selectedNotifyMode,
+          pfpDataUrl: croppedPng,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        settingsStatusEl.textContent = data.message || ('Save failed (' + res.status + ')');
+        return;
+      }
       if (data.prefs) {
         prefsMap[active.handle] = data.prefs;
       }
+      settingsStatusEl.textContent = 'Saved.';
       settingsModal.classList.remove('open');
       syncMode();
+    } catch (err) {
+      settingsStatusEl.textContent = err && err.message ? err.message : 'Network error saving settings.';
+    } finally {
+      saveSettingsBtn.disabled = false;
     }
   });
 
@@ -3246,6 +3271,11 @@ self.addEventListener('fetch', (event) => {
                 return message(403, 'Choose a valid handle to update settings.')
             }
 
+            const bucket = primaryCommunityBucket(env)
+            if (!bucket) {
+                return message(500, 'Community R2 bucket is not bound.')
+            }
+
             const handle = resolved.user.handle
             let pfpKey: string | undefined
 
@@ -3259,13 +3289,10 @@ self.addEventListener('fetch', (event) => {
                 if (rawBytes.byteLength > 2 * 1024 * 1024) {
                     return message(400, 'Profile image too large.')
                 }
-                const bucket = primaryCommunityBucket(env)
-                if (bucket) {
-                    pfpKey = `community/chat/pfp/${handle}.png`
-                    await bucket.put(pfpKey, rawBytes, {
-                        httpMetadata: { contentType: mime },
-                    })
-                }
+                pfpKey = `community/chat/pfp/${handle}.png`
+                await bucket.put(pfpKey, rawBytes, {
+                    httpMetadata: { contentType: mime },
+                })
             }
 
             const nextDisplayName = typeof body?.displayName === 'string' && body.displayName.trim()
