@@ -165,6 +165,17 @@ function sanitizeHttpLink(raw?: unknown): string {
     return ''
 }
 
+function buildPostShareUrl(req: Request, env: WorkerEnv, postId: string): string {
+    const cleanId = postId.replace(/^#/, '').trim()
+    return `${addressOf(req, env)}/p/${encodeURIComponent(cleanId)}`
+}
+
+function buildPostSonolusDeepLink(req: Request, env: WorkerEnv, postId: string): string {
+    const cleanId = postId.replace(/^#/, '').trim()
+    const hostAndBase = addressOf(req, env).replace(/^https?:\/\//, '')
+    return `sonolus://${hostAndBase}/sonolus/posts/${encodeURIComponent(cleanId)}`
+}
+
 async function getBucketObject(
     bucket: R2Bucket | null,
     keys: string[],
@@ -272,6 +283,7 @@ async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
     const bucket = communityBucket(env)
     if (!bucket) return []
 
+    const indexed: ChatMediaItem[] = []
     for (const key of [MEDIA_INDEX_KEY, 'media/index.json']) {
         try {
             const obj = await bucket.get(key)
@@ -282,14 +294,41 @@ async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
                 : Array.isArray(parsed?.items)
                     ? parsed.items
                     : []
-            return rawList
-                .filter((item): item is ChatMediaItem => Boolean(item && typeof item.id === 'string' && typeof item.imageKey === 'string'))
-                .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+            for (const item of rawList) {
+                if (item && typeof item.id === 'string' && typeof item.imageKey === 'string') {
+                    indexed.push(item)
+                }
+            }
+            if (indexed.length > 0) break
         } catch {
             // try next
         }
     }
-    return []
+
+    if (indexed.length > 0) {
+        return indexed.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    }
+
+    // Fallback to objects stored directly under chat/media/ in R2
+    try {
+        const listed = await bucket.list({ prefix: 'chat/media/' })
+        const derived: ChatMediaItem[] = []
+        for (const obj of listed.objects ?? []) {
+            if (!obj.key || obj.key.endsWith('/') || obj.key.endsWith('.json')) continue
+            const fileName = obj.key.slice('chat/media/'.length)
+            const id = fileName.replace(/\.[^.]+$/, '') || fileName
+            derived.push({
+                id,
+                imageKey: obj.key,
+                contentType: obj.httpMetadata?.contentType ?? 'image/png',
+                createdAt: obj.uploaded ? new Date(obj.uploaded).getTime() : Date.now(),
+                authorHandle: MEDIA_ADMIN_HANDLE,
+            })
+        }
+        return derived.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    } catch {
+        return []
+    }
 }
 
 async function saveChatMediaIndex(env: WorkerEnv, items: ChatMediaItem[]): Promise<void> {
@@ -697,9 +736,9 @@ function externalChatUrl(req: Request, env: WorkerEnv): string {
     return `${addressOf(req, env)}/chat`
 }
 
-function sonolusDeepLinkUrl(req: Request, env: WorkerEnv): string {
-    const serverUrl = `${addressOf(req, env)}/sonolus`
-    return `sonolus://external-server/${encodeURIComponent(serverUrl)}`
+function sonolusChatLinkUrl(req: Request, env: WorkerEnv): string {
+    const hostAndBase = addressOf(req, env).replace(/^https?:\/\//, '')
+    return `sonolus://${hostAndBase}/sonolus/posts/chat`
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -820,6 +859,89 @@ function escapeAttr(str: string): string {
         .replace(/"/g, '&quot;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
+}
+
+function renderPostShareHtml(
+    post: StoredPost,
+    shareUrl: string,
+    sonolusDeepLink: string,
+    sonolusItemUrl: string,
+): string {
+    const title = String(post.item?.title ?? 'Post')
+    const author = String(post.item?.author ?? '')
+    const desc = String(post.description ?? '')
+    const categoryLabel = POST_LABELS[post.category]?.section ?? post.category
+    const hasThumb = Boolean(post.thumbnailHash)
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#9E4B76"/>
+<meta property="og:title" content="${escapeAttr(title)}"/>
+<meta property="og:description" content="${escapeAttr(desc.slice(0, 240))}"/>
+${hasThumb ? `<meta property="og:image" content="${escapeAttr(shareUrl.replace(/\/p\/[^/]+$/, `/sonolus/posts/${encodeURIComponent(post.item.name)}/thumbnail`))}"/>` : ''}
+<title>${escapeAttr(title)} — XX!</title>
+<style>
+  :root{--plum:#9E4B76;--plum-dark:#833B61;--blush:#F4DCE6;--blush-soft:#FBF2F6;--blush-border:#E8C6D6;--bg:#FAF7F9;--surface:#FFFFFF;--text:#2D1B25;--muted:#7D5D6E}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:24px 16px;display:flex;justify-content:center}
+  .card{width:100%;max-width:560px;background:var(--surface);border:2px solid var(--blush-border);border-radius:18px;overflow:hidden;box-shadow:0 10px 28px rgba(87,35,62,.1)}
+  .top{background:var(--plum);color:var(--blush);padding:16px 20px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .cat{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;background:rgba(244,220,230,.18);padding:4px 10px;border-radius:999px}
+  .body{padding:20px;display:flex;flex-direction:column;gap:14px}
+  h1{font-size:21px;line-height:1.25}
+  .meta{font-size:13px;color:var(--muted);font-weight:600}
+  .desc{font-size:15px;line-height:1.55;white-space:pre-wrap;word-break:break-word;background:var(--blush-soft);border:1px solid var(--blush-border);border-radius:12px;padding:14px}
+  .link-box{display:flex;gap:8px;align-items:center}
+  input{flex:1;min-width:0;padding:10px 12px;border:1.5px solid var(--blush-border);border-radius:10px;font-size:13px;background:var(--bg);color:var(--text)}
+  .btn{display:inline-flex;align-items:center;justify-content:center;padding:10px 16px;border-radius:10px;font-weight:700;font-size:13px;text-decoration:none;border:none;cursor:pointer}
+  .btn-primary{background:var(--plum);color:var(--blush)}
+  .btn-secondary{background:var(--blush);color:var(--plum-dark)}
+  .actions{display:flex;gap:10px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+  <article class="card">
+    <div class="top">
+      <strong>XX!</strong>
+      <span class="cat">${escapeAttr(categoryLabel)}</span>
+    </div>
+    <div class="body">
+      <div>
+        <h1>${escapeAttr(title)}</h1>
+        <div class="meta">${escapeAttr(author)} · #${escapeAttr(post.item.name)}</div>
+      </div>
+      <div class="desc">${escapeAttr(desc)}</div>
+      <div class="link-box">
+        <input id="shareInput" type="text" readonly value="${escapeAttr(shareUrl)}"/>
+        <button id="copyBtn" type="button" class="btn btn-secondary">Copy Link</button>
+      </div>
+      <div class="actions">
+        <a class="btn btn-primary" href="${escapeAttr(sonolusDeepLink)}">Open in Sonolus</a>
+        <a class="btn btn-secondary" href="${escapeAttr(sonolusItemUrl)}">Post JSON</a>
+      </div>
+    </div>
+  </article>
+  <script>
+    const copyBtn = document.getElementById('copyBtn');
+    const shareInput = document.getElementById('shareInput');
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(shareInput.value);
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy Link'; }, 1500);
+      } catch {
+        shareInput.select();
+        document.execCommand('copy');
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = 'Copy Link'; }, 1500);
+      }
+    });
+  </script>
+</body>
+</html>`
 }
 
 const RANKED_TIERS_UPPER = new Set([
@@ -1024,6 +1146,16 @@ function renderStaffChatHtml(
   }
   .btn-header:hover{background:#FFFFFF}
   .btn-header:active{transform:scale(.97)}
+  .btn-plus{
+    width:34px;
+    height:34px;
+    padding:0;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    font-size:20px;
+    line-height:1;
+  }
   .btn-sm{
     background:var(--blush-soft);
     color:var(--plum-dark);
@@ -1385,44 +1517,25 @@ function renderStaffChatHtml(
     overflow-y:auto;
     -webkit-overflow-scrolling:touch;
     overscroll-behavior:contain;
-    padding:12px 12px 32px;
+    padding:0 0 32px;
     gap:16px;
   }
   #mediaTab.active{display:flex}
-  .media-upload-card{
-    background:var(--surface);
-    border:1.5px solid var(--blush-border);
-    border-radius:16px;
-    padding:14px 16px;
-    display:flex;
-    flex-direction:column;
-    gap:10px;
-    box-shadow:0 4px 14px rgba(158,75,118,.08);
-  }
   .media-feed{
     display:flex;
     flex-direction:column;
-    gap:20px;
+    gap:16px;
     width:100%;
   }
   .media-card{
     background:var(--surface);
-    border:1.5px solid var(--blush-border);
-    border-radius:16px;
-    overflow:hidden;
+    border-top:1.5px solid var(--blush-border);
+    border-bottom:1.5px solid var(--blush-border);
     width:100%;
-    box-shadow:0 4px 16px rgba(45,27,37,.06);
   }
-  .media-frame{
+  .media-card img{
     width:100%;
-    aspect-ratio:16/9;
-    background:var(--plum-deep);
-    display:block;
-  }
-  .media-frame img{
-    width:100%;
-    height:100%;
-    object-fit:cover;
+    height:auto;
     display:block;
   }
   .media-meta{
@@ -1629,6 +1742,7 @@ function renderStaffChatHtml(
     </div>
     <div class="header-right">
       <span id="userBadge" class="badge"></span>
+      <button id="addMediaHeaderBtn" type="button" class="btn-header btn-plus" style="display:none" title="Add Media" aria-label="Add Media">+</button>
       <button id="settingsBtn" type="button" class="btn-header" style="display:none">Settings</button>
     </div>
   </header>
@@ -1661,17 +1775,35 @@ function renderStaffChatHtml(
       </footer>
     </div>
     <div id="mediaTab">
-      <div id="mediaUploadCard" class="media-upload-card" style="display:none">
-        <span class="field-label">Add 16:9 Media (#163292)</span>
-        <input id="mediaFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
-        <input id="mediaLinkInput" type="url" maxlength="400" placeholder="Optional link (https://...)"/>
-        <input id="mediaCaptionInput" type="text" maxlength="160" placeholder="Optional caption"/>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-          <span id="mediaStatus" class="auth-error"></span>
-          <button id="uploadMediaBtn" type="button" class="btn-primary">Upload Media</button>
+      <div id="mediaFeed" class="media-feed"></div>
+    </div>
+  </div>
+  <div id="mediaUploadModal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">Upload Media (#163292)</div>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="mediaFileInput">Image (keeps original aspect ratio)</label>
+          <input id="mediaFileInput" type="file" accept="image/png,image/jpeg,image/webp"/>
+        </div>
+        <div>
+          <label class="field-label" for="mediaLinkInput">Optional Link</label>
+          <input id="mediaLinkInput" type="url" maxlength="400" placeholder="https://..."/>
+        </div>
+        <div>
+          <label class="field-label" for="mediaCaptionInput">Optional Caption</label>
+          <input id="mediaCaptionInput" type="text" maxlength="160" placeholder="Caption"/>
+        </div>
+        <div id="mediaStatus" class="auth-error"></div>
+        <div class="modal-actions">
+          <div class="modal-actions-right">
+            <button id="closeMediaModalBtn" type="button" class="btn-sm">Cancel</button>
+            <button id="uploadMediaBtn" type="button" class="btn-primary">Upload</button>
+          </div>
         </div>
       </div>
-      <div id="mediaFeed" class="media-feed"></div>
     </div>
   </div>
   <div id="passwordModal" class="modal-backdrop">
@@ -1763,7 +1895,9 @@ function renderStaffChatHtml(
   const tabMediaBtn = document.getElementById('tabMediaBtn');
   const chatTabEl = document.getElementById('chatTab');
   const mediaTabEl = document.getElementById('mediaTab');
-  const mediaUploadCard = document.getElementById('mediaUploadCard');
+  const addMediaHeaderBtn = document.getElementById('addMediaHeaderBtn');
+  const mediaUploadModal = document.getElementById('mediaUploadModal');
+  const closeMediaModalBtn = document.getElementById('closeMediaModalBtn');
   const mediaFileInput = document.getElementById('mediaFileInput');
   const mediaLinkInput = document.getElementById('mediaLinkInput');
   const mediaCaptionInput = document.getElementById('mediaCaptionInput');
@@ -2006,6 +2140,18 @@ function renderStaffChatHtml(
   tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
   tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
 
+  addMediaHeaderBtn.addEventListener('click', () => {
+    const active = getActiveUser();
+    if (!active || active.handle !== MEDIA_ADMIN) return;
+    setActiveTab('media');
+    mediaStatusEl.textContent = '';
+    mediaUploadModal.classList.add('open');
+  });
+
+  closeMediaModalBtn.addEventListener('click', () => {
+    mediaUploadModal.classList.remove('open');
+  });
+
   function renderMedia(items) {
     if (Array.isArray(items)) {
       currentMedia = items;
@@ -2014,7 +2160,7 @@ function renderStaffChatHtml(
     const canDelete = active && active.handle === MEDIA_ADMIN;
 
     if (!currentMedia.length) {
-      mediaFeedEl.innerHTML = '<div class="empty-state">No media items yet.</div>';
+      mediaFeedEl.innerHTML = '<div class="empty-state">No media uploaded yet.</div>';
       return;
     }
 
@@ -2032,7 +2178,7 @@ function renderStaffChatHtml(
         : '';
 
       return '<article class="media-card">' +
-        '<div class="media-frame"><img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/></div>' +
+        '<img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/>' +
         '<div class="media-meta">' +
           '<div style="display:flex;flex-direction:column;gap:4px;min-width:0">' + captionHtml + linkHtml + '</div>' +
           delHtml +
@@ -2054,45 +2200,13 @@ function renderStaffChatHtml(
     }
   }
 
-  async function fileTo16x9DataUrl(file) {
-    const dataUrl = await new Promise((resolve, reject) => {
+  async function fileToDataUrl(file) {
+    return await new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result || ''));
       reader.onerror = () => reject(new Error('Failed to read image'));
       reader.readAsDataURL(file);
     });
-    const img = await new Promise((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = () => reject(new Error('Invalid image'));
-      el.src = dataUrl;
-    });
-
-    const targetW = 1280;
-    const targetH = 720;
-    const targetRatio = targetW / targetH;
-    const srcW = img.naturalWidth || targetW;
-    const srcH = img.naturalHeight || targetH;
-    const srcRatio = srcW / srcH;
-
-    let sx = 0;
-    let sy = 0;
-    let sw = srcW;
-    let sh = srcH;
-    if (srcRatio > targetRatio) {
-      sw = Math.round(srcH * targetRatio);
-      sx = Math.round((srcW - sw) / 2);
-    } else if (srcRatio < targetRatio) {
-      sh = Math.round(srcW / targetRatio);
-      sy = Math.round((srcH - sh) / 2);
-    }
-
-    const canvas = document.createElement('canvas');
-    canvas.width = targetW;
-    canvas.height = targetH;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, targetW, targetH);
-    return canvas.toDataURL('image/png');
   }
 
   uploadMediaBtn.addEventListener('click', async () => {
@@ -2106,7 +2220,7 @@ function renderStaffChatHtml(
     mediaStatusEl.textContent = 'Uploading...';
     uploadMediaBtn.disabled = true;
     try {
-      const imageDataUrl = await fileTo16x9DataUrl(file);
+      const imageDataUrl = await fileToDataUrl(file);
       const res = await fetch('/api/chat/media', {
         method: 'POST',
         headers: authHeaders({ 'Content-Type': 'application/json' }),
@@ -2127,6 +2241,7 @@ function renderStaffChatHtml(
       mediaLinkInput.value = '';
       mediaCaptionInput.value = '';
       mediaStatusEl.textContent = '';
+      mediaUploadModal.classList.remove('open');
       if (Array.isArray(data.items)) renderMedia(data.items);
     } finally {
       uploadMediaBtn.disabled = false;
@@ -2248,6 +2363,7 @@ function renderStaffChatHtml(
     if (!active) {
       disconnectSocket();
       badgeEl.textContent = 'Select profile';
+      addMediaHeaderBtn.style.display = 'none';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
       appViewEl.classList.remove('open');
@@ -2259,8 +2375,8 @@ function renderStaffChatHtml(
     }
 
     badgeEl.textContent = formatTag(active.name, active.handle);
+    addMediaHeaderBtn.style.display = active.handle === MEDIA_ADMIN ? 'inline-flex' : 'none';
     settingsBtn.style.display = 'inline-block';
-    mediaUploadCard.style.display = active.handle === MEDIA_ADMIN ? 'flex' : 'none';
     pickerEl.classList.remove('open');
     appViewEl.classList.add('open');
     setActiveTab(activeTab);
@@ -2728,6 +2844,61 @@ function postForm(category: PostCategory) {
     }
 }
 
+function makeEditPostForm(post: StoredPost) {
+    return {
+        name: 'Edit',
+        type: 'editPost',
+        title: 'Edit',
+        icon: 'edit',
+        requireConfirmation: false,
+        options: [
+            {
+                name: 'Title',
+                query: 'title',
+                required: false,
+                type: 'text',
+                def: String(post.item?.title ?? ''),
+                placeholder: 'Post title',
+                limit: 100,
+                shortcuts: [],
+            },
+            {
+                name: 'Description',
+                query: 'description',
+                required: false,
+                type: 'textArea',
+                def: String(post.description ?? ''),
+                placeholder: 'Post description',
+                limit: 2000,
+                shortcuts: [],
+            },
+            {
+                name: 'Thumbnail',
+                query: 'thumbnail',
+                description: 'Optional replacement image.',
+                required: false,
+                type: 'file',
+                def: '',
+                validation: {
+                    type: 'postThumbnail',
+                    maxSize: 5242880,
+                    maxWidth: 2048,
+                    maxHeight: 2048,
+                },
+            },
+        ],
+    }
+}
+
+const sharePostForm = {
+    name: 'Share',
+    type: 'sharePost',
+    title: 'Share Link',
+    icon: 'share',
+    requireConfirmation: false,
+    options: [],
+}
+
 function makeLikePostForm(liked: boolean) {
     return {
         name: liked ? 'Unlike' : 'Like',
@@ -2762,12 +2933,12 @@ const deletePostForm = {
 function postActionsFor(post: StoredPost, session: AuthSession | null) {
     const liked = Boolean(session && (post.likes ?? []).includes(session.user.handle))
     const pinned = Boolean(post.pinned)
-    const actions = [
+    const actions: any[] = [
+        sharePostForm,
         makeLikePostForm(liked),
-        makePinPostForm(pinned),
     ]
     if (canManagePosts(session)) {
-        actions.push(deletePostForm)
+        actions.push(makeEditPostForm(post), makePinPostForm(pinned), deletePostForm)
     }
     return actions
 }
@@ -3026,6 +3197,17 @@ export default {
             })
         }
 
+        const sharePageMatch = path.match(/^\/p\/([\w-]+)$/)
+        if (sharePageMatch && req.method === 'GET') {
+            const postId = decodeURIComponent(sharePageMatch[1]!)
+            const post = await lobby(env).getPost(postId).catch(() => null)
+            if (!post) return new Response('Post not found', { status: 404 })
+            const shareUrl = buildPostShareUrl(req, env, postId)
+            const deepLink = buildPostSonolusDeepLink(req, env, postId)
+            const itemUrl = `${addressOf(req, env)}/sonolus/posts/${encodeURIComponent(postId)}`
+            return html(renderPostShareHtml(post, shareUrl, deepLink, itemUrl))
+        }
+
         if (path === '/manifest.webmanifest' && req.method === 'GET') {
             return new Response(JSON.stringify({
                 name: 'XX!',
@@ -3202,6 +3384,8 @@ self.addEventListener('fetch', (event) => {
             const obj = await getBucketObject(communityBucket(env), [
                 target.imageKey,
                 `chat/media/${mediaId}.png`,
+                `chat/media/${mediaId}.jpg`,
+                `chat/media/${mediaId}.webp`,
             ])
             if (!obj) return new Response(null, { status: 404 })
 
@@ -3246,8 +3430,9 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const mime = match[1]!
+                const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
                 const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
-                if (rawBytes.byteLength > 4 * 1024 * 1024) {
+                if (rawBytes.byteLength > 8 * 1024 * 1024) {
                     return message(400, 'Media image too large.')
                 }
 
@@ -3257,7 +3442,7 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const id = randomId(12)
-                const imageKey = `chat/media/${id}.png`
+                const imageKey = `chat/media/${id}.${ext}`
                 await bucket.put(imageKey, rawBytes, {
                     httpMetadata: { contentType: mime },
                 })
@@ -3399,7 +3584,7 @@ self.addEventListener('fetch', (event) => {
             ])
             const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
-            const sUrl = sonolusDeepLinkUrl(req, env)
+            const sUrl = sonolusChatLinkUrl(req, env)
             if (resolved) {
                 return html(
                     renderStaffChatHtml(
@@ -4051,11 +4236,55 @@ self.addEventListener('fetch', (event) => {
             const post = await lobby(env).getPost(postName).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
 
+            if (actionType === 'sharePost') {
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateItem: false,
+                })
+            }
+
             if (actionType === 'likePost') {
                 await lobby(env).togglePostLike(postName, session.user.handle)
                 return json({
                     key: '',
                     hashes: [],
+                    shouldUpdateItem: true,
+                })
+            }
+
+            if (actionType === 'editPost') {
+                if (!canManagePosts(session)) {
+                    return message(403, 'Only handle 163292 can edit posts.')
+                }
+
+                const nextTitle = (values.get('title') ?? String(post.item?.title ?? '')).trim()
+                const nextDescription = (values.get('description') ?? String(post.description ?? '')).trim()
+                const nextThumbHash = (values.get('thumbnail') ?? '').trim()
+
+                if (!nextTitle || !nextDescription) {
+                    return message(400, 'A title and content are required.')
+                }
+
+                if (nextTitle.length > 100 || nextDescription.length > 2000) {
+                    return message(400, 'Post title or description exceeds maximum length.')
+                }
+
+                const updatedPost: StoredPost = {
+                    ...post,
+                    item: {
+                        ...post.item,
+                        title: nextTitle,
+                    },
+                    description: nextDescription,
+                    ...(nextThumbHash ? { thumbnailHash: nextThumbHash } : {}),
+                }
+
+                await lobby(env).updatePost(updatedPost)
+
+                return json({
+                    key: nextThumbHash ? post.uploadKey || randomId(24) : '',
+                    hashes: nextThumbHash ? [nextThumbHash] : [],
                     shouldUpdateItem: true,
                 })
             }
@@ -4244,12 +4473,20 @@ self.addEventListener('fetch', (event) => {
                 })
             }
 
-            const post = await lobby(env).getPost(postPath[1]!).catch(() => null)
+            const postId = postPath[1]!
+            const post = await lobby(env).getPost(postId).catch(() => null)
             if (!post) return new Response(null, { status: 404 })
+
+            const shareUrl = buildPostShareUrl(req, env, postId)
+            const deepLink = buildPostSonolusDeepLink(req, env, postId)
+            const baseDesc = String(post.description ?? '')
+            const fullDesc = baseDesc.includes(shareUrl)
+                ? baseDesc
+                : `${baseDesc}\n\nShare Link:\n${shareUrl}\nSonolus Link:\n${deepLink}`
 
             return json({
                 item: buildPostItemWithBadges(post),
-                description: post.description,
+                description: fullDesc,
                 actions: postActionsFor(post, session),
                 hasCommunity: true,
                 leaderboards: [],
