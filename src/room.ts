@@ -10,11 +10,12 @@ import type {
     GameplayResult,
     JoinSession,
     LevelItem,
-    MatchMode,
     RoomMember,
     RoomSettings,
+    RoomStatus,
     RoomSummary,
     UserProfile,
+    UserStatus,
 } from './types.ts'
 import { verifyToken } from './crypto.ts'
 import {
@@ -37,6 +38,8 @@ type Connection = {
 type PersistedState = {
     name: string
     key: string
+    configured: boolean
+    status: RoomStatus
     hostId: string
     hostName: string
     hostHandle: string
@@ -108,14 +111,25 @@ function normalizeGrade(raw: any): GameplayResult['grade'] {
 
 function normalizeResult(raw: any): GameplayResult {
     const grade = normalizeGrade(raw?.grade)
+    const perfect = Number(raw?.perfect) || 0
+    const great = Number(raw?.great) || 0
+    const good = Number(raw?.good) || 0
+    const miss = Number(raw?.miss) || 0
+    const totalCount = Number(raw?.totalCount) || (perfect + great + good + miss)
+    const score = Number(raw?.score ?? raw?.arcadeScore) || 0
+    const accuracy = Math.max(0, Math.min(1, Number(raw?.accuracy) || 0))
+
     return {
-        score: Number(raw?.score) || 0,
-        accuracy: Math.max(0, Math.min(1, Number(raw?.accuracy) || 0)),
+        score,
+        arcadeScore: Number(raw?.arcadeScore) || score,
+        accuracyScore: Number(raw?.accuracyScore) || Math.round(accuracy * 10000),
+        accuracy,
         combo: Number(raw?.combo) || 0,
-        perfect: Number(raw?.perfect) || 0,
-        great: Number(raw?.great) || 0,
-        good: Number(raw?.good) || 0,
-        miss: Number(raw?.miss) || 0,
+        perfect,
+        great,
+        good,
+        miss,
+        totalCount,
         grade,
     }
 }
@@ -151,8 +165,9 @@ function fmtDetail(member: RoomMember): string {
         const r = member.lastResult
         const gradeText = formatGradeLabel(r.grade)
         const accPct = (r.accuracy * 100).toFixed(2)
+        const scoreVal = r.score ?? r.arcadeScore ?? 0
         parts.push(
-            `Last: ${r.score.toLocaleString()} pts · ${accPct}% · ${r.combo} combo · ${gradeText}`,
+            `Last: ${scoreVal.toLocaleString()} pts · ${accPct}% · ${r.combo} combo · ${gradeText}`,
         )
     } else if (member.lastPlayCount > 0) {
         parts.push(`Plays: ${member.lastPlayCount}`)
@@ -182,7 +197,11 @@ export class Room extends DurableObject {
         void ctx.blockConcurrencyWhile(async () => {
             const saved = await this.ctx.storage.get<PersistedState>('room')
             if (saved) {
-                this.state = saved
+                this.state = {
+                    ...saved,
+                    configured: Boolean(saved.configured),
+                    status: saved.status ?? 'selecting',
+                }
                 if (this.state.members.some((m) => m.playing)) {
                     this.scheduleRoundTimer()
                 }
@@ -200,12 +219,12 @@ export class Room extends DurableObject {
     }
 
     private async syncLobby(): Promise<void> {
-        if (!this.state) return
+        if (!this.state?.name) return
         try {
-            if (this.state.members.length === 0) {
-                await this.lobbyStub().remove(this.state.name)
-            } else {
+            if (this.state.configured && this.state.members.length > 0) {
                 await this.lobbyStub().register(this.state.name)
+            } else {
+                await this.lobbyStub().remove(this.state.name)
             }
         } catch (error) {
             console.error('Could not sync room with lobby:', error)
@@ -300,6 +319,8 @@ export class Room extends DurableObject {
             this.state = {
                 name,
                 key: meta.key,
+                configured: false,
+                status: 'selecting',
                 hostId: meta.hostId,
                 hostName: meta.hostName,
                 hostHandle: meta.hostHandle,
@@ -323,11 +344,11 @@ export class Room extends DurableObject {
     }
 
     async isOpen(): Promise<boolean> {
-        return Boolean(this.state)
+        return Boolean(this.state && this.state.configured)
     }
 
     async canJoin(user: UserProfile): Promise<string | null> {
-        if (!this.state) return 'Room does not exist.'
+        if (!this.state || !this.state.configured) return 'Room does not exist.'
 
         const s = this.state.settings
         if (this.state.members.length >= s.maxCount) {
@@ -378,6 +399,8 @@ export class Room extends DurableObject {
                 ? settings.timeLimitSec
                 : 180,
         }
+        this.state.configured = true
+        this.state.status = 'selecting'
 
         await this.save()
         await this.syncLobby()
@@ -386,7 +409,7 @@ export class Room extends DurableObject {
     }
 
     async summary(): Promise<RoomSummary | null> {
-        if (!this.state) return null
+        if (!this.state || !this.state.configured) return null
         const s = this.state.settings
         const modeLabel = s.matchMode === 'ranked' ? 'RANKED' : 'CASUAL'
         const roundText = s.roundCount ? `R${Math.min(this.state.roundNumber + 1, s.roundCount)}/${s.roundCount}` : ''
@@ -421,6 +444,7 @@ export class Room extends DurableObject {
         return {
             name: this.state.name,
             title: s.title,
+            status: this.state.status,
             master: s.master,
             maxCount: s.maxCount,
             visibility: s.visibility,
@@ -434,6 +458,7 @@ export class Room extends DurableObject {
                 user: m.user,
                 ready: m.ready,
                 playing: m.playing,
+                status: m.status ?? (m.playing ? 'playing' : m.ready ? 'ready' : 'waiting'),
                 detail: fmtDetail(m),
                 lastResult: m.lastResult ? sanitizeWireResult(m.lastResult) : undefined,
                 pp: m.pp ?? 0,
@@ -472,20 +497,25 @@ export class Room extends DurableObject {
     private async finishRound(reason: 'allFinished' | 'timeout' | 'manual'): Promise<void> {
         if (!this.state) return
         this.clearRoundTimer()
+        this.state.status = 'selecting'
 
         const activePlayers = this.state.members.filter((m) => m.playing)
         for (const m of activePlayers) {
             m.playing = false
             m.ready = false
+            m.status = 'waiting'
             if (!m.lastResult) {
                 m.lastResult = {
                     score: 0,
+                    arcadeScore: 0,
+                    accuracyScore: 0,
                     accuracy: 0,
                     combo: 0,
                     perfect: 0,
                     great: 0,
                     good: 0,
                     miss: 0,
+                    totalCount: 0,
                     grade: 'fail',
                 }
             }
@@ -508,6 +538,7 @@ export class Room extends DurableObject {
         for (const player of participants) {
             const lb = this.ensureLeaderboardEntry(player.user)!
             const res = player.lastResult!
+            const scoreVal = res.score ?? res.arcadeScore ?? 0
             const pp = computePp(res, lb.rating, mode)
             player.pp = pp
             lb.pp = Math.max(lb.pp, pp)
@@ -520,11 +551,13 @@ export class Room extends DurableObject {
                 let totalDelta = 0
                 for (const opp of opponents) {
                     const oppLb = this.ensureLeaderboardEntry(opp.user)!
-                    const oppScore = isPlayerX(opp.lastResult) ? -1 : (opp.lastResult?.score ?? 0)
+                    const oppScore = isPlayerX(opp.lastResult)
+                        ? -1
+                        : (opp.lastResult?.score ?? opp.lastResult?.arcadeScore ?? 0)
                     totalDelta += calculateRatingDelta(
                         lb.rating,
                         oppLb.rating,
-                        res.score,
+                        scoreVal,
                         oppScore,
                         mode,
                     )
@@ -534,10 +567,12 @@ export class Room extends DurableObject {
 
             if (opponents.length > 0 && !isPlayerX(res)) {
                 const topOppScore = Math.max(
-                    ...opponents.map((o) => (isPlayerX(o.lastResult) ? -1 : (o.lastResult?.score ?? 0))),
+                    ...opponents.map((o) =>
+                        isPlayerX(o.lastResult) ? -1 : (o.lastResult?.score ?? o.lastResult?.arcadeScore ?? 0),
+                    ),
                 )
-                if (res.score > topOppScore) lb.wins += 1
-                else if (res.score < topOppScore) lb.losses += 1
+                if (scoreVal > topOppScore) lb.wins += 1
+                else if (scoreVal < topOppScore) lb.losses += 1
                 else lb.draws += 1
             }
 
@@ -550,7 +585,7 @@ export class Room extends DurableObject {
             roundEntries.push({
                 handle: player.user.handle,
                 name: player.user.name || player.user.handle,
-                score: res.score,
+                score: scoreVal,
                 accuracy: res.accuracy,
                 combo: res.combo,
                 grade: res.grade,
@@ -568,12 +603,10 @@ export class Room extends DurableObject {
         this.state.roundHistory = this.state.roundHistory.slice(-20)
 
         const maxRounds = this.state.settings.roundCount ?? 3
-        if (this.state.roundNumber < maxRounds) {
-            this.state.settings.level = await this.pickRandomLevel(this.state.settings.levelPool)
-        } else {
+        if (this.state.roundNumber >= maxRounds) {
             this.state.roundNumber = 0
-            this.state.settings.level = await this.pickRandomLevel(this.state.settings.levelPool)
         }
+        this.state.settings.level = await this.pickRandomLevel(this.state.settings.levelPool)
 
         await this.save()
         await this.syncLobby()
@@ -606,24 +639,46 @@ export class Room extends DurableObject {
             member.user.handle === this.state.hostHandle ||
             member.user.handle === TOURNAMENT_HOST_HANDLE
 
-        if (msg?.type === 'setReady') {
-            member.ready = Boolean(msg.ready)
+        const msgType = String(msg?.type ?? '')
+
+        if (msgType === 'setReady' || msgType === 'updateStatus') {
+            const nextStatus: UserStatus = typeof msg.status === 'string'
+                ? msg.status
+                : msg.ready
+                    ? 'ready'
+                    : 'waiting'
+            member.status = nextStatus
+            member.ready = nextStatus === 'ready'
+            member.playing = nextStatus === 'playing'
             await this.save()
             this.broadcastRoomState()
             return
         }
 
-        if (msg?.type === 'startRound') {
+        if (msgType === 'updateOptionValues' && isHost && msg.options && typeof msg.options === 'object') {
+            this.state.settings = {
+                ...this.state.settings,
+                ...msg.options,
+            }
+            await this.save()
+            await this.syncLobby()
+            this.broadcastRoomState()
+            return
+        }
+
+        if (msgType === 'startRound' || msgType === 'startGameplay') {
             if (!isHost) {
                 this.send(conn.ws, { type: 'error', message: 'Only the host can start the round.' })
                 return
             }
 
+            this.state.status = 'playing'
             for (const m of this.state.members) {
                 m.previousResult = m.lastResult
                 m.lastResult = undefined
                 m.playing = true
                 m.ready = false
+                m.status = 'playing'
                 m.lastPlayCount += 1
                 m.lastPlayLevel = this.state.settings.level
                 m.lastPlayAt = Date.now()
@@ -641,11 +696,12 @@ export class Room extends DurableObject {
             return
         }
 
-        if (msg?.type === 'finishResult') {
-            const result = normalizeResult(msg.result)
+        if (msgType === 'finishResult' || msgType === 'finishGameplay') {
+            const result = normalizeResult(msg.result ?? msg)
             member.lastResult = result
             member.playing = false
             member.ready = false
+            member.status = 'waiting'
 
             const lb = this.ensureLeaderboardEntry(member.user)!
             member.pp = computePp(result, lb.rating, this.state.settings.matchMode ?? 'casual')
@@ -663,7 +719,7 @@ export class Room extends DurableObject {
             return
         }
 
-        if (msg?.type === 'rewind') {
+        if (msgType === 'rewind') {
             if (!isEligibleForRewind(member)) {
                 this.send(conn.ws, {
                     type: 'error',
@@ -675,6 +731,8 @@ export class Room extends DurableObject {
             member.lastResult = undefined
             member.playing = true
             member.ready = false
+            member.status = 'playing'
+            this.state.status = 'playing'
             this.scheduleRoundTimer()
             await this.save()
             this.broadcast({
@@ -685,7 +743,7 @@ export class Room extends DurableObject {
             return
         }
 
-        if (msg?.type === 'chat') {
+        if (msgType === 'chat') {
             const text = String(msg.text ?? '').trim().slice(0, 300)
             if (!text) return
 
@@ -713,23 +771,28 @@ export class Room extends DurableObject {
             if (member.playing && !member.lastResult) {
                 member.lastResult = {
                     score: 0,
+                    arcadeScore: 0,
+                    accuracyScore: 0,
                     accuracy: 0,
                     combo: 0,
                     perfect: 0,
                     great: 0,
                     good: 0,
                     miss: 0,
+                    totalCount: 0,
                     grade: 'X',
                 }
             }
             member.playing = false
             member.ready = false
+            member.status = 'waiting'
         }
 
         this.state.members = this.state.members.filter((m) => m.index !== index)
 
         if (this.state.members.length === 0) {
             this.clearRoundTimer()
+            this.state.status = 'selecting'
         } else if (this.state.members.every((m) => !m.playing) && this.roundTimer !== null) {
             await this.finishRound('allFinished')
             return
@@ -782,6 +845,7 @@ export class Room extends DurableObject {
             ? {
                 ...existing,
                 user: join.user,
+                status: existing.status ?? 'waiting',
                 rating: lb.rating,
                 pp: lb.pp,
                 wins: lb.wins,
@@ -793,6 +857,7 @@ export class Room extends DurableObject {
                 user: join.user,
                 ready: false,
                 playing: false,
+                status: 'waiting',
                 lastPlayCount: 0,
                 rating: lb.rating,
                 pp: lb.pp,
@@ -813,10 +878,16 @@ export class Room extends DurableObject {
         await this.save()
         await this.syncLobby()
 
+        const snap = this.roomSnapshot()
         this.send(server, {
             type: 'welcome',
             index,
-            room: this.roomSnapshot(),
+            room: snap,
+            chat: this.state.chat.slice(-50),
+        })
+        this.send(server, {
+            type: 'update',
+            room: snap,
             chat: this.state.chat.slice(-50),
         })
         this.broadcastRoomState()
