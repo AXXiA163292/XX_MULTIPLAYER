@@ -656,6 +656,73 @@ function resolveOfficialColumns(headers: string[]): Record<OfficialDiff, { level
     return resolved
 }
 
+function isTruthyRanked(value: string): boolean {
+    const v = normalizeId(value).toLowerCase()
+    return v === 'true' || v === 'yes' || v === '1' || v === 'ranked' || v === 'y'
+}
+
+function parsePlayLevel(raw: string, constantRaw: string): number {
+    const c = parseConstantValue(constantRaw)
+    if (c !== null) return Math.floor(c)
+    const cleaned = normalizeId(raw).replace(/[^0-9.]/g, '')
+    const num = Number(cleaned)
+    return Number.isFinite(num) && num > 0 ? Math.floor(num) : 25
+}
+
+export async function pickRankedLevel(
+    options: {
+        tier?: string
+        customSongs?: CustomSongsMode | string
+        env?: Env
+    } = {},
+): Promise<SheetChart | null> {
+    const rawTier = String(options.tier ?? 'master').toLowerCase() as RankedTier
+    const tier: RankedTier = rawTier in RANKED_TIERS ? rawTier : 'master'
+    const tierCfg = RANKED_TIERS[tier]
+    const mode = String(options.customSongs ?? 'off').toLowerCase()
+
+    const pool: SheetChart[] = []
+
+    try {
+        const rows = await customRows()
+        const flagged = rows
+            .filter((r) => isPublicLevel(r) && isTruthyRanked(r.ranked))
+            .map((r) => {
+                const chart = chartFromUrl(r.id, r.input)
+                if (!chart) return null
+                const lvl = parsePlayLevel(r.playLevel, r.constant)
+                const diffLower = r.difficulty.toLowerCase()
+                const isAppend = diffLower.includes('append') || diffLower === 'ap'
+                const allowed = isAppend
+                    ? inRange(lvl, tierCfg.append)
+                    : inRange(lvl, tierCfg.main)
+                return allowed ? chart : null
+            })
+            .filter((c): c is SheetChart => c !== null)
+
+        pool.push(...flagged)
+    } catch {
+        // fall through to custom levels fallback if sheet read fails
+    }
+
+    if (mode === 'on' || mode === 'only' || pool.length === 0) {
+        const custom = await getCustomLevels(options.env).catch(() => [])
+        if (mode === 'only') {
+            pool.splice(0, pool.length, ...custom)
+        } else {
+            for (const c of custom) {
+                if (!pool.some((p) => p.name === c.name && p.address === c.address)) {
+                    pool.push(c)
+                }
+            }
+        }
+    }
+
+    if (!pool.length) return null
+    const idx = Math.floor(Math.random() * pool.length)
+    return pool[idx] ?? null
+}
+
 export async function refreshDailyAssets(env?: Env): Promise<{
     customLevelsCount: number
     playlistsCount: number
