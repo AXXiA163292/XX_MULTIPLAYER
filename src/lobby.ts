@@ -50,7 +50,6 @@ type LobbyState = {
     posts: StoredPost[]
     chat: StoredChatMessage[]
     pinnedChatId: string | null
-    rooms: string[]
 }
 
 const MAX_POSTS = 200
@@ -128,11 +127,11 @@ function normalizeChatMessage(raw: any): StoredChatMessage {
 }
 
 export class Lobby extends DurableObject<Env> {
+    private rooms = new Map<string, { name: string }>()
     private st: LobbyState = {
         posts: [],
         chat: [],
         pinnedChatId: null,
-        rooms: [],
     }
     private loaded = false
 
@@ -181,7 +180,7 @@ export class Lobby extends DurableObject<Env> {
                 }
             }
 
-            return { posts, chat, pinnedChatId, rooms: [] }
+            return { posts, chat, pinnedChatId }
         } catch (error) {
             console.error('Could not load lobby state from R2:', error)
             return null
@@ -232,9 +231,6 @@ export class Lobby extends DurableObject<Env> {
                 pinnedChatId: typeof stored.pinnedChatId === 'string'
                     ? stored.pinnedChatId
                     : null,
-                rooms: Array.isArray(stored.rooms)
-                    ? Array.from(new Set(stored.rooms.map(String).filter(Boolean)))
-                    : [],
             }
             this.loaded = true
             return
@@ -252,7 +248,6 @@ export class Lobby extends DurableObject<Env> {
     private async save(): Promise<void> {
         this.st.posts = this.st.posts.slice(-MAX_POSTS)
         this.st.chat = this.st.chat.slice(-MAX_CHAT)
-        this.st.rooms = Array.from(new Set(this.st.rooms.map(String).filter(Boolean)))
         if (
             this.st.pinnedChatId &&
             !this.st.chat.some((m) => m.id === this.st.pinnedChatId)
@@ -269,29 +264,15 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async list(): Promise<{ name: string }[]> {
-        await this.ensureLoaded()
-        return this.st.rooms.map((name) => ({ name }))
+        return [...this.rooms.values()]
     }
 
     async register(name: string): Promise<void> {
-        await this.ensureLoaded()
-        const clean = String(name ?? '').trim()
-        if (!clean) return
-        if (!this.st.rooms.includes(clean)) {
-            this.st.rooms.push(clean)
-            await this.ctx.storage.put('state', this.st)
-        }
+        this.rooms.set(name, { name })
     }
 
     async remove(name: string): Promise<void> {
-        await this.ensureLoaded()
-        const clean = String(name ?? '').trim()
-        if (!clean) return
-        const next = this.st.rooms.filter((r) => r !== clean)
-        if (next.length !== this.st.rooms.length) {
-            this.st.rooms = next
-            await this.ctx.storage.put('state', this.st)
-        }
+        this.rooms.delete(name)
     }
 
     async listPosts(category?: PostCategory): Promise<StoredPost[]> {
@@ -450,7 +431,6 @@ export class Lobby extends DurableObject<Env> {
     }
 
     async getChatMessagesFromR2(): Promise<StoredChatMessage[]> {
-        await this.ensureLoaded()
         const bucket = this.env.COMMUNITY_BUCKET
         if (!bucket) return this.st.chat
 
