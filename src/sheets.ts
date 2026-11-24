@@ -313,8 +313,8 @@ async function writeBucketJson<T>(
     key: string,
     data: T,
 ): Promise<void> {
-    const bucket = env?.POSTS_BUCKET
-    if (!bucket) throw new Error('POSTS_BUCKET R2 binding is missing.')
+    const bucket = env?.SONOLUS_ASSETS_BUCKET
+    if (!bucket) throw new Error('SONOLUS_ASSETS_BUCKET R2 binding is missing.')
 
     const payload: StoredSnapshot<T> = {
         updatedAt: Date.now(),
