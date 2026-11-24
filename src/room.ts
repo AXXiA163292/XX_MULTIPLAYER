@@ -38,6 +38,9 @@ type ConnectionMeta = {
     handle: string
 }
 
+type SonolusRoomStatus = 'selecting' | 'preparing' | 'playing'
+type SonolusUserStatus = 'selecting' | 'waiting' | 'ready' | 'playing'
+
 type PersistedState = {
     name: string
     key: string
@@ -46,6 +49,7 @@ type PersistedState = {
     hostName: string
     hostHandle: string
     settings: FormRoomSettings
+    status: SonolusRoomStatus
     level: LevelItem
     maxCount: number
     roundCount: number
@@ -186,7 +190,10 @@ export class Room extends DurableObject {
         void ctx.blockConcurrencyWhile(async () => {
             const saved = await this.ctx.storage.get<PersistedState>('room')
             if (saved) {
-                this.state = saved
+                this.state = {
+                    ...saved,
+                    status: saved.status ?? 'selecting',
+                }
                 if (this.state.members.some((m) => m.playing)) {
                     this.scheduleRoundTimer()
                 }
@@ -309,6 +316,7 @@ export class Room extends DurableObject {
                 hostName: meta.hostName,
                 hostHandle: meta.hostHandle,
                 settings: defaultFormSettings(meta.hostName || meta.hostHandle),
+                status: 'selecting',
                 level: DEFAULT_LEVEL,
                 maxCount: 4,
                 roundCount: 3,
@@ -376,6 +384,7 @@ export class Room extends DurableObject {
             ...settings,
             title,
         }
+        this.state.status = 'selecting'
         this.state.level = chosenLevel
         this.state.configured = true
         this.state.roundCount = ROUND_COUNT_OPTIONS.includes(3 as any) ? 3 : 3
@@ -411,61 +420,88 @@ export class Room extends DurableObject {
         }
     }
 
+    private userStatusOf(member: RoomMember): SonolusUserStatus {
+        if (member.playing || this.state?.status === 'playing') return 'playing'
+        if (this.state?.status === 'selecting') return 'selecting'
+        return member.ready ? 'ready' : 'waiting'
+    }
+
     private roomSnapshot() {
         if (!this.state) return null
         const s = this.state.settings
-        const matchMode: MatchMode = s.scoring === 'rankedMatch' || s.type === 'rankedRoom' ? 'ranked' : 'casual'
-        const masterUser =
-            this.state.members.find((m) => m.user.handle === this.state!.hostHandle)?.user ??
-            this.state.members[0]?.user ?? {
-                id: this.state.hostId,
-                handle: this.state.hostHandle,
-                name: this.state.hostName || this.state.hostHandle,
-            }
+        const masterIndex =
+            this.state.members.find((m) => m.user.handle === this.state!.hostHandle)?.index ??
+            this.state.members[0]?.index ??
+            0
+
+        const scores = [...this.state.leaderboard]
+            .sort((a, b) => b.rating - a.rating || b.pp - a.pp)
+            .slice(0, 20)
+            .map((entry, idx) => ({
+                rank: idx + 1,
+                user: {
+                    id: entry.handle,
+                    handle: entry.handle,
+                    name: entry.name || entry.handle,
+                },
+                score: `${entry.rating} RP · ${entry.pp} PP`,
+            }))
 
         return {
-            type: 'roomState',
-            name: this.state.name,
+            type: 'update',
+            allowOtherServers: true,
+            reportUserOptions: [],
             title: s.title,
-            master: masterUser.handle,
-            maxCount: this.state.maxCount,
-            visibility: s.visibility,
-            matchMode,
-            roundCount: this.state.roundCount,
-            roundNumber: this.state.roundNumber,
-            roundDeadline: this.roundDeadline,
+            status: this.state.status,
+            master: masterIndex,
+            lead: masterIndex,
             level: this.state.level,
+            options: [],
+            optionValues: [],
+            levelOptions: {
+                options: [],
+                values: [],
+            },
+            isSuggestionsLocked: false,
+            suggestions: [],
+            autoExit: {
+                type: 'none',
+            },
             users: this.state.members.map((m) => ({
                 index: m.index,
-                user: m.user,
-                ready: m.ready,
-                playing: m.playing,
-                detail: fmtDetail(m),
-                lastResult: m.lastResult ? sanitizeWireResult(m.lastResult) : undefined,
-                pp: m.pp ?? 0,
-                rating: m.rating ?? 1000,
-                wins: m.wins ?? 0,
-                losses: m.losses ?? 0,
-                draws: m.draws ?? 0,
+                userProfile: m.user,
+                isMaster: m.index === masterIndex,
+                isLead: m.index === masterIndex,
+                roomUser: (m as any).roomUser ?? {
+                    authentication: '',
+                    signature: '',
+                },
             })),
-            members: this.state.members.map((m) => ({
+            userStatuses: this.state.members.map((m) => ({
                 index: m.index,
-                user: m.user,
-                ready: m.ready,
-                playing: m.playing,
-                detail: fmtDetail(m),
-                lastResult: m.lastResult ? sanitizeWireResult(m.lastResult) : undefined,
-                pp: m.pp ?? 0,
-                rating: m.rating ?? 1000,
-                wins: m.wins ?? 0,
-                losses: m.losses ?? 0,
-                draws: m.draws ?? 0,
+                status: this.userStatusOf(m),
             })),
-            leaderboards: [...this.state.leaderboard]
-                .sort((a, b) => b.rating - a.rating || b.pp - a.pp)
-                .slice(0, 20),
-            sections: [],
-            roundHistory: this.state.roundHistory.slice(-10),
+            scoreboardDescription: fmtDetail(
+                this.state.members[0] ?? ({
+                    index: 0,
+                    user: {
+                        id: this.state.hostId,
+                        handle: this.state.hostHandle,
+                        name: this.state.hostName || this.state.hostHandle,
+                    },
+                    ready: false,
+                    playing: false,
+                    lastPlayCount: 0,
+                } as RoomMember),
+            ),
+            scoreboardSections: [
+                {
+                    title: 'Standings',
+                    icon: 'trophy',
+                    scores,
+                },
+            ],
+            results: [],
         }
     }
 
@@ -595,16 +631,12 @@ export class Room extends DurableObject {
         this.state.level = await this.pickRandomLevel(
             this.state.settings.type === 'groupStage' ? this.state.settings.group : 'all',
         )
+        this.state.status = 'selecting'
 
         await this.save()
         await this.syncLobby()
-
-        this.broadcast({
-            type: 'roundEnded',
-            reason,
-            round: this.state.roundHistory[this.state.roundHistory.length - 1],
-            room: this.roomSnapshot(),
-        })
+        this.broadcastRoomState()
+        void reason
     }
 
     async webSocketMessage(ws: WebSocket, rawData: string | ArrayBuffer): Promise<void> {
@@ -630,42 +662,61 @@ export class Room extends DurableObject {
             member.user.handle === this.state.hostHandle ||
             member.user.handle === TOURNAMENT_HOST_HANDLE
 
-        if (msg?.type === 'setReady' || msg?.type === 'updateUserStatus') {
-            member.ready = Boolean(msg.ready ?? msg.status === 'ready')
+        if (msg?.type === 'updateUserStatus') {
+            const status = String(msg.status ?? '')
+            member.ready = status === 'ready'
+            member.playing = status === 'playing'
             await this.save()
             this.broadcastRoomState()
             return
         }
 
-        if (msg?.type === 'startRound' || msg?.type === 'updateStatus') {
+        if (msg?.type === 'updateStatus') {
             if (!isHost) {
-                this.send(ws, { type: 'error', message: 'Only the host can start the round.' })
+                this.send(ws, { type: 'error', message: 'Only the host can change room status.' })
                 return
             }
 
-            for (const m of this.state.members) {
-                m.previousResult = m.lastResult
-                m.lastResult = undefined
-                m.playing = true
-                m.ready = false
-                m.lastPlayCount += 1
-                m.lastPlayLevel = this.state.level
-                m.lastPlayAt = Date.now()
+            const nextStatus = String(msg.status ?? '')
+            if (nextStatus === 'selecting' || nextStatus === 'preparing' || nextStatus === 'playing') {
+                this.state.status = nextStatus
             }
 
-            this.scheduleRoundTimer()
+            if (nextStatus === 'playing') {
+                for (const m of this.state.members) {
+                    m.previousResult = m.lastResult
+                    m.lastResult = undefined
+                    m.playing = true
+                    m.ready = false
+                    m.lastPlayCount += 1
+                    m.lastPlayLevel = this.state.level
+                    m.lastPlayAt = Date.now()
+                }
+                this.scheduleRoundTimer()
+            }
+
             await this.save()
             await this.syncLobby()
-            this.broadcast({
-                type: 'roundStarted',
-                round: this.state.roundNumber + 1,
-                deadline: this.roundDeadline,
-                room: this.roomSnapshot(),
-            })
+            this.broadcastRoomState()
             return
         }
 
-        if (msg?.type === 'finishResult' || msg?.type === 'finishGameplay') {
+        if (msg?.type === 'startGameplay') {
+            member.previousResult = member.lastResult
+            member.lastResult = undefined
+            member.playing = true
+            member.ready = false
+            member.lastPlayCount += 1
+            member.lastPlayLevel = this.state.level
+            member.lastPlayAt = Date.now()
+            this.state.status = 'playing'
+            this.scheduleRoundTimer()
+            await this.save()
+            this.broadcastRoomState()
+            return
+        }
+
+        if (msg?.type === 'finishGameplay') {
             const result = normalizeResult(msg.result ?? msg)
             member.lastResult = result
             member.playing = false
@@ -701,18 +752,15 @@ export class Room extends DurableObject {
             member.lastResult = undefined
             member.playing = true
             member.ready = false
+            this.state.status = 'playing'
             this.scheduleRoundTimer()
             await this.save()
-            this.broadcast({
-                type: 'playerRewound',
-                handle: member.user.handle,
-                room: this.roomSnapshot(),
-            })
+            this.broadcastRoomState()
             return
         }
 
-        if (msg?.type === 'chat') {
-            const text = String(msg.text ?? '').trim().slice(0, 300)
+        if (msg?.type === 'addChatMessage') {
+            const text = String(msg.message ?? msg.text ?? '').trim().slice(0, 300)
             if (!text) return
 
             const entry = {
@@ -725,7 +773,16 @@ export class Room extends DurableObject {
             this.state.chat.push(entry)
             this.state.chat = this.state.chat.slice(-100)
             await this.save()
-            this.broadcast({ type: 'chat', message: entry })
+            this.broadcast({
+                type: 'addChatMessage',
+                nonce: typeof msg.nonce === 'number' ? msg.nonce : undefined,
+                message: {
+                    name: entry.id,
+                    author: entry.author,
+                    time: entry.time,
+                    content: entry.text,
+                },
+            })
         }
     }
 
@@ -762,6 +819,7 @@ export class Room extends DurableObject {
 
         if (this.state.members.length === 0) {
             this.clearRoundTimer()
+            this.state.status = 'selecting'
         } else if (this.state.members.every((m) => !m.playing) && this.roundTimer !== null) {
             await this.finishRound('allFinished')
             return
@@ -781,7 +839,11 @@ export class Room extends DurableObject {
     }
 
     async fetch(req: Request): Promise<Response> {
-        if (!this.state) {
+        if (req.headers.get('Upgrade') !== 'websocket') {
+            return new Response('Expected WebSocket', { status: 426 })
+        }
+
+        if (!this.state || !this.state.configured) {
             return new Response('Room not found', { status: 404 })
         }
 
@@ -841,6 +903,8 @@ export class Room extends DurableObject {
                 draws: lb.draws,
             }
 
+        ;(member as any).roomUser = join.roomUser
+
         this.state.members = [
             ...this.state.members.filter((m) => m.index !== index),
             member,
@@ -858,11 +922,7 @@ export class Room extends DurableObject {
 
         const snap = this.roomSnapshot()
         if (snap) {
-            this.send(server, {
-                ...snap,
-                index,
-                chat: this.state.chat.slice(-50),
-            })
+            this.send(server, snap)
         }
         this.broadcastRoomState()
 
