@@ -33,11 +33,11 @@
   "r2_buckets": [
     {
       "binding": "COMMUNITY_BUCKET",
-      "bucket_name": "community-bucket"
+      "bucket_name": "community"
     },
     {
-      "binding": "POSTS_BUCKET",
-      "bucket_name": "posts-bucket"
+      "binding": "SONOLUS_ASSETS_BUCKET",
+      "bucket_name": "sonolus-assets"
     }
   ],
   "triggers": {
