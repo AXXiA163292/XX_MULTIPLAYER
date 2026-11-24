@@ -166,6 +166,16 @@ function isValidEmail(email: string): boolean {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
 }
 
+function formatXxFromHeader(rawFrom?: string): string {
+    const trimmed = String(rawFrom ?? '').trim()
+    if (!trimmed) {
+        return 'XX! <onboarding@resend.dev>'
+    }
+    const angleMatch = trimmed.match(/<([^>]+)>/)
+    const address = angleMatch ? angleMatch[1]!.trim() : trimmed
+    return `XX! <${address}>`
+}
+
 async function getBucketObject(
     bucket: R2Bucket | null,
     keys: string[],
@@ -285,7 +295,7 @@ async function sendChatNotificationEmails(
         return
     }
 
-    const fromEmail = String(env.NOTIFY_FROM_EMAIL ?? '').trim() || 'onboarding@resend.dev'
+    const fromEmail = formatXxFromHeader(env.NOTIFY_FROM_EMAIL)
     const allPrefs = await Promise.all(
         CHAT_PFP_HANDLES.map((h) => getUserChatPrefs(env, h)),
     )
