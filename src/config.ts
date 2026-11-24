@@ -40,9 +40,6 @@ export const RANKED_POINTS = {
     good: 1,
 } as const
 
-export const ROUND_COUNT_OPTIONS = [1, 3, 5, 7] as const
-export const TIME_LIMIT_OPTIONS = [90, 120, 180, 240, 300] as const
-
 export const ROOM_TYPES = {
     groupStage: 'Group Stage',
     final: 'Final',
