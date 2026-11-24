@@ -750,14 +750,9 @@ async function getRankedTierOfficialPool(tier: RankedTier, env?: Env): Promise<S
 }
 
 async function getRankedCustomPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
-    const cached = await readBucketJson<RankedCustomChart[]>(env, R2_RANKED_CUSTOM_KEY)
-    if (cached) return filterCustomRankedForTier(cached, tier)
-
-    const allCustom = buildAllCustomRanked(await customRows())
-    await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustom).catch((e) =>
-        console.warn('[R2] Could not cache ranked custom pool:', e),
-    )
-    return filterCustomRankedForTier(allCustom, tier)
+    const cached = await readBucketJson<RankedCustomChart[]>(env, R2_RANKED_CUSTOM_KEY, Number.POSITIVE_INFINITY)
+    if (cached === null) throw new Error(`R2 ranked custom pool missing: ${R2_RANKED_CUSTOM_KEY}`)
+    return filterCustomRankedForTier(cached, tier)
 }
 
 export async function pickRankedLevel(
@@ -788,7 +783,7 @@ export type RefreshSummary = {
 }
 
 export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
-    console.log('[Refresh] Starting R2 refresh on POSTS_BUCKET...')
+    console.log('[Refresh] Starting R2 refresh on SONOLUS_ASSETS_BUCKET...')
     const summary: RefreshSummary = {
         levels: null,
         playlists: null,
