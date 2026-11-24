@@ -18,6 +18,7 @@ import type { PostCategory, PostComment, StoredPost } from './lobby.ts'
 
 export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
+export { Chat } from './chat.ts'
 
 const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
 const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
@@ -285,6 +286,9 @@ const roomStub = (env: Env, name: string) =>
 
 const lobby = (env: Env) =>
     env.LOBBY.get(env.LOBBY.idFromName('main'))
+
+const chatStub = (env: Env) =>
+    env.CHAT.get(env.CHAT.idFromName('staff'))
 
 const POST_LABELS: Record<PostCategory, {
     section: string
@@ -929,7 +933,11 @@ function renderStaffChatHtml(
   let loggedOut = false;
   let activeReply = null;
   let currentMessages = [];
+  let lastRenderSig = '';
   let hasLoadedOnce = false;
+  let socket = null;
+  let reconnectTimer = null;
+  let pollTimer = null;
   let cropState = { loaded: false, imgW: 0, imgH: 0, scale: 1, x: 0, y: 0, dragging: false, lastX: 0, lastY: 0 };
 
   function readSavedHandle() {
@@ -1077,6 +1085,9 @@ function renderStaffChatHtml(
     currentMessages = Array.isArray(messages) ? messages : [];
     const active = getActiveUser();
     const myHandle = active ? active.handle : '';
+    const sig = JSON.stringify({ myHandle, prefsMap, currentMessages });
+    if (sig === lastRenderSig) return;
+    lastRenderSig = sig;
 
     if (currentMessages.length === 0) {
       box.innerHTML = '<div class="empty-state">No messages yet.</div>';
@@ -1122,7 +1133,7 @@ function renderStaffChatHtml(
 
   async function loadMessages() {
     const active = getActiveUser();
-    if (!active) return;
+    if (!active || document.hidden) return;
     if (!hasLoadedOnce) {
       box.innerHTML = '<div class="empty-state">Loading messages...</div>';
     }
@@ -1149,9 +1160,50 @@ function renderStaffChatHtml(
     }
   }
 
+  function disconnectSocket() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (socket) {
+      try { socket.close(1000, 'Switching profile'); } catch {}
+      socket = null;
+    }
+  }
+
+  function connectSocket() {
+    disconnectSocket();
+    const active = getActiveUser();
+    if (!active || document.hidden) return;
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const qs = new URLSearchParams({ handle: active.handle });
+    if (sessionToken && !loggedOut) qs.set('session', sessionToken);
+    const ws = new WebSocket(proto + '//' + location.host + '/ws/chat?' + qs.toString());
+    socket = ws;
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(String(event.data || '{}'));
+        if (data.type === 'chat' && Array.isArray(data.messages)) {
+          hasLoadedOnce = true;
+          render(data.messages);
+        }
+      } catch {}
+    };
+
+    ws.onclose = () => {
+      if (socket === ws) socket = null;
+      if (!document.hidden && getActiveUser()) {
+        reconnectTimer = setTimeout(() => connectSocket(), 1500);
+      }
+    };
+  }
+
   function syncMode() {
     const active = getActiveUser();
     if (!active) {
+      disconnectSocket();
       badgeEl.textContent = 'Pick profile';
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
@@ -1165,11 +1217,13 @@ function renderStaffChatHtml(
     chatViewEl.classList.add('open');
     renderKnownUserChips();
     void loadMessages();
+    connectSocket();
   }
 
   logoutBtn.addEventListener('click', () => {
     loggedOut = true;
     hasLoadedOnce = false;
+    lastRenderSig = '';
     persistHandle('');
     currentMessages = [];
     render([]);
@@ -1449,19 +1503,28 @@ function renderStaffChatHtml(
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) void loadMessages();
+    if (document.hidden) {
+      disconnectSocket();
+    } else {
+      syncMode();
+    }
   });
   window.addEventListener('focus', () => {
-    void loadMessages();
+    if (!document.hidden) {
+      void loadMessages();
+      if (!socket) connectSocket();
+    }
   });
   window.addEventListener('pageshow', () => {
     syncMode();
   });
 
   syncMode();
-  setInterval(() => {
-    void loadMessages();
-  }, 2500);
+  pollTimer = setInterval(() => {
+    if (!document.hidden && (!socket || socket.readyState !== WebSocket.OPEN)) {
+      void loadMessages();
+    }
+  }, 8000);
 </script>
 </body>
 </html>`
@@ -2022,6 +2085,14 @@ self.addEventListener('fetch', (event) => {
             return json({ ok: true, prefs: savedPrefs })
         }
 
+        if (path === '/ws/chat' && req.headers.get('Upgrade') === 'websocket') {
+            const resolved = await resolveChatUser(req, env, url)
+            if (!resolved) {
+                return new Response('Unauthorized', { status: 401 })
+            }
+            return chatStub(env).fetch(req)
+        }
+
         if (path === '/chat' && req.method === 'GET') {
             const prefsEntries = await Promise.all(
                 CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
@@ -2057,7 +2128,7 @@ self.addEventListener('fetch', (event) => {
             const prefsMap = Object.fromEntries(prefsEntries)
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json({ messages, prefs: prefsMap })
             }
 
@@ -2067,7 +2138,7 @@ self.addEventListener('fetch', (event) => {
                     if (!targetId) {
                         return message(400, 'Missing message id.')
                     }
-                    const messages = await lobby(env).listChatMessages().catch(() => [])
+                    const messages = await chatStub(env).listMessages().catch(() => [])
                     const target = messages.find((m) => m.id === targetId)
                     if (!target) {
                         return message(404, 'Message not found.')
@@ -2075,16 +2146,16 @@ self.addEventListener('fetch', (event) => {
                     if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                         return message(403, 'Only 163292 can delete messages from other members.')
                     }
-                    await lobby(env).deleteChatMessage(targetId)
-                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    await chatStub(env).deleteMessage(targetId)
+                    const updated = await chatStub(env).listMessages().catch(() => [])
                     return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
 
                 if (body?.action === 'like') {
                     const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
                     if (!targetId) return message(400, 'Missing message id.')
-                    await lobby(env).toggleChatLike(targetId, resolved.user.handle)
-                    const updated = await lobby(env).listChatMessages().catch(() => [])
+                    await chatStub(env).toggleLike(targetId, resolved.user.handle)
+                    const updated = await chatStub(env).listMessages().catch(() => [])
                     return json({ ok: true, messages: updated, prefs: prefsMap })
                 }
 
@@ -2100,14 +2171,14 @@ self.addEventListener('fetch', (event) => {
                     }
                     : undefined
 
-                await lobby(env).addChatMessage({
+                await chatStub(env).addMessage({
                     handle: resolved.user.handle,
                     author: resolved.user.name || resolved.user.handle,
                     text: text.slice(0, 500),
                     ...(replyTo ? { replyTo } : {}),
                 })
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json({ ok: true, messages, prefs: prefsMap })
             }
 
@@ -2116,7 +2187,7 @@ self.addEventListener('fetch', (event) => {
                 if (!id) {
                     return message(400, 'Missing message id.')
                 }
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 const target = messages.find((m) => m.id === id)
                 if (!target) {
                     return message(404, 'Message not found.')
@@ -2124,8 +2195,8 @@ self.addEventListener('fetch', (event) => {
                 if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
                     return message(403, 'Only 163292 can delete messages from other members.')
                 }
-                await lobby(env).deleteChatMessage(id)
-                const updated = await lobby(env).listChatMessages().catch(() => [])
+                await chatStub(env).deleteMessage(id)
+                const updated = await chatStub(env).listMessages().catch(() => [])
                 return json({ ok: true, messages: updated, prefs: prefsMap })
             }
         }
@@ -2265,8 +2336,8 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
+                    chatStub(env).listMessages().catch(() => []),
+                    chatStub(env).getPinnedId().catch(() => null),
                 ])
 
                 return json({
@@ -2324,8 +2395,8 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
+                    chatStub(env).listMessages().catch(() => []),
+                    chatStub(env).getPinnedId().catch(() => null),
                 ])
 
                 return json({
@@ -2443,7 +2514,7 @@ self.addEventListener('fetch', (event) => {
                     return json({ creates: [], actions: [], topComments: [] })
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json({
                     creates: [],
                     actions: [chatActionForm],
@@ -2490,7 +2561,7 @@ self.addEventListener('fetch', (event) => {
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await lobby(env).addChatMessage({
+                await chatStub(env).addMessage({
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
@@ -2561,7 +2632,7 @@ self.addEventListener('fetch', (event) => {
                     return json({ pageCount: 1, comments: [] })
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 return json(formatChatCommunityComments(messages, session, page))
             }
 
@@ -2589,13 +2660,13 @@ self.addEventListener('fetch', (event) => {
                     return message(403, 'Chat is restricted.')
                 }
 
-                const messages = await lobby(env).listChatMessages().catch(() => [])
+                const messages = await chatStub(env).listMessages().catch(() => [])
                 const target = messages.find((m) => m.id === commentName)
                 if (!target || !canDeleteComment(session, target.handle)) {
                     return message(403, 'You cannot delete this comment.')
                 }
 
-                await lobby(env).deleteChatMessage(commentName)
+                await chatStub(env).deleteMessage(commentName)
                 return json({
                     key: '',
                     hashes: [],
@@ -2649,7 +2720,7 @@ self.addEventListener('fetch', (event) => {
                     return message(400, 'Message cannot be empty.')
                 }
 
-                await lobby(env).addChatMessage({
+                await chatStub(env).addMessage({
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
@@ -2841,8 +2912,8 @@ self.addEventListener('fetch', (event) => {
                 }
 
                 const [messages, pinnedId] = await Promise.all([
-                    lobby(env).listChatMessages().catch(() => []),
-                    lobby(env).getPinnedChatId().catch(() => null),
+                    chatStub(env).listMessages().catch(() => []),
+                    chatStub(env).getPinnedId().catch(() => null),
                 ])
                 const extUrl = externalChatUrl(req, env)
 
