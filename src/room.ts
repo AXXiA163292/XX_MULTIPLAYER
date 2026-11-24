@@ -13,6 +13,7 @@ import type {
     MatchMode,
     RoomMember,
     RoomSummary,
+    Sil,
     UserProfile,
 } from './types.ts'
 import { verifyToken } from './crypto.ts'
@@ -101,6 +102,31 @@ function defaultFormSettings(hostName = 'Host'): FormRoomSettings {
         random: false,
         tier: 'master',
         customSongs: 'off',
+    }
+}
+
+function serializeSettings(settings: FormRoomSettings): string {
+    return Object.entries(settings)
+        .map(([k, v]) => `${k}=${String(v)}`)
+        .join('&')
+}
+
+function levelToSil(level: LevelItem | undefined, publicAddress?: string): Sil {
+    const fallbackLevel = level ?? DEFAULT_LEVEL
+    const name = fallbackLevel?.name || DEFAULT_LEVEL.name
+    const rawSource = typeof fallbackLevel?.source === 'string' ? fallbackLevel.source.trim() : ''
+
+    if (rawSource.startsWith('sonolus://') || rawSource.startsWith('http://') || rawSource.startsWith('https://')) {
+        return {
+            address: rawSource,
+            name,
+        }
+    }
+
+    const base = (publicAddress || '').replace(/\/+$/, '')
+    return {
+        address: base ? `${base}/sonolus/levels/${encodeURIComponent(name)}` : `/sonolus/levels/${encodeURIComponent(name)}`,
+        name,
     }
 }
 
@@ -204,7 +230,7 @@ export class Room extends DurableObject {
     private async syncLobby(): Promise<void> {
         if (!this.state || !this.state.name) return
         try {
-            if (this.state.configured && this.state.members.length > 0) {
+            if (this.state.configured) {
                 await this.lobbyStub().register(this.state.name)
             } else {
                 await this.lobbyStub().remove(this.state.name)
@@ -457,9 +483,9 @@ export class Room extends DurableObject {
             status: this.state.status,
             master: masterUserId,
             lead: masterUserId,
-            level: this.state.level,
+            level: levelToSil(this.state.level, this.envRoom?.PUBLIC_ADDRESS),
             options: [],
-            optionValues: [],
+            optionValues: serializeSettings(s),
             levelOptions: [],
             isSuggestionsLocked: false,
             suggestions: [],
