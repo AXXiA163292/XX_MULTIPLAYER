@@ -285,7 +285,7 @@ async function readBucketJson<T>(
     key: string,
     maxAgeMs = DAY_MS,
 ): Promise<T | null> {
-    const bucket = env?.POSTS_BUCKET
+    const bucket = env?.SONOLUS_ASSETS_BUCKET
     if (!bucket) return null
 
     try {
