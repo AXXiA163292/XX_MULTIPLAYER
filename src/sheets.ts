@@ -1,6 +1,5 @@
-
 import type { CustomSongsMode } from './forms.ts'
-import type { Env } from './types.ts'
+import type { Env, LevelItem } from './types.ts'
 
 const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
@@ -14,6 +13,20 @@ const rankedTierKey = (tier: RankedTier) => `ranked-match/${tier.toUpperCase()}/
 const R2_RANKED_CUSTOM_KEY = 'ranked-match/CUSTOM/pool.json'
 const DAY_MS = 24 * 60 * 60 * 1000
 const SHEET_FETCH_TIMEOUT_MS = 90000
+
+export const DEFAULT_LEVEL: LevelItem = {
+    name: 'default',
+    version: 1,
+    title: 'Default Level',
+    artists: 'XX!',
+    author: 'XX!',
+    rating: 25,
+    engine: 'pjsekai',
+    cover: { hash: '', url: '' },
+    bgm: { hash: '', url: '' },
+    data: { hash: '', url: '' },
+    tags: [],
+}
 
 type Row = {
     id: string
@@ -360,6 +373,42 @@ export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
         console.warn('[R2] Could not cache level list:', e),
     )
     return charts
+}
+
+export async function loadLevelsByNames(
+    names: string[],
+    env?: Env,
+): Promise<LevelItem[]> {
+    if (!names.length) return []
+    const charts = await getCustomLevels(env)
+    const byName = new Map(charts.map((c) => [c.name, c]))
+    const loaded: LevelItem[] = []
+
+    for (const name of names) {
+        const chart = byName.get(name)
+        if (!chart) continue
+        try {
+            const endpoint = `${stripTrailingSlash(chart.address)}/sonolus/levels/${encodeURIComponent(chart.name)}`
+            const res = await fetch(endpoint, {
+                headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+                signal: AbortSignal.timeout(10000),
+            })
+            if (!res.ok) continue
+            const data: any = await res.json()
+            const item = data?.item ?? data
+            if (item && typeof item.name === 'string') {
+                loaded.push({
+                    ...DEFAULT_LEVEL,
+                    ...item,
+                    source: chart.address,
+                })
+            }
+        } catch {
+            // skip unreachable level
+        }
+    }
+
+    return loaded
 }
 
 export async function getCustomLevelPage(
