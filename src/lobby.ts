@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers'
 import { randomId } from './crypto.ts'
-import type { ChatMessage, Env, RoomVisibility, UserProfile } from './types.ts'
+import type { Env, RoomVisibility, UserProfile } from './types.ts'
 
 export type PostCategory = 'announcements' | 'posts' | 'results'
 
@@ -36,16 +36,6 @@ export type StoredPost = {
     pinned?: boolean
 }
 
-export type StoredChatMessage = ChatMessage & {
-    likes?: string[]
-    replyTo?: {
-        id: string
-        author: string
-        handle: string
-        text: string
-    }
-}
-
 export type RoomDirectoryEntry = {
     name: string
     title: string
@@ -60,14 +50,10 @@ type LobbyState = {
     rooms: string[]
     roomEntries?: Record<string, RoomDirectoryEntry>
     posts: StoredPost[]
-    chat: StoredChatMessage[]
-    pinnedChatId: string | null
 }
 
 const MAX_POSTS = 200
-const MAX_CHAT = 200
 const CATEGORIES: PostCategory[] = ['announcements', 'posts', 'results']
-const CHAT_INDEX_KEY = 'chat/index.json'
 const MIN_R2_WRITE_INTERVAL_MS = 1100
 
 const categoryIndexKey = (category: PostCategory) => `${category}/index.json`
@@ -118,37 +104,12 @@ function normalizePost(raw: any, forcedCategory?: PostCategory): StoredPost {
     }
 }
 
-function normalizeChatMessage(raw: any): StoredChatMessage {
-    const replyTo = raw?.replyTo && typeof raw.replyTo === 'object'
-        ? {
-            id: String(raw.replyTo.id ?? ''),
-            author: String(raw.replyTo.author ?? ''),
-            handle: String(raw.replyTo.handle ?? ''),
-            text: String(raw.replyTo.text ?? '').slice(0, 120),
-        }
-        : undefined
-
-    return {
-        id: String(raw?.id ?? randomId(10)),
-        handle: String(raw?.handle ?? ''),
-        author: String(raw?.author ?? ''),
-        text: String(raw?.text ?? '').slice(0, 500),
-        time: Number(raw?.time) || Date.now(),
-        likes: Array.isArray(raw?.likes)
-            ? Array.from(new Set(raw.likes.map(String).filter(Boolean)))
-            : [],
-        ...(replyTo ? { replyTo } : {}),
-    }
-}
-
 export class Lobby extends DurableObject<Env> {
     private rooms = new Set<string>()
     private st: LobbyState = {
         rooms: [],
         roomEntries: {},
         posts: [],
-        chat: [],
-        pinnedChatId: null,
     }
     private loaded = false
     private r2Queue: Promise<void> = Promise.resolve()
@@ -198,59 +159,11 @@ export class Lobby extends DurableObject<Env> {
                     }
                 }
             } catch {
-                // ignore empty/invalid manual placeholder JSON
+                // ignore empty/invalid placeholder JSON
             }
         }
 
         return loadedPosts.slice(-MAX_POSTS)
-    }
-
-    private async loadFromR2(): Promise<LobbyState | null> {
-        const bucket = this.env.COMMUNITY_BUCKET
-        if (!bucket) return null
-
-        try {
-            const [loadedPosts, chatObj] = await Promise.all([
-                this.loadPostsFromR2(),
-                bucket.get(CHAT_INDEX_KEY).catch(() => null),
-            ])
-
-            let chat: StoredChatMessage[] = []
-            let pinnedChatId: string | null = null
-
-            if (chatObj) {
-                try {
-                    const text = (await chatObj.text()).trim()
-                    if (text) {
-                        const parsedChat = JSON.parse(text) as {
-                            messages?: StoredChatMessage[]
-                            pinnedChatId?: string | null
-                        }
-                        if (Array.isArray(parsedChat.messages)) {
-                            chat = parsedChat.messages
-                                .slice(-MAX_CHAT)
-                                .map((message) => normalizeChatMessage(message))
-                        }
-                        if (typeof parsedChat.pinnedChatId === 'string') {
-                            pinnedChatId = parsedChat.pinnedChatId
-                        }
-                    }
-                } catch {
-                    // ignore empty/invalid chat JSON
-                }
-            }
-
-            return {
-                rooms: [],
-                roomEntries: {},
-                posts: loadedPosts,
-                chat,
-                pinnedChatId,
-            }
-        } catch (error) {
-            console.error('Could not load lobby state from R2:', error)
-            return null
-        }
     }
 
     private async writeR2Now(): Promise<void> {
@@ -303,11 +216,11 @@ export class Lobby extends DurableObject<Env> {
     private async ensureLoaded(): Promise<void> {
         if (this.loaded) return
 
+        const r2Posts = await this.loadPostsFromR2()
         const stored = await this.ctx.storage.get<LobbyState>('state')
         if (stored) {
             const roomNames = Array.isArray(stored.rooms) ? stored.rooms.map(String).filter(Boolean) : []
             this.rooms = new Set(roomNames)
-            const r2Posts = await this.loadPostsFromR2()
             const storedPosts = Array.isArray(stored.posts)
                 ? stored.posts.slice(-MAX_POSTS).map((post) => normalizePost(post))
                 : []
@@ -324,36 +237,23 @@ export class Lobby extends DurableObject<Env> {
                     ? stored.roomEntries
                     : {},
                 posts: mergedPosts,
-                chat: Array.isArray(stored.chat)
-                    ? stored.chat.slice(-MAX_CHAT).map((message) => normalizeChatMessage(message))
-                    : [],
-                pinnedChatId: typeof stored.pinnedChatId === 'string'
-                    ? stored.pinnedChatId
-                    : null,
             }
             this.loaded = true
             return
         }
 
-        const fromR2 = await this.loadFromR2()
-        if (fromR2) {
-            this.st = fromR2
-            await this.ctx.storage.put('state', this.st)
+        this.st = {
+            rooms: [],
+            roomEntries: {},
+            posts: r2Posts,
         }
-
+        await this.ctx.storage.put('state', this.st)
         this.loaded = true
     }
 
     private async save(persistR2 = false): Promise<void> {
         this.st.rooms = [...this.rooms]
         this.st.posts = this.st.posts.slice(-MAX_POSTS)
-        this.st.chat = this.st.chat.slice(-MAX_CHAT)
-        if (
-            this.st.pinnedChatId &&
-            !this.st.chat.some((m) => m.id === this.st.pinnedChatId)
-        ) {
-            this.st.pinnedChatId = null
-        }
         await this.ctx.storage.put('state', this.st)
         if (persistR2) {
             await this.scheduleR2Persist()
@@ -554,99 +454,6 @@ export class Lobby extends DurableObject<Env> {
         this.st.posts[index] = current
         await this.save(true)
         return true
-    }
-
-    async listChatMessages(): Promise<StoredChatMessage[]> {
-        await this.ensureLoaded()
-        return this.st.chat.map((message) => normalizeChatMessage(message))
-    }
-
-    async getChatMessagesFromR2(): Promise<StoredChatMessage[]> {
-        const bucket = this.env.COMMUNITY_BUCKET
-        if (!bucket) return this.st.chat
-
-        const object = await bucket.get(CHAT_INDEX_KEY)
-        if (!object) return this.st.chat
-
-        const parsed = await object.json() as {
-            messages?: StoredChatMessage[]
-        }
-
-        if (!Array.isArray(parsed.messages)) return this.st.chat
-
-        return parsed.messages
-            .slice(-MAX_CHAT)
-            .map((message) => normalizeChatMessage(message))
-    }
-
-    async getPinnedChatId(): Promise<string | null> {
-        await this.ensureLoaded()
-        return this.st.pinnedChatId
-    }
-
-    async addChatMessage(input: {
-        handle: string
-        author: string
-        text: string
-        replyTo?: {
-            id: string
-            author: string
-            handle: string
-            text: string
-        }
-    }): Promise<StoredChatMessage> {
-        await this.ensureLoaded()
-
-        const message: StoredChatMessage = normalizeChatMessage({
-            id: randomId(10),
-            handle: input.handle,
-            author: input.author,
-            text: input.text.slice(0, 500),
-            time: Date.now(),
-            likes: [],
-            ...(input.replyTo ? { replyTo: input.replyTo } : {}),
-        })
-
-        this.st.chat = [...this.st.chat, message].slice(-MAX_CHAT)
-        await this.save(false)
-        return message
-    }
-
-    async deleteChatMessage(id: string): Promise<boolean> {
-        await this.ensureLoaded()
-        const before = this.st.chat.length
-        this.st.chat = this.st.chat.filter((message) => message.id !== id)
-        if (this.st.pinnedChatId === id) {
-            this.st.pinnedChatId = null
-        }
-        if (this.st.chat.length === before) return false
-        await this.save(false)
-        return true
-    }
-
-    async toggleChatLike(id: string, handle: string): Promise<StoredChatMessage | null> {
-        await this.ensureLoaded()
-        const idx = this.st.chat.findIndex((m) => m.id === id)
-        if (idx === -1) return null
-
-        const current = normalizeChatMessage(this.st.chat[idx])
-        const hasLike = (current.likes ?? []).includes(handle)
-        current.likes = hasLike
-            ? (current.likes ?? []).filter((h) => h !== handle)
-            : [...(current.likes ?? []), handle]
-
-        this.st.chat[idx] = current
-        await this.save(false)
-        return current
-    }
-
-    async togglePinChatMessage(id: string): Promise<string | null> {
-        await this.ensureLoaded()
-        const exists = this.st.chat.some((m) => m.id === id)
-        if (!exists) return this.st.pinnedChatId
-        this.st.pinnedChatId = this.st.pinnedChatId === id ? null : id
-        await this.save(false)
-        return this.st.pinnedChatId
     }
 
     async fetch(req: Request): Promise<Response> {
