@@ -30,7 +30,6 @@ import {
 } from './scoring.ts'
 import {
     getEditionData,
-    loadRankedPool,
     pickRankedLevel,
     type EditionData,
     type RankedTier,
@@ -74,18 +73,12 @@ type LevelInfo = {
     coverUrl?: string | null
 }
 
-type RankedPoolCache = {
-    key: string
-    charts: SheetChart[]
-}
-
 type RoomState = {
     name: string
     createdAt: number
     edition: string
     divisions: Record<string, string>
     poolCharts: SheetChart[]
-    rankedPool: RankedPoolCache | null
     reserved: Reservation | null
     configured: boolean
     hostId: string
@@ -109,7 +102,6 @@ const fresh = (): RoomState => ({
     edition: '',
     divisions: {},
     poolCharts: [],
-    rankedPool: null,
     reserved: null,
     configured: false,
     hostId: '',
@@ -139,9 +131,6 @@ const fresh = (): RoomState => ({
 
 const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
-
-const rankedPoolKeyOf = (settings: RoomSettings): string =>
-    `${String(settings.tier || 'master').toLowerCase()}::${normalizeCustomSongsMode(settings.customSongs)}`
 
 const ROUND_SLOT_ID_RE = /^(?:G[1-6]|F[1-4])$/i
 
@@ -507,24 +496,12 @@ function cleanPoolCharts(value: unknown): SheetChart[] {
             !!entry &&
             typeof entry === 'object' &&
             typeof (entry as SheetChart).address === 'string' &&
-            (entry as SheetChart).address.trim().length > 0 &&
-            typeof (entry as SheetChart).name === 'string' &&
-            (entry as SheetChart).name.trim().length > 0,
+            typeof (entry as SheetChart).name === 'string',
     )
-}
-
-function cleanRankedPoolCache(value: unknown): RankedPoolCache | null {
-    if (!value || typeof value !== 'object') return null
-    const raw = value as Partial<RankedPoolCache>
-    if (typeof raw.key !== 'string' || !raw.key) return null
-    const charts = cleanPoolCharts(raw.charts)
-    if (charts.length === 0) return null
-    return { key: raw.key, charts }
 }
 
 export class Room extends DurableObject<Env> {
     st: RoomState = fresh()
-    private rankedSelectionInProgress = false
 
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
@@ -550,7 +527,6 @@ export class Room extends DurableObject<Env> {
                 edition: typeof saved?.edition === 'string' ? saved.edition : '',
                 divisions: cleanDivisions(saved?.divisions),
                 poolCharts: cleanPoolCharts(saved?.poolCharts),
-                rankedPool: cleanRankedPoolCache(saved?.rankedPool),
                 reserved: saved?.reserved ?? null,
                 configured: saved?.configured === true,
                 hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
@@ -789,51 +765,6 @@ export class Room extends DurableObject<Env> {
         })
     }
 
-    private async ensureRankedPoolInStorage(): Promise<SheetChart[]> {
-        const expectedKey = rankedPoolKeyOf(this.st.settings)
-        const existing = cleanRankedPoolCache(this.st.rankedPool)
-        if (existing && existing.key === expectedKey && existing.charts.length > 0) {
-            return existing.charts
-        }
-
-        const loaded = await loadRankedPool(
-            this.st.settings.tier as RankedTier,
-            this.st.settings.customSongs,
-            this.env,
-        )
-
-        const validCharts = cleanPoolCharts(loaded.charts)
-        if (validCharts.length > 0) {
-            this.st.rankedPool = {
-                key: expectedKey,
-                charts: validCharts,
-            }
-            await this.save()
-        }
-
-        return validCharts
-    }
-
-    private hydrateLevelMetadataInBackground(level: Sil): void {
-        const targetAddress = level.address
-        const targetName = level.name
-
-        this.ctx.waitUntil(
-            (async () => {
-                const info = await fetchLevelInfo(level)
-                if (!info) return
-                if (!this.st.level || !sameLevel(this.st.level, { address: targetAddress, name: targetName })) {
-                    return
-                }
-                this.st.levelInfo = info
-                this.pushScoreboard()
-                await this.save().catch(() => {})
-            })().catch((err) => {
-                console.warn('[Room] Background level metadata fetch failed:', err)
-            }),
-        )
-    }
-
     async reserve(name: string, reservation: Reservation): Promise<void> {
         this.st = {
             ...fresh(),
@@ -880,12 +811,10 @@ export class Room extends DurableObject<Env> {
 
         let editionData: EditionData | null = null
 
-        if (!isOpenType(settings.type)) {
-            try {
-                editionData = await getEditionData()
-            } catch (error) {
-                console.error('Could not load edition sheet while configuring room:', error)
-            }
+        try {
+            editionData = await getEditionData()
+        } catch (error) {
+            console.error('Could not load edition sheet while configuring room:', error)
         }
 
         const poolCharts = editionData
@@ -908,39 +837,22 @@ export class Room extends DurableObject<Env> {
             ? (poolCharts[0] ?? null)
             : null
 
-        const nextSettings: RoomSettings = {
-            ...settings,
-            roundMode: 'tournament',
-        }
-
-        let rankedPool: RankedPoolCache | null = null
-        if (nextSettings.type === 'rankedRoom') {
-            const loaded = await loadRankedPool(
-                nextSettings.tier as RankedTier,
-                nextSettings.customSongs,
-                this.env,
-            )
-            const validCharts = cleanPoolCharts(loaded.charts)
-            if (validCharts.length > 0) {
-                rankedPool = {
-                    key: rankedPoolKeyOf(nextSettings),
-                    charts: validCharts,
-                }
-            }
-        }
-
         this.st.createdAt = Date.now()
         this.st.configured = true
         this.st.hostId = host.id
         this.st.hostName = host.name
-        this.st.settings = nextSettings
-        this.st.rankedPool = rankedPool
+        this.st.settings = {
+            ...settings,
+            roundMode: 'tournament',
+        }
         this.st.reserved = null
         this.st.status = 'selecting'
         this.st.level = firstPoolChart
             ? { address: firstPoolChart.address, name: firstPoolChart.name }
             : null
-        this.st.levelInfo = null
+        this.st.levelInfo = this.st.level
+            ? await fetchLevelInfo(this.st.level)
+            : null
         this.st.levelOptions = []
         this.st.round = null
         this.st.results = {}
@@ -949,11 +861,6 @@ export class Room extends DurableObject<Env> {
         await this.save()
         await this.syncLobby()
         await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
-
-        if (this.st.level) {
-            this.hydrateLevelMetadataInBackground(this.st.level)
-        }
-
         this.diag('configured')
 
         return true
@@ -1236,7 +1143,9 @@ export class Room extends DurableObject<Env> {
 
                 this.sendLevel()
                 this.pushScoreboard()
-                this.hydrateLevelMetadataInBackground(state.level)
+
+                state.levelInfo = await fetchLevelInfo(state.level)
+                this.pushScoreboard()
                 return
             }
 
@@ -1266,21 +1175,12 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                if (state.settings.type === 'rankedRoom' && next.tier !== state.settings.tier) {
-                    this.diag('tier-change-rejected', {
-                        currentTier: state.settings.tier,
-                        attemptedTier: next.tier,
-                    })
-                    return this.resync(uid)
-                }
-
-                const prevPoolKey = rankedPoolKeyOf(state.settings)
-                const nextPoolKey = rankedPoolKeyOf(next)
                 const randomChanged = next.random !== state.settings.random
                 const modeChanged = next.scoring !== state.settings.scoring
                 const titleChanged =
                     next.group !== state.settings.group ||
-                    next.title !== state.settings.title
+                    next.title !== state.settings.title ||
+                    next.tier !== state.settings.tier
 
                 if (next.type === 'casualRoom' && !next.title) {
                     next.title = defaultCustomRoomTitle(state.hostName)
@@ -1288,13 +1188,7 @@ export class Room extends DurableObject<Env> {
 
                 state.settings = {
                     ...next,
-                    tier: state.settings.type === 'rankedRoom' ? state.settings.tier : next.tier,
                     roundMode: 'tournament',
-                }
-
-                if (state.settings.type === 'rankedRoom' && prevPoolKey !== nextPoolKey) {
-                    state.rankedPool = null
-                    void this.ensureRankedPoolInStorage()
                 }
 
                 this.sendAll({
@@ -1655,19 +1549,6 @@ export class Room extends DurableObject<Env> {
         }
     }
 
-    private notifyRankedPoolError(uid: string, tier: string): void {
-        const msg = `No charts available for ranked tier ${String(tier || 'master').toUpperCase()}.`
-        this.sendTo(uid, {
-            type: 'addChatMessage',
-            message: {
-                userId: this.st.hostId || uid,
-                type: 'text',
-                value: msg,
-            },
-        })
-        this.resync(uid)
-    }
-
     private async changeStatus(
         uid: string,
         next: RoomStatus,
@@ -1683,67 +1564,29 @@ export class Room extends DurableObject<Env> {
 
         if (current === 'selecting' && next === 'preparing') {
             if (state.settings.type === 'rankedRoom') {
-                if (this.rankedSelectionInProgress) {
-                    this.diag('ranked-selection-deduped', { userId: uid })
-                    return this.resync(uid)
-                }
-
-                this.rankedSelectionInProgress = true
                 let pick: SheetChart | null = null
 
                 try {
-                    const pool = await this.ensureRankedPoolInStorage()
-                    if (pool.length === 0) {
-                        this.diag('ranked-pool-empty', {
-                            tier: state.settings.tier,
-                            customSongs: state.settings.customSongs,
-                        })
-                        this.notifyRankedPoolError(uid, state.settings.tier)
-                        return
-                    }
-
                     pick = await pickRankedLevel(
                         state.settings.tier as RankedTier,
                         state.settings.customSongs,
                         this.env,
-                        pool,
                     )
                 } catch (error) {
                     console.error('Could not pick a ranked level:', error)
-                } finally {
-                    this.rankedSelectionInProgress = false
                 }
 
-                if (state.status !== 'selecting') {
+                if (state.status !== 'selecting' || !pick) {
                     return this.resync(uid)
                 }
 
-                if (!pick || !pick.address || !pick.name) {
-                    this.notifyRankedPoolError(uid, state.settings.tier)
-                    return
-                }
-
                 state.level = { address: pick.address, name: pick.name }
-                state.levelInfo = null
+                state.levelInfo = await fetchLevelInfo(state.level)
                 state.levelOptions = []
-                state.status = 'preparing'
-                waitAll()
-
-                await this.save()
 
                 this.sendAll({ type: 'updateLevel', level: state.level })
                 this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
-                this.sendAll({
-                    type: 'updateStatus',
-                    status: 'preparing',
-                })
-
-                this.hydrateLevelMetadataInBackground(state.level)
-                this.diag('status-preparing-ranked', { level: state.level.name })
-                return
-            }
-
-            if (
+            } else if (
                 state.settings.type === 'casualRoom' &&
                 state.settings.random
             ) {
@@ -1968,7 +1811,9 @@ export class Room extends DurableObject<Env> {
 
         this.sendLevel()
         this.pushScoreboard()
-        this.hydrateLevelMetadataInBackground(s.level)
+
+        s.levelInfo = await fetchLevelInfo(s.level)
+        this.pushScoreboard()
     }
 
     private hostIsTournament(): boolean {
@@ -2024,7 +1869,7 @@ export class Room extends DurableObject<Env> {
             master,
             lead: master,
             options: [
-                ...roomFormsForType(state.settings.type, this.hostIsTournament(), true),
+                ...roomFormsForType(state.settings.type, this.hostIsTournament()),
                 ...(isHost ? [closeRoomForm] : []),
             ],
             optionValues: serializeSettings(state.settings),
