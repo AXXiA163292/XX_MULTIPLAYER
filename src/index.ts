@@ -493,16 +493,13 @@ function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
 function formatChatCommunityComments(
     messages: ChatMessage[],
     session: AuthSession | null,
-    page = 0,
+    _page = 0,
 ) {
     const ordered = [...messages].reverse()
-    const pageSize = 10
-    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
-    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
-        pageCount,
-        comments: slice.map((m) => ({
+        pageCount: 1,
+        comments: ordered.map((m) => ({
             name: m.id,
             author: formatAuthorTag(m.author, m.handle),
             time: m.time,
@@ -530,8 +527,12 @@ function extractCommentText(values: URLSearchParams): string {
     return ''
 }
 
-function externalChatUrl(req: Request, env: Env): string {
-    return `${addressOf(req, env)}/chat`
+function externalChatUrl(req: Request, env: Env, token: string | null): string {
+    const target = new URL('/chat', addressOf(req, env))
+    if (token) {
+        target.searchParams.set('session', token)
+    }
+    return target.toString()
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -1554,17 +1555,14 @@ function postActionsFor(post: StoredPost, session: AuthSession | null) {
 function formatPostComments(
     post: StoredPost,
     session: AuthSession | null,
-    page = 0,
+    _page = 0,
 ) {
     const comments: PostComment[] = post.comments ?? []
     const ordered = [...comments].reverse()
-    const pageSize = 10
-    const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
-    const slice = ordered.slice(page * pageSize, page * pageSize + pageSize)
 
     return {
-        pageCount,
-        comments: slice.map((c) => ({
+        pageCount: 1,
+        comments: ordered.map((c) => ({
             name: c.id,
             author: formatAuthorTag(c.author, c.handle),
             time: c.time,
@@ -1638,16 +1636,6 @@ async function remoteLevelItem(
 ): Promise<RemoteLevelItem | null> {
     const details = await remoteLevelDetails(chart)
     return details?.item ?? null
-}
-
-function localizedTitle(value: any): string {
-    if (typeof value === 'string') return value
-    if (value && typeof value === 'object') {
-        if (typeof value.en === 'string') return value.en
-        const first = Object.values(value).find((entry) => typeof entry === 'string')
-        return typeof first === 'string' ? first : ''
-    }
-    return ''
 }
 
 async function loadLevelItems(charts: SheetChart[], concurrency = 12) {
@@ -1871,7 +1859,7 @@ self.addEventListener('fetch', (event) => {
         if (path === '/refresh' || path === '/admin/refresh') {
             const session = await sessionOf(req, env, url)
             const authHeader = req.headers.get('Authorization') ?? ''
-            const expectedKey = (env as any).REFRESH_KEY as string | undefined
+            const expectedKey = env.REFRESH_KEY
             const authorized =
                 canManagePosts(session) ||
                 (Boolean(expectedKey) &&
@@ -1996,8 +1984,7 @@ self.addEventListener('fetch', (event) => {
             const prefsMap = Object.fromEntries(prefsEntries)
 
             if (req.method === 'GET') {
-                const messages = await lobby(env).getChatMessagesFromR2()
-                    .catch(() => lobby(env).listChatMessages().catch(() => []))
+                const messages = await lobby(env).listChatMessages().catch(() => [])
                 return json({ messages, prefs: prefsMap })
             }
 
@@ -2239,9 +2226,6 @@ self.addEventListener('fetch', (event) => {
                         title: POST_LABELS[kind].section,
                         itemType: 'post',
                         items: posts.map(buildPostItemWithBadges),
-                        ...(explicit
-                            ? { searchValues: new URLSearchParams({ category: explicit }).toString() }
-                            : {}),
                     }
                 }),
             )
@@ -2258,8 +2242,6 @@ self.addEventListener('fetch', (event) => {
 
         if (path === '/sonolus/posts/list' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
-            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
-            const pageSize = 10
 
             if (isChatCategory(url)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
@@ -2274,7 +2256,7 @@ self.addEventListener('fetch', (event) => {
                 return json({
                     title: 'Chat',
                     pageCount: 1,
-                    items: page === 0 ? [buildChatPostItem(messages, pinnedId)] : [],
+                    items: [buildChatPostItem(messages, pinnedId)],
                     searches: [],
                 })
             }
@@ -2302,13 +2284,10 @@ self.addEventListener('fetch', (event) => {
                 })
                 : allCategoryPosts
 
-            const pageCount = Math.max(1, Math.ceil(posts.length / pageSize))
-            const slice = posts.slice(page * pageSize, page * pageSize + pageSize)
-
             return json({
                 title: POST_LABELS[kind].section,
-                pageCount,
-                items: slice.map(buildPostItemWithBadges),
+                pageCount: 1,
+                items: posts.map(buildPostItemWithBadges),
                 searches: [],
             })
         }
@@ -2390,7 +2369,7 @@ self.addEventListener('fetch', (event) => {
                 return json({
                     creates: [],
                     actions: [chatActionForm],
-                    topComments: formatChatCommunityComments(messages, session, 0).comments.slice(0, 3),
+                    topComments: formatChatCommunityComments(messages, session, 0).comments,
                 })
             }
 
@@ -2402,7 +2381,7 @@ self.addEventListener('fetch', (event) => {
             return json({
                 creates: [],
                 actions: [postCommentForm],
-                topComments: formatPostComments(post, session, 0).comments.slice(0, 3),
+                topComments: formatPostComments(post, session, 0).comments,
             })
         }
 
@@ -2783,7 +2762,7 @@ self.addEventListener('fetch', (event) => {
                     lobby(env).listChatMessages().catch(() => []),
                     lobby(env).getPinnedChatId().catch(() => null),
                 ])
-                const extUrl = externalChatUrl(req, env)
+                const extUrl = externalChatUrl(req, env, extractSessionToken(req, url))
 
                 return json({
                     item: buildChatPostItem(messages, pinnedId),
