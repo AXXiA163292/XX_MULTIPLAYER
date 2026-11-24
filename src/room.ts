@@ -70,7 +70,6 @@ type LevelInfo = {
     constant: number | null
     noteCount: number | null
     difficulty: string
-    coverUrl?: string | null
 }
 
 type RoomState = {
@@ -408,12 +407,6 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                 const descriptionConstant = extractDescriptionNumber(description, 'Constant')
                 const constant = descriptionConstant ?? rating
 
-                const rawCoverUrl = typeof item?.cover?.url === 'string' && item.cover.url
-                    ? (item.cover.url.startsWith('/')
-                        ? `${root.replace(/\/sonolus$/, '')}${item.cover.url}`
-                        : item.cover.url)
-                    : null
-
                 return {
                     title: localize(item.title) || level.name,
                     firstTag: difficulty || firstTag,
@@ -421,7 +414,6 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     constant,
                     noteCount,
                     difficulty,
-                    coverUrl: rawCoverUrl,
                 }
             } catch (error) {
                 console.warn('Could not fetch level metadata:', path, error)
@@ -889,10 +881,6 @@ export class Room extends DurableObject<Env> {
             master: this.st.hostName,
             hostId: this.st.hostId,
             visibility: this.st.settings.visibility,
-            type: this.st.settings.type,
-            tier: this.st.settings.tier,
-            level: this.st.level,
-            coverUrl: this.st.levelInfo?.coverUrl ?? null,
         }
     }
 
