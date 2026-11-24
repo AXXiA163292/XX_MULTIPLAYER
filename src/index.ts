@@ -1,132 +1,152 @@
-export type UserProfile = {
-    id: string
-    handle: string
-    name: string
+import type { EditionData, SheetChart } from './sheets.ts'
+
+export const GROUP_ORDER = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G',
+    'H', 'I', 'J', 'K', 'X', 'T',
+] as const
+
+export type GroupName = typeof GROUP_ORDER[number]
+export type BracketName = 'Upper Bracket' | 'Lower Bracket'
+
+export type SongPoolChart = {
+    url: string | null
+    constant: number | null
 }
 
-export type AuthSession = {
-    user: UserProfile
-    exp: number
-}
-
-export type JoinSession = {
-    room: string
-    user: UserProfile
-    roomUser: {
-        authentication: string
-        signature: string
+export type EditionComposition = {
+    groupStage: {
+        groups: Record<GroupName, string[]>
     }
-    exp: number
+    final: {
+        brackets: {
+            upperBracket: string[]
+            lowerBracket: string[]
+        }
+    }
 }
 
-export type RoomVisibility = 'public' | 'private' | 'locked'
-
-export type MatchMode = 'casual' | 'ranked'
-
-export type RoomStatus = 'selecting' | 'preparing' | 'playing'
-
-export type UserStatus = 'waiting' | 'ready' | 'skipped' | 'playing'
-
-export interface Sil {
-    address: string
-    name: string
+export type Edition = {
+    groupStage: (SongPoolChart | null)[]
+    final: (SongPoolChart | null)[]
+    composition: EditionComposition
 }
 
-export type RoomCover = {
-    url: string
-    hash?: string
+export const ACTIVE_EDITION = 'CURRENT EDITION'
+export const EDITIONS: Record<string, Edition> = {}
+
+export const RANKED_POINTS = {
+    perfect: 3,
+    great: 2,
+    good: 1,
+} as const
+
+export const ROOM_TYPES = {
+    groupStage: 'Group Stage',
+    final: 'Final',
+    casualRoom: 'Custom Room',
+    rankedRoom: 'Ranked Match',
+} as const
+
+export const RANKED_TIER_NAMES = [
+    'master',
+    'diamond',
+    'platinum',
+    'gold',
+    'silver',
+    'bronze',
+    'beginner',
+] as const
+
+export const RANKED_MIN_RATING = 18
+export const RANKED_MAX_RATING = 39
+
+export const RANKED_ALLOWED_DIFFICULTIES = new Set([
+    'HARD',
+    'EXPERT',
+    'MASTER',
+    'APPEND',
+])
+
+export const TOURNAMENT_HOST_HANDLE = '163292'
+
+export const STAFF_CHAT_HANDLES = [
+    '163292',
+    '283420',
+    '3227470',
+] as const
+
+export const STAFF_CHAT_SHORTCUTS = [
+    '@Bell',
+    '@Noct',
+    '@Ʌstra',
+] as const
+
+export const STAFF_CHAT_ALERT_EMAIL = 'axxia163292@gmail.com'
+
+export const SCOREBOARD_PUBLIC = true
+
+export type RoomType = keyof typeof ROOM_TYPES
+
+export const SCORING_MODES = {
+    pp: 'PP',
+    rankedMatch: 'Ranked Match',
+} as const
+
+export type ScoringMode = keyof typeof SCORING_MODES
+
+export const DEFAULT_TYPE: RoomType = 'groupStage'
+export const DEFAULT_SCORING: ScoringMode = 'pp'
+export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
+
+export const SERVER_TITLE = 'XX!'
+export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\n\nAXX!A's server!"
+
+/** Empty/unjoined rooms expire after 3 minutes; active rooms stay open up to 4 hours. */
+export const EMPTY_ROOM_TTL_MS = 3 * 60 * 1000
+export const RESERVED_ROOM_TTL_MS = 3 * 60 * 1000
+export const MAX_ROOM_LIFESPAN_MS = 4 * 60 * 60 * 1000
+
+let sheetDivisions: Record<string, string> = {}
+
+export function setSheetDivisions(
+    divisions: Record<string, string>,
+): void {
+    sheetDivisions = { ...divisions }
 }
 
-export interface GameplayResult {
-    grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
-    disqualified?: boolean
-    score?: number
-    accuracy?: number
-    arcadeScore: number
-    accuracyScore: number
-    combo: number
-    perfect: number
-    great: number
-    good: number
-    miss: number
-    totalCount: number
+export function getChartConstant(
+    _address: string,
+    _name: string,
+    _type: 'groupStage' | 'final',
+): number | null {
+    return null
 }
 
-export type LevelItem = {
-    name: string
-    version: 1
-    title: string
-    artists: string
-    author: string
-    rating: number
-    engine: any
-    cover: any
-    bgm: any
-    data: any
-    source?: string
-    tags?: { title: string; icon?: string }[]
+export function getDivision(
+    handle: string,
+    type: 'groupStage' | 'final',
+): string | null {
+    const division = sheetDivisions[handle]
+
+    if (!division) return null
+
+    if (type === 'groupStage') {
+        return division.startsWith('Group ')
+            ? division
+            : null
+    }
+
+    return division === 'Upper Bracket' ||
+        division === 'Lower Bracket'
+        ? division
+        : null
 }
 
-export type RoomMember = {
-    index: number
-    user: UserProfile
-    ready: boolean
-    playing: boolean
-    lastResult?: GameplayResult
-    previousResult?: GameplayResult
-    lastPlayCount: number
-    lastPlayLevel?: LevelItem
-    lastPlayAt?: number
-    pp?: number
-    rating?: number
-    wins?: number
-    losses?: number
-    draws?: number
-}
-
-export type ChatMessage = {
-    id: string
-    handle: string
-    author: string
-    text: string
-    time: number
-}
-
-export type RoomSummary = {
-    name: string
-    title: string
-    subtitle: string
-    /** Host display name. Must be text for the Sonolus RoomItem. */
-    master: string
-    hostId?: string
-    visibility: RoomVisibility
-    type?: 'groupStage' | 'final' | 'casualRoom' | 'rankedRoom'
-    tier?: string
-    level?: Sil | null
-    coverUrl?: string | null
-    matchMode?: MatchMode
-    roundCount?: number
-    ratingMin?: number
-    ratingMax?: number
-    grade?: string
-    accuracyMin?: number
-    accuracyMax?: number
-    fullCombo?: boolean
-    allPerfect?: boolean
-}
-
-export type Env = {
-    ROOM: DurableObjectNamespace<import('./room.ts').Room>
-    LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
-    POSTS_BUCKET: R2Bucket
-    COMMUNITY_BUCKET?: R2Bucket
-    SESSION_SECRET: string
-    PUBLIC_ADDRESS?: string
-    DEV_SKIP_SIGNATURE?: string
-    GOOGLE_SHEETS_SPREADSHEET_ID?: string
-    GOOGLE_SHEETS_CUSTOM_RANGE?: string
-    GOOGLE_SHEETS_PLAYLIST_RANGE?: string
-    GOOGLE_SHEETS_API_KEY?: string
-    GOOGLE_SERVICE_ACCOUNT_EMAIL?: string
-    GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string
+export function getEditionChart(
+    edition: EditionData,
+    type: 'groupStage' | 'final',
+): SheetChart[] {
+    return type === 'groupStage'
+        ? edition.groupStage
+        : edition.final
 }
