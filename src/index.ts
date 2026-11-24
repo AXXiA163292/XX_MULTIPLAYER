@@ -23,6 +23,7 @@ export { Chat } from './chat.ts'
 const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
 const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
 const CHAT_HANDLE_COOKIE = 'xx_chat_handle'
+const PROTECTED_CHAT_HANDLE = '163292'
 
 const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = {
     '163292': { handle: '163292', name: 'AXX!A' },
@@ -36,10 +37,14 @@ const HANDLE_TIMEZONES: Record<string, string> = {
     '3227470': 'Etc/GMT+6',
 }
 
+type EmailNotifyMode = 'mention' | 'all'
+
 type UserChatPrefs = {
     handle: string
     displayName: string
     pfpKey?: string
+    notifyEmail?: string
+    emailNotifyMode?: EmailNotifyMode
     updatedAt: number
 }
 
@@ -77,6 +82,16 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
 
+function requiresProfilePassword(handle?: string | null): boolean {
+    return String(handle ?? '').trim() === PROTECTED_CHAT_HANDLE
+}
+
+function matchesSessionSecretPassword(env: Env, password?: unknown): boolean {
+    const secret = String(env.SESSION_SECRET ?? '')
+    const candidate = typeof password === 'string' ? password : ''
+    return Boolean(secret) && candidate.length > 0 && candidate === secret
+}
+
 function defaultDisplayName(handle: string, fallbackName?: string): string {
     const cleanHandle = String(handle ?? '').trim()
     const cleanFallback = String(fallbackName ?? '').trim()
@@ -108,6 +123,8 @@ async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs
     const fallback: UserChatPrefs = {
         handle: clean,
         displayName: defaultDisplayName(clean),
+        notifyEmail: '',
+        emailNotifyMode: 'mention',
         updatedAt: 0,
     }
 
@@ -118,10 +135,13 @@ async function getUserChatPrefs(env: Env, handle: string): Promise<UserChatPrefs
         if (!obj) return fallback
         const parsed = await obj.json() as Partial<UserChatPrefs>
         const displayName = String(parsed?.displayName ?? '').trim().slice(0, 40)
+        const mode: EmailNotifyMode = parsed?.emailNotifyMode === 'all' ? 'all' : 'mention'
         return {
             handle: clean,
             displayName: displayName || fallback.displayName,
             pfpKey: typeof parsed?.pfpKey === 'string' ? parsed.pfpKey : undefined,
+            notifyEmail: typeof parsed?.notifyEmail === 'string' ? parsed.notifyEmail.trim().slice(0, 120) : '',
+            emailNotifyMode: mode,
             updatedAt: Number(parsed?.updatedAt) || 0,
         }
     } catch {
@@ -134,6 +154,8 @@ async function saveUserChatPrefs(
     handle: string,
     displayName: string,
     pfpKey?: string,
+    notifyEmail?: string,
+    emailNotifyMode?: EmailNotifyMode,
 ): Promise<UserChatPrefs> {
     const clean = String(handle ?? '').trim()
     const current = await getUserChatPrefs(env, clean)
@@ -141,6 +163,8 @@ async function saveUserChatPrefs(
         handle: clean,
         displayName: String(displayName ?? '').trim().slice(0, 40) || current.displayName,
         pfpKey: pfpKey ?? current.pfpKey,
+        notifyEmail: notifyEmail !== undefined ? notifyEmail.trim().slice(0, 120) : (current.notifyEmail ?? ''),
+        emailNotifyMode: emailNotifyMode ?? current.emailNotifyMode ?? 'mention',
         updatedAt: Date.now(),
     }
 
@@ -473,7 +497,7 @@ function canDeleteComment(session: AuthSession | null, authorHandle: string): bo
     return session.user.handle === authorHandle || session.user.handle === TOURNAMENT_HOST_HANDLE
 }
 
-function canDeleteChatMessage(actorHandle: string, authorHandle: string): boolean {
+function canModifyChatMessage(actorHandle: string, authorHandle: string): boolean {
     return actorHandle === authorHandle || actorHandle === TOURNAMENT_HOST_HANDLE
 }
 
@@ -542,6 +566,11 @@ function extractCommentText(values: URLSearchParams): string {
 
 function externalChatUrl(req: Request, env: Env): string {
     return `${addressOf(req, env)}/chat`
+}
+
+function sonolusDeepLinkUrl(req: Request, env: Env): string {
+    const serverUrl = `${addressOf(req, env)}/sonolus`
+    return `sonolus://external-server/${encodeURIComponent(serverUrl)}`
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -756,14 +785,17 @@ function renderStaffChatHtml(
     sessionToken: string,
     fromSonolus: boolean,
     prefsMap: Record<string, UserChatPrefs>,
+    sonolusUrl: string,
 ): string {
     const cardsHtml = CHAT_PFP_HANDLES.map((handle) => {
         const pref = prefsMap[handle]
         const name = pref?.displayName || DEFAULT_CHAT_PROFILES[handle]?.name || handle
+        const lockBadge = handle === PROTECTED_CHAT_HANDLE ? `<span class="pick-lock">Password</span>` : ''
         return `<button type="button" class="pick-card" data-pick-handle="${escapeAttr(handle)}">
           <img class="pick-pfp" src="/api/chat/pfp/${escapeAttr(handle)}" alt="${escapeAttr(name)}"/>
           <span class="pick-name">${escapeAttr(name)}</span>
           <span class="pick-handle">#${escapeAttr(handle)}</span>
+          ${lockBadge}
         </button>`
     }).join('')
 
@@ -881,6 +913,9 @@ function renderStaffChatHtml(
     font-size:12px;
     font-weight:700;
     cursor:pointer;
+    text-decoration:none;
+    display:inline-flex;
+    align-items:center;
     transition:all .12s ease;
   }
   .btn-sm:hover{background:var(--blush);border-color:var(--plum)}
@@ -986,6 +1021,14 @@ function renderStaffChatHtml(
     padding:2px 9px;
     border-radius:999px;
   }
+  .pick-lock{
+    font-size:11px;
+    font-weight:700;
+    color:#FFFFFF;
+    background:var(--plum);
+    padding:2px 8px;
+    border-radius:999px;
+  }
 
   #chatView{
     position:fixed;
@@ -1084,7 +1127,7 @@ function renderStaffChatHtml(
   }
   .row.me .meta{color:var(--blush)}
   .meta-actions{display:flex;align-items:center;gap:6px}
-  .reply-btn{
+  .reply-btn,.edit-btn{
     background:var(--blush-soft);
     color:var(--plum-dark);
     border:1px solid var(--blush-border);
@@ -1095,13 +1138,13 @@ function renderStaffChatHtml(
     cursor:pointer;
     font-family:inherit;
   }
-  .reply-btn:hover{background:var(--blush)}
-  .row.me .reply-btn{
+  .reply-btn:hover,.edit-btn:hover{background:var(--blush)}
+  .row.me .reply-btn,.row.me .edit-btn{
     background:rgba(244,220,230,.18);
     color:var(--blush);
     border-color:rgba(244,220,230,.35);
   }
-  .row.me .reply-btn:hover{background:rgba(244,220,230,.3)}
+  .row.me .reply-btn:hover,.row.me .edit-btn:hover{background:rgba(244,220,230,.3)}
   .del-btn{
     background:#FFF1F4;
     color:#BE123C;
@@ -1144,6 +1187,30 @@ function renderStaffChatHtml(
     white-space:pre-wrap;
     word-break:break-word;
   }
+  .edited-tag{
+    font-size:11.5px;
+    font-weight:600;
+    opacity:.78;
+    margin-left:6px;
+  }
+  .edit-box{
+    display:flex;
+    flex-direction:column;
+    gap:7px;
+    margin-top:4px;
+  }
+  .edit-input{
+    width:100%;
+    background:var(--bg);
+    color:var(--text);
+    border:1.5px solid var(--blush-border);
+    border-radius:9px;
+    padding:7px 10px;
+    font-size:14.5px;
+    font-family:inherit;
+    outline:none;
+  }
+  .edit-actions{display:flex;gap:6px;justify-content:flex-end}
   .msg-footer{margin-top:8px;display:flex;align-items:center;flex-wrap:wrap;gap:8px}
   .like-pill{
     display:inline-flex;
@@ -1215,7 +1282,7 @@ function renderStaffChatHtml(
   .chip:hover{background:var(--blush);border-color:var(--plum)}
   .chip:active{background:var(--plum);color:var(--blush);border-color:var(--plum)}
   form{display:flex;gap:9px;align-items:center}
-  input[type=text]{
+  input[type=text],input[type=email],input[type=password],select{
     flex:1;
     min-width:0;
     background:var(--bg);
@@ -1229,8 +1296,8 @@ function renderStaffChatHtml(
     font-family:inherit;
     transition:border-color .14s ease,background .14s ease;
   }
-  input[type=text]::placeholder{color:var(--muted)}
-  input[type=text]:focus{border-color:var(--plum);background:var(--surface)}
+  input[type=text]::placeholder,input[type=email]::placeholder,input[type=password]::placeholder{color:var(--muted)}
+  input[type=text]:focus,input[type=email]:focus,input[type=password]:focus,select:focus{border-color:var(--plum);background:var(--surface)}
   button[type=submit]{
     background:var(--plum);
     color:var(--blush);
@@ -1250,7 +1317,7 @@ function renderStaffChatHtml(
   button[type=submit]:hover{background:var(--plum-dark);color:#FFFFFF}
   button[type=submit]:active{transform:scale(.98)}
 
-  #settingsModal{
+  .modal-backdrop{
     display:none;
     position:fixed;
     inset:0;
@@ -1262,13 +1329,14 @@ function renderStaffChatHtml(
     z-index:40;
     overflow-y:auto;
   }
-  #settingsModal.open{display:flex}
+  .modal-backdrop.open{display:flex}
   .modal-card{
     width:min(100%,460px);
+    max-height:90dvh;
     background:var(--surface);
     border:2px solid var(--blush);
     border-radius:20px;
-    overflow:hidden;
+    overflow-y:auto;
     box-shadow:0 18px 40px rgba(87,35,62,.24);
     display:flex;
     flex-direction:column;
@@ -1282,6 +1350,41 @@ function renderStaffChatHtml(
   .modal-title{font-size:17px;text-transform:uppercase;letter-spacing:.03em}
   .modal-body{padding:18px 20px 20px;display:flex;flex-direction:column;gap:14px}
   .field-label{font-size:13px;font-weight:700;color:var(--plum-dark);margin-bottom:6px;display:block}
+  .mode-row{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:8px;
+    margin-bottom:8px;
+  }
+  .mode-btn{
+    background:var(--blush-soft);
+    color:var(--plum-dark);
+    border:1.5px solid var(--blush-border);
+    border-radius:10px;
+    padding:8px 10px;
+    font-family:'Montserrat',sans-serif;
+    font-size:12px;
+    font-weight:700;
+    cursor:pointer;
+  }
+  .mode-btn.active{
+    background:var(--plum);
+    color:var(--blush);
+    border-color:var(--plum);
+  }
+  .sonolus-box{
+    background:var(--blush-soft);
+    border:1px solid var(--blush-border);
+    border-radius:12px;
+    padding:11px 13px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+  }
+  .sonolus-label{font-size:13px;font-weight:700;color:var(--plum-dark)}
+  .sonolus-sub{font-size:12px;color:var(--muted)}
+  .auth-error{font-size:13px;font-weight:700;color:#BE123C;min-height:18px}
   input[type=file]{font-size:13.5px;color:var(--muted);font-family:inherit}
   input[type=range]{width:100%;accent-color:var(--plum)}
   .crop-box{
@@ -1307,7 +1410,7 @@ function renderStaffChatHtml(
     border-top:1px solid var(--blush-border);
     flex-wrap:wrap;
   }
-  .modal-actions-right{display:flex;gap:8px}
+  .modal-actions-right{display:flex;gap:8px;margin-left:auto}
 </style>
 </head>
 <body>
@@ -1342,15 +1445,50 @@ function renderStaffChatHtml(
       </form>
     </footer>
   </div>
-  <div id="settingsModal">
+  <div id="passwordModal" class="modal-backdrop">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title">AXX!A Profile Password</div>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="profilePasswordInput">Enter password for AXX!A (#163292)</label>
+          <input id="profilePasswordInput" type="password" placeholder="Password" autocomplete="current-password"/>
+          <div id="passwordError" class="auth-error"></div>
+        </div>
+        <div class="modal-actions">
+          <div class="modal-actions-right">
+            <button id="cancelPasswordBtn" type="button" class="btn-sm">Cancel</button>
+            <button id="submitPasswordBtn" type="button" class="btn-primary">Unlock</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="settingsModal" class="modal-backdrop">
     <div class="modal-card">
       <div class="modal-header">
         <div class="modal-title">Chat Settings</div>
       </div>
       <div class="modal-body">
         <div>
-          <label class="field-label" for="displayNameInput">Display Name (also used for @mention)</label>
+          <label class="field-label" for="displayNameInput">Display Name</label>
           <input id="displayNameInput" type="text" maxlength="40" placeholder="Your display name"/>
+        </div>
+        <div>
+          <label class="field-label" for="notifyEmailInput">Email Notifications</label>
+          <div class="mode-row">
+            <button id="modeMentionBtn" type="button" class="mode-btn">Mentions only</button>
+            <button id="modeAllBtn" type="button" class="mode-btn">All messages</button>
+          </div>
+          <input id="notifyEmailInput" type="email" maxlength="120" placeholder="you@example.com"/>
+        </div>
+        <div class="sonolus-box">
+          <div>
+            <div class="sonolus-label">Sonolus App</div>
+            <div class="sonolus-sub">Open server chat in Sonolus</div>
+          </div>
+          <a id="openSonolusBtn" class="btn-sm" href="${escapeAttr(sonolusUrl)}">Open on Sonolus</a>
         </div>
         <div>
           <label class="field-label" for="pfpFileInput">Square 1:1 Profile Picture (R2)</label>
@@ -1375,6 +1513,8 @@ function renderStaffChatHtml(
   </div>
 <script>
   const STORAGE_KEY = 'xx_chat_handle';
+  const UNLOCK_KEY = 'xx_chat_unlocked_163292';
+  const PROTECTED_HANDLE = ${JSON.stringify(PROTECTED_CHAT_HANDLE)};
   const COOKIE_NAME = ${JSON.stringify(CHAT_HANDLE_COOKIE)};
   const HOST_HANDLE = ${JSON.stringify(TOURNAMENT_HOST_HANDLE)};
   const knownHandles = ${JSON.stringify([...CHAT_PFP_HANDLES])};
@@ -1396,8 +1536,15 @@ function renderStaffChatHtml(
   const replyTextEl = document.getElementById('replyText');
   const cancelReplyBtn = document.getElementById('cancelReplyBtn');
 
+  const passwordModal = document.getElementById('passwordModal');
+  const profilePasswordInput = document.getElementById('profilePasswordInput');
+  const passwordError = document.getElementById('passwordError');
+
   const settingsModal = document.getElementById('settingsModal');
   const displayNameInput = document.getElementById('displayNameInput');
+  const modeMentionBtn = document.getElementById('modeMentionBtn');
+  const modeAllBtn = document.getElementById('modeAllBtn');
+  const notifyEmailInput = document.getElementById('notifyEmailInput');
   const pfpFileInput = document.getElementById('pfpFileInput');
   const cropWrap = document.getElementById('cropWrap');
   const cropBox = document.getElementById('cropBox');
@@ -1405,7 +1552,10 @@ function renderStaffChatHtml(
   const zoomRange = document.getElementById('zoomRange');
 
   let loggedOut = false;
+  let pendingPasswordHandle = '';
+  let selectedNotifyMode = 'mention';
   let activeReply = null;
+  let editingMessageId = '';
   let currentMessages = [];
   let lastRenderSig = '';
   let hasLoadedOnce = false;
@@ -1430,6 +1580,21 @@ function renderStaffChatHtml(
       syncViewportHeight();
       box.scrollTop = box.scrollHeight;
     });
+  }
+
+  function isProtectedUnlocked() {
+    try {
+      return sessionStorage.getItem(UNLOCK_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  function setProtectedUnlocked(val) {
+    try {
+      if (val) sessionStorage.setItem(UNLOCK_KEY, '1');
+      else sessionStorage.removeItem(UNLOCK_KEY);
+    } catch {}
   }
 
   function readSavedHandle() {
@@ -1485,17 +1650,23 @@ function renderStaffChatHtml(
   function getActiveUser() {
     if (loggedOut) return null;
     if (sonolusUser && sonolusUser.handle) {
+      if (sonolusUser.handle === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        return null;
+      }
       return { ...sonolusUser, name: displayNameFor(sonolusUser.handle, sonolusUser.name) };
     }
     const saved = readSavedHandle();
     if (saved && defaultsMap[saved]) {
+      if (saved === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        return null;
+      }
       return {
         id: saved,
         handle: saved,
         name: displayNameFor(saved, defaultsMap[saved].name),
       };
     }
-    return null
+    return null;
   }
 
   function authHeaders(extra = {}) {
@@ -1573,12 +1744,13 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
-  function render(messages) {
+  function render(messages, force = false) {
+    const shouldStickBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90 || !hasLoadedOnce || force;
     currentMessages = Array.isArray(messages) ? messages : [];
     const active = getActiveUser();
     const myHandle = active ? active.handle : '';
-    const sig = JSON.stringify({ myHandle, prefsMap, currentMessages });
-    if (sig === lastRenderSig) return;
+    const sig = JSON.stringify({ myHandle, prefsMap, editingMessageId, currentMessages });
+    if (!force && sig === lastRenderSig) return;
     lastRenderSig = sig;
 
     if (currentMessages.length === 0) {
@@ -1589,14 +1761,28 @@ function renderStaffChatHtml(
     box.innerHTML = currentMessages.map((m) => {
       const time = formatAuthorTime(m);
       const mine = m.handle === myHandle ? 'me' : '';
-      const canDelete = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
+      const canModify = myHandle && (m.handle === myHandle || myHandle === HOST_HANDLE);
       const pfpImg = '<img class="pfp" src="' + escapeHtml(pfpUrlFor(m.handle)) + '" alt=""/>';
       const replyHtml = m.replyTo
         ? '<div class="reply-quote">Replying to ' + escapeHtml(m.replyTo.author || m.replyTo.handle || '') + ': ' + escapeHtml(m.replyTo.text || '') + '</div>'
         : '';
-      const delHtml = canDelete
+      const editBtn = canModify
+        ? '<button type="button" class="edit-btn" data-edit-id="' + escapeHtml(m.id) + '">Edit</button>'
+        : '';
+      const delHtml = canModify
         ? '<button type="button" class="del-btn" data-delete-id="' + escapeHtml(m.id) + '">Delete</button>'
         : '';
+
+      const isEditing = editingMessageId === m.id;
+      const bodyHtml = isEditing
+        ? '<div class="edit-box">' +
+            '<input type="text" class="edit-input" data-edit-input="' + escapeHtml(m.id) + '" maxlength="500" value="' + escapeAttr(m.text) + '"/>' +
+            '<div class="edit-actions">' +
+              '<button type="button" class="btn-sm" data-cancel-edit="1">Cancel</button>' +
+              '<button type="button" class="btn-primary" data-save-edit="' + escapeHtml(m.id) + '">Save</button>' +
+            '</div>' +
+          '</div>'
+        : '<div class="text">' + escapeHtml(m.text) + (m.editedAt ? '<span class="edited-tag">(edited)</span>' : '') + '</div>';
 
       const likers = Array.isArray(m.likes) ? m.likes : [];
       const avatarsHtml = likers.map((h) =>
@@ -1612,20 +1798,24 @@ function renderStaffChatHtml(
           '<div class="meta"><span>' + escapeHtml(formatTag(m.author, m.handle)) + ' · ' + escapeHtml(time) + '</span>' +
           '<span class="meta-actions">' +
             '<button type="button" class="reply-btn" data-reply-id="' + escapeHtml(m.id) + '">Reply</button>' +
+            editBtn +
             delHtml +
           '</span></div>' +
           replyHtml +
-          '<div class="text">' + escapeHtml(m.text) + '</div>' +
+          bodyHtml +
           (likeBadgeHtml ? '<div class="msg-footer">' + likeBadgeHtml + '</div>' : '') +
         '</div>' +
       '</div>';
     }).join('');
-    box.scrollTop = box.scrollHeight;
+
+    if (shouldStickBottom) {
+      box.scrollTop = box.scrollHeight;
+    }
   }
 
-  async function loadMessages() {
+  async function loadMessages(force = false) {
     const active = getActiveUser();
-    if (!active || document.hidden) return;
+    if (!active) return;
     if (!hasLoadedOnce) {
       box.innerHTML = '<div class="empty-state">Loading messages...</div>';
     }
@@ -1643,7 +1833,7 @@ function renderStaffChatHtml(
         renderKnownUserChips();
       }
       hasLoadedOnce = true;
-      render(Array.isArray(data.messages) ? data.messages : []);
+      render(Array.isArray(data.messages) ? data.messages : [], force);
     } catch (error) {
       console.error('Could not load chat messages:', error);
       if (!hasLoadedOnce) {
@@ -1666,13 +1856,17 @@ function renderStaffChatHtml(
   function connectSocket() {
     disconnectSocket();
     const active = getActiveUser();
-    if (!active || document.hidden) return;
+    if (!active) return;
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const qs = new URLSearchParams({ handle: active.handle });
     if (sessionToken && !loggedOut) qs.set('session', sessionToken);
     const ws = new WebSocket(proto + '//' + location.host + '/ws/chat?' + qs.toString());
     socket = ws;
+
+    ws.onopen = () => {
+      void loadMessages(true);
+    };
 
     ws.onmessage = (event) => {
       try {
@@ -1686,7 +1880,7 @@ function renderStaffChatHtml(
 
     ws.onclose = () => {
       if (socket === ws) socket = null;
-      if (!document.hidden && getActiveUser()) {
+      if (getActiveUser()) {
         reconnectTimer = setTimeout(() => connectSocket(), 1500);
       }
     };
@@ -1700,6 +1894,10 @@ function renderStaffChatHtml(
       settingsBtn.style.display = 'none';
       pickerEl.classList.add('open');
       chatViewEl.classList.remove('open');
+      const saved = readSavedHandle();
+      if (!loggedOut && saved === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        openPasswordPrompt(PROTECTED_HANDLE);
+      }
       return;
     }
 
@@ -1709,17 +1907,70 @@ function renderStaffChatHtml(
     chatViewEl.classList.add('open');
     syncViewportHeight();
     renderKnownUserChips();
-    void loadMessages();
+    void loadMessages(true);
     connectSocket();
   }
+
+  function openPasswordPrompt(handle) {
+    pendingPasswordHandle = handle;
+    profilePasswordInput.value = '';
+    passwordError.textContent = '';
+    passwordModal.classList.add('open');
+    setTimeout(() => profilePasswordInput.focus(), 20);
+  }
+
+  async function verifyProfilePassword() {
+    const pw = profilePasswordInput.value;
+    if (!pw) {
+      passwordError.textContent = 'Please enter the password.';
+      return;
+    }
+    const res = await fetch('/api/chat/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ handle: pendingPasswordHandle || PROTECTED_HANDLE, password: pw }),
+    });
+    if (!res.ok) {
+      passwordError.textContent = 'Incorrect password.';
+      return;
+    }
+    setProtectedUnlocked(true);
+    loggedOut = false;
+    hasLoadedOnce = false;
+    lastRenderSig = '';
+    persistHandle(pendingPasswordHandle || PROTECTED_HANDLE);
+    pendingPasswordHandle = '';
+    passwordModal.classList.remove('open');
+    syncMode();
+  }
+
+  document.getElementById('cancelPasswordBtn').addEventListener('click', () => {
+    pendingPasswordHandle = '';
+    passwordModal.classList.remove('open');
+  });
+  document.getElementById('submitPasswordBtn').addEventListener('click', () => {
+    void verifyProfilePassword();
+  });
+  profilePasswordInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void verifyProfilePassword();
+    } else if (e.key === 'Escape') {
+      pendingPasswordHandle = '';
+      passwordModal.classList.remove('open');
+    }
+  });
 
   logoutBtn.addEventListener('click', () => {
     loggedOut = true;
     hasLoadedOnce = false;
     lastRenderSig = '';
+    editingMessageId = '';
+    setProtectedUnlocked(false);
     persistHandle('');
     currentMessages = [];
-    render([]);
+    render([], true);
     setReplyTarget(null);
     settingsModal.classList.remove('open');
     syncMode();
@@ -1736,7 +1987,24 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || []);
+      render(data.messages || [], true);
+    }
+  }
+
+  async function saveEditedMessage(id, nextText) {
+    const active = getActiveUser();
+    const cleanText = String(nextText || '').trim();
+    if (!active || !id || !cleanText) return;
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      credentials: 'same-origin',
+      body: JSON.stringify({ action: 'edit', id, text: cleanText, handle: active.handle }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      editingMessageId = '';
+      render(data.messages || [], true);
     }
   }
 
@@ -1822,10 +2090,22 @@ function renderStaffChatHtml(
     return canvas.toDataURL('image/png');
   }
 
+  function applyNotifyModeUi(mode) {
+    selectedNotifyMode = mode === 'all' ? 'all' : 'mention';
+    modeMentionBtn.classList.toggle('active', selectedNotifyMode === 'mention');
+    modeAllBtn.classList.toggle('active', selectedNotifyMode === 'all');
+  }
+
+  modeMentionBtn.addEventListener('click', () => applyNotifyModeUi('mention'));
+  modeAllBtn.addEventListener('click', () => applyNotifyModeUi('all'));
+
   settingsBtn.addEventListener('click', () => {
     const active = getActiveUser();
     if (!active) return;
+    const p = prefsMap[active.handle] || {};
     displayNameInput.value = active.name;
+    notifyEmailInput.value = p.notifyEmail || '';
+    applyNotifyModeUi(p.emailNotifyMode === 'all' ? 'all' : 'mention');
     pfpFileInput.value = '';
     zoomRange.value = '1';
     cropWrap.style.display = 'none';
@@ -1833,14 +2113,15 @@ function renderStaffChatHtml(
     settingsModal.classList.add('open');
   });
 
-  closeSettingsBtn.addEventListener('click', () => {
+  document.getElementById('closeSettingsBtn').addEventListener('click', () => {
     settingsModal.classList.remove('open');
   });
 
-  saveSettingsBtn.addEventListener('click', async () => {
+  document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
     const active = getActiveUser();
     if (!active) return;
     const displayName = displayNameInput.value.trim() || active.name;
+    const notifyEmail = notifyEmailInput.value.trim();
     const croppedPng = await buildCroppedSquareDataUrl();
     const res = await fetch('/api/chat/settings', {
       method: 'POST',
@@ -1849,6 +2130,8 @@ function renderStaffChatHtml(
       body: JSON.stringify({
         handle: active.handle,
         displayName,
+        notifyEmail,
+        emailNotifyMode: selectedNotifyMode,
         pfpDataUrl: croppedPng,
       }),
     });
@@ -1866,8 +2149,13 @@ function renderStaffChatHtml(
     card.addEventListener('click', () => {
       const picked = card.getAttribute('data-pick-handle') || '';
       if (!defaultsMap[picked]) return;
+      if (picked === PROTECTED_HANDLE && !isProtectedUnlocked()) {
+        openPasswordPrompt(picked);
+        return;
+      }
       loggedOut = false;
       hasLoadedOnce = false;
+      lastRenderSig = '';
       persistHandle(picked);
       syncMode();
     });
@@ -1925,7 +2213,7 @@ function renderStaffChatHtml(
   });
 
   box.addEventListener('dblclick', async (e) => {
-    if (e.target.closest('button')) return;
+    if (e.target.closest('button,input')) return;
     const rowEl = e.target.closest('[data-row-id]');
     if (!rowEl) return;
     const id = rowEl.getAttribute('data-row-id');
@@ -1936,12 +2224,54 @@ function renderStaffChatHtml(
     }
   });
 
+  box.addEventListener('keydown', (e) => {
+    const editInp = e.target.closest('[data-edit-input]');
+    if (!editInp) return;
+    const id = editInp.getAttribute('data-edit-input') || '';
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void saveEditedMessage(id, editInp.value);
+    } else if (e.key === 'Escape') {
+      editingMessageId = '';
+      render(currentMessages, true);
+    }
+  });
+
   box.addEventListener('click', async (e) => {
     const replyBtn = e.target.closest('[data-reply-id]');
     if (replyBtn) {
       const id = replyBtn.getAttribute('data-reply-id');
       const target = currentMessages.find((m) => m.id === id);
       if (target) setReplyTarget(target);
+      return;
+    }
+
+    const editBtn = e.target.closest('[data-edit-id]');
+    if (editBtn) {
+      const id = editBtn.getAttribute('data-edit-id') || '';
+      editingMessageId = id;
+      render(currentMessages, true);
+      const inp = box.querySelector('[data-edit-input="' + CSS.escape(id) + '"]');
+      if (inp) {
+        inp.focus();
+        inp.setSelectionRange(inp.value.length, inp.value.length);
+      }
+      return;
+    }
+
+    if (e.target.closest('[data-cancel-edit]')) {
+      editingMessageId = '';
+      render(currentMessages, true);
+      return;
+    }
+
+    const saveEditBtn = e.target.closest('[data-save-edit]');
+    if (saveEditBtn) {
+      const id = saveEditBtn.getAttribute('data-save-edit') || '';
+      const inp = box.querySelector('[data-edit-input="' + CSS.escape(id) + '"]');
+      if (inp) {
+        await saveEditedMessage(id, inp.value);
+      }
       return;
     }
 
@@ -1956,7 +2286,7 @@ function renderStaffChatHtml(
       });
       if (res.ok) {
         const data = await res.json();
-        render(data.messages || []);
+        render(data.messages || [], true);
       }
       return;
     }
@@ -1987,7 +2317,7 @@ function renderStaffChatHtml(
     });
     if (res.ok) {
       const data = await res.json();
-      render(data.messages || []);
+      render(data.messages || [], true);
     }
   });
 
@@ -1996,17 +2326,14 @@ function renderStaffChatHtml(
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      disconnectSocket();
-    } else {
-      syncMode();
+    if (!document.hidden) {
+      void loadMessages(true);
+      if (!socket) connectSocket();
     }
   });
   window.addEventListener('focus', () => {
-    if (!document.hidden) {
-      void loadMessages();
-      if (!socket) connectSocket();
-    }
+    void loadMessages(true);
+    if (!socket) connectSocket();
   });
   window.addEventListener('pageshow', () => {
     syncMode();
@@ -2014,10 +2341,10 @@ function renderStaffChatHtml(
 
   syncMode();
   pollTimer = setInterval(() => {
-    if (!document.hidden && (!socket || socket.readyState !== WebSocket.OPEN)) {
-      void loadMessages();
+    if (!document.hidden) {
+      void loadMessages(false);
     }
-  }, 8000);
+  }, 5000);
 </script>
 </body>
 </html>`
@@ -2536,6 +2863,23 @@ self.addEventListener('fetch', (event) => {
             return new Response(null, { status: 404 })
         }
 
+        if (path === '/api/chat/auth' && req.method === 'POST') {
+            let body: any
+            try {
+                body = await req.json()
+            } catch {
+                return message(400, 'Invalid JSON.')
+            }
+            const handle = String(body?.handle ?? '').trim()
+            if (!requiresProfilePassword(handle)) {
+                return json({ ok: true })
+            }
+            if (!matchesSessionSecretPassword(env, body?.password)) {
+                return message(401, 'Invalid password.')
+            }
+            return json({ ok: true })
+        }
+
         if (path === '/api/chat/settings' && req.method === 'POST') {
             let body: any
             try {
@@ -2574,7 +2918,23 @@ self.addEventListener('fetch', (event) => {
                 ? body.displayName.trim().slice(0, 40)
                 : resolved.user.name
 
-            const savedPrefs = await saveUserChatPrefs(env, handle, nextDisplayName, pfpKey)
+            const notifyEmail = typeof body?.notifyEmail === 'string'
+                ? body.notifyEmail.trim().slice(0, 120)
+                : undefined
+
+            const emailNotifyMode: EmailNotifyMode | undefined =
+                body?.emailNotifyMode === 'all' || body?.emailNotifyMode === 'mention'
+                    ? body.emailNotifyMode
+                    : undefined
+
+            const savedPrefs = await saveUserChatPrefs(
+                env,
+                handle,
+                nextDisplayName,
+                pfpKey,
+                notifyEmail,
+                emailNotifyMode,
+            )
             return json({ ok: true, prefs: savedPrefs })
         }
 
@@ -2592,12 +2952,13 @@ self.addEventListener('fetch', (event) => {
             )
             const prefsMap = Object.fromEntries(prefsEntries)
             const resolved = await resolveChatUser(req, env, url)
+            const sUrl = sonolusDeepLinkUrl(req, env)
             if (resolved) {
                 return html(
-                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus, prefsMap),
+                    renderStaffChatHtml(resolved.user, resolved.token, resolved.fromSonolus, prefsMap, sUrl),
                 )
             }
-            return html(renderStaffChatHtml(null, '', false, prefsMap))
+            return html(renderStaffChatHtml(null, '', false, prefsMap, sUrl))
         }
 
         if (path === '/api/chat') {
@@ -2626,6 +2987,25 @@ self.addEventListener('fetch', (event) => {
             }
 
             if (req.method === 'POST') {
+                if (body?.action === 'edit') {
+                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
+                    const nextText = typeof body?.text === 'string' ? body.text.trim() : ''
+                    if (!targetId || !nextText) {
+                        return message(400, 'Missing message id or text.')
+                    }
+                    const messages = await chatStub(env).listMessages().catch(() => [])
+                    const target = messages.find((m) => m.id === targetId)
+                    if (!target) {
+                        return message(404, 'Message not found.')
+                    }
+                    if (!canModifyChatMessage(resolved.user.handle, target.handle)) {
+                        return message(403, 'You cannot edit this message.')
+                    }
+                    await chatStub(env).editMessage(targetId, nextText.slice(0, 500))
+                    const updated = await chatStub(env).listMessages().catch(() => [])
+                    return json({ ok: true, messages: updated, prefs: prefsMap })
+                }
+
                 if (body?.action === 'delete') {
                     const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
                     if (!targetId) {
@@ -2636,7 +3016,7 @@ self.addEventListener('fetch', (event) => {
                     if (!target) {
                         return message(404, 'Message not found.')
                     }
-                    if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
+                    if (!canModifyChatMessage(resolved.user.handle, target.handle)) {
                         return message(403, 'Only 163292 can delete messages from other members.')
                     }
                     await chatStub(env).deleteMessage(targetId)
@@ -2685,7 +3065,7 @@ self.addEventListener('fetch', (event) => {
                 if (!target) {
                     return message(404, 'Message not found.')
                 }
-                if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
+                if (!canModifyChatMessage(resolved.user.handle, target.handle)) {
                     return message(403, 'Only 163292 can delete messages from other members.')
                 }
                 await chatStub(env).deleteMessage(id)
