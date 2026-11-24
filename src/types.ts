@@ -90,7 +90,8 @@ export type RoomSummary = {
     name: string
     title: string
     subtitle: string
-    master: boolean
+    /** Host display name. Must be text for the Sonolus RoomItem. */
+    master: string
     visibility: RoomVisibility
     matchMode?: MatchMode
     roundCount?: number
