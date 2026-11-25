@@ -179,6 +179,12 @@ function normalizeId(value: unknown): string {
         .trim()
 }
 
+function normalizeEditionLabel(value: unknown): string {
+    return normalizeId(value)
+        .replace(/\s+/g, ' ')
+        .toUpperCase()
+}
+
 function chartFromUrl(id: string, rawInput: string): SheetChart | null {
     const raw = stripTrailingSlash(rawInput)
     if (!raw) return null
@@ -515,6 +521,35 @@ function isGroupHeader(header: string): boolean {
     return /^[A-Z]$/i.test(header)
 }
 
+function findIndexHeaderRow(rows: string[][]): {
+    headerIndex: number
+    headers: string[]
+    normalized: string[]
+    editionCol: number
+} {
+    let headerIndex = rows.findIndex((row) => {
+        const values = row.map((cell) => normalizeEditionLabel(cell))
+        return values.includes('EDITION') && (values.includes('G1') || values.includes('F1'))
+    })
+
+    if (headerIndex < 0) {
+        headerIndex = rows.findIndex((row) =>
+            row.some((cell) => normalizeEditionLabel(cell) === 'EDITION'),
+        )
+    }
+
+    if (headerIndex < 0) {
+        throw new Error(`[INDEX] Could not find the EDITION header row in "${INDEX_SHEET_TAB}".`)
+    }
+
+    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
+    const normalized = headers.map((cell) => normalizeEditionLabel(cell))
+    const foundEditionCol = normalized.indexOf('EDITION')
+    const editionCol = foundEditionCol >= 0 ? foundEditionCol : 0
+
+    return { headerIndex, headers, normalized, editionCol }
+}
+
 export function getLiveEdition(date = new Date()): string {
     const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: 'Europe/Paris',
@@ -535,22 +570,11 @@ export function getLiveEdition(date = new Date()): string {
 
 export async function getAvailableEditions(): Promise<string[]> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-
-    const headerIndex = rows.findIndex((row) =>
-        row.some((cell) => normalizeId(cell).toUpperCase() === 'EDITION'),
-    )
-
-    if (headerIndex < 0) {
-        throw new Error('[INDEX] Could not find the EDITION header.')
-    }
-
-    const editionColumn = rows[headerIndex]!.findIndex(
-        (cell) => normalizeId(cell).toUpperCase() === 'EDITION',
-    )
+    const { headerIndex, editionCol } = findIndexHeaderRow(rows)
 
     const editions = rows
         .slice(headerIndex + 1)
-        .map((row) => normalizeId(row[editionColumn]).toUpperCase())
+        .map((row) => normalizeEditionLabel(row[editionCol]))
         .filter((value) => /^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+\d{4}$/.test(value))
 
     const unique = [...new Set(editions)].reverse()
@@ -565,23 +589,12 @@ export async function getEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-
-    const headerIndex = rows.findIndex((row) => {
-        const values = row.map((cell) => normalizeId(cell).toUpperCase())
-        return values.includes('EDITION') && values.includes('G1') && values.includes('F1')
-    })
-
-    if (headerIndex < 0) {
-        throw new Error(`[INDEX] Could not find the EDITION/G1/F1 header row in "${INDEX_SHEET_TAB}".`)
-    }
-
-    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
-    const normalized = headers.map((cell) => cell.toUpperCase())
+    const { headerIndex, headers, normalized, editionCol } = findIndexHeaderRow(rows)
     const dataRows = rows.slice(headerIndex + 1)
 
-    const edition = normalizeId(requestedEdition).toUpperCase()
+    const edition = normalizeEditionLabel(requestedEdition)
     const activeRow = dataRows.find((row) =>
-        normalizeId(row[0]).toUpperCase() === edition,
+        normalizeEditionLabel(row[editionCol]) === edition,
     ) ?? []
 
     const groupStage: SheetChart[] = []
@@ -664,33 +677,22 @@ export async function getUltimateEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<UltimateEditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-
-    const headerIndex = rows.findIndex((row) => {
-        const values = row.map((cell) => normalizeId(cell).toUpperCase())
-        return values.includes('EDITION') && values.includes('G1') && values.includes('F1')
-    })
-
-    if (headerIndex < 0) {
-        throw new Error('[ULTIMATE] Could not find the EDITION/G1/F1 header row.')
-    }
-
-    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
-    const normalized = headers.map((cell) => cell.toUpperCase())
+    const { headerIndex, normalized, editionCol } = findIndexHeaderRow(rows)
     const dataRows = rows.slice(headerIndex + 1)
-    const edition = normalizeId(requestedEdition).toUpperCase()
+    const edition = normalizeEditionLabel(requestedEdition)
 
     if (!/^ULTIMATE\s+\d{4}$/.test(edition)) {
         throw new Error(`[ULTIMATE] Invalid edition: ${edition}`)
     }
 
     const ultimateRow = dataRows.find(
-        (row) => normalizeId(row[0]).toUpperCase() === edition,
+        (row) => normalizeEditionLabel(row[editionCol]) === edition,
     )
 
     const year = edition.match(/\d{4}$/)![0]
 
     const getRow = (name: string) => dataRows.find(
-        (row) => normalizeId(row[0]).toUpperCase() === name,
+        (row) => normalizeEditionLabel(row[editionCol]) === name,
     )
 
     const buildSeasonPool = (
