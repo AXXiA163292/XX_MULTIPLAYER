@@ -32,12 +32,17 @@ const SEASON_RANK: Record<string, number> = {
     FALL: 4,
 }
 
-const SEASONAL_RE = /^(WINTER|SPRING|SUMMER|FALL)\s+(\d{4})$/
-const ULTIMATE_RE = /^ULTIMATE\s+(\d{4})$/
+export const SEASONAL_EDITION_RE = /^(WINTER|SPRING|SUMMER|FALL)\s+(\d{4})$/
+export const ULTIMATE_EDITION_RE = /^ULTIMATE\s+(\d{4})$/
+export const ANY_EDITION_RE = /^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+(\d{4})$/
+
+export function isUltimateEdition(edition: string): boolean {
+    return ULTIMATE_EDITION_RE.test(edition.trim().toUpperCase())
+}
 
 function editionTimestamp(edition: string, now = new Date()): number {
     const clean = edition.trim().toUpperCase()
-    const seasonal = clean.match(SEASONAL_RE)
+    const seasonal = clean.match(SEASONAL_EDITION_RE)
     if (seasonal) {
         const season = seasonal[1]!
         const year = Number(seasonal[2]!)
@@ -50,10 +55,9 @@ function editionTimestamp(edition: string, now = new Date()): number {
         return Date.UTC(year, monthBySeason[season] ?? 0, 1)
     }
 
-    const ultimate = clean.match(ULTIMATE_RE)
+    const ultimate = clean.match(ULTIMATE_EDITION_RE)
     if (ultimate) {
         const year = Number(ultimate[1]!)
-        // Anchor Ultimate editions around late year (November) to match annual edition timing
         return Date.UTC(year, 10, 25)
     }
 
@@ -72,8 +76,8 @@ export function pickClosestEdition(
         const diffB = Math.abs(editionTimestamp(b, now) - targetMs)
         if (diffA !== diffB) return diffA - diffB
 
-        const matchA = a.match(SEASONAL_RE)
-        const matchB = b.match(SEASONAL_RE)
+        const matchA = a.match(SEASONAL_EDITION_RE)
+        const matchB = b.match(SEASONAL_EDITION_RE)
         if (matchA && matchB) {
             const yearDiff = Number(matchB[2]) - Number(matchA[2])
             if (yearDiff !== 0) return yearDiff
@@ -83,25 +87,14 @@ export function pickClosestEdition(
     })[0]!
 }
 
-export function filterEditionsForRoomType(
-    availableEditions: string[],
-    type: RoomType,
-): string[] {
-    const normalized = [...new Set(
-        availableEditions
-            .map((edition) => String(edition).trim().toUpperCase())
-            .filter(Boolean),
-    )]
-
-    if (type === 'ultimateEdition') {
-        return normalized.filter((edition) => ULTIMATE_RE.test(edition))
-    }
-
-    if (type === 'groupStage' || type === 'final') {
-        return normalized.filter((edition) => SEASONAL_RE.test(edition))
-    }
-
-    return normalized
+export function normalizeEditionsList(availableEditions: string[]): string[] {
+    return [
+        ...new Set(
+            availableEditions
+                .map((edition) => String(edition).trim().toUpperCase())
+                .filter((edition) => ANY_EDITION_RE.test(edition)),
+        ),
+    ]
 }
 
 export function defaultCustomRoomTitle(hostName?: string): string {
@@ -129,9 +122,9 @@ const editionOption = (editions: string[], defaultEdition?: string) => ({
     description: 'Choose the championship edition.',
     required: false,
     type: 'select' as const,
-    def: (defaultEdition && editions.includes(defaultEdition))
+    def: defaultEdition && editions.includes(defaultEdition)
         ? defaultEdition
-        : (pickClosestEdition(editions) || editions[0] || ''),
+        : pickClosestEdition(editions) || editions[0] || '',
     values: editions.map((edition) => ({
         name: edition,
         title: edition,
@@ -141,11 +134,11 @@ const editionOption = (editions: string[], defaultEdition?: string) => ({
 const groupOption = {
     query: 'group',
     name: 'Group',
-    description: 'Enter the group name, for example A.',
+    description: 'Leave empty for Final / Ultimate, or enter a group (e.g. A) for Group Stage.',
     required: false,
     type: 'text' as const,
-    def: 'A',
-    placeholder: 'A',
+    def: '',
+    placeholder: 'Empty = Final / Ultimate',
     limit: 24,
     shortcuts: [],
 }
@@ -240,17 +233,15 @@ export const closeRoomForm = {
     options: [],
 }
 
-const isOpenType = (type: RoomType) =>
+export const isOpenType = (type: RoomType) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
 export const roomForms = (
     isTournamentHost = false,
     availableEditions: string[] = [],
 ) => {
-    const seasonalEditions = filterEditionsForRoomType(availableEditions, 'groupStage')
-    const ultimateEditions = filterEditionsForRoomType(availableEditions, 'ultimateEdition')
-    const defaultSeasonal = pickClosestEdition(seasonalEditions)
-    const defaultUltimate = pickClosestEdition(ultimateEditions)
+    const editions = normalizeEditionsList(availableEditions)
+    const defaultEdition = pickClosestEdition(editions)
 
     return (Object.keys(ROOM_TYPES) as RoomType[])
         .filter((type) => isTournamentHost || isOpenType(type))
@@ -258,40 +249,31 @@ export const roomForms = (
             type,
             title: ROOM_TYPES[type],
             requireConfirmation: false,
-            options: type === 'groupStage'
+            options: type === 'tournament'
                 ? [
-                    editionOption(seasonalEditions, defaultSeasonal),
+                    editionOption(editions, defaultEdition),
                     groupOption,
                     tournamentScoringOption,
                     tournamentVisibilityOption,
                 ]
-                : type === 'final'
+                : type === 'casualRoom'
                     ? [
-                        editionOption(seasonalEditions, defaultSeasonal),
-                        tournamentScoringOption,
-                        tournamentVisibilityOption,
+                        titleOption,
+                        customScoringOption,
+                        customVisibilityOption,
+                        randomOption,
                     ]
-                    : type === 'ultimateEdition'
-                        ? [
-                            editionOption(ultimateEditions, defaultUltimate),
-                            tournamentScoringOption,
-                            tournamentVisibilityOption,
-                        ]
-                        : type === 'casualRoom'
-                            ? [
-                                titleOption,
-                                customScoringOption,
-                                customVisibilityOption,
-                                randomOption,
-                            ]
-                            : [
-                                tierOption,
-                                customSongsOption,
-                                vocalTypeOption,
-                            ],
+                    : [
+                        tierOption,
+                        customSongsOption,
+                        vocalTypeOption,
+                    ],
         }))
 }
 
+/**
+ * Inside an already-opened room, settings cannot be edited except Room access.
+ */
 export const roomFormsForType = (
     type: RoomType,
     isTournamentHost = false,
@@ -299,11 +281,14 @@ export const roomFormsForType = (
 ) =>
     roomForms(isTournamentHost, availableEditions)
         .filter((form) => form.type === type)
-        .map((form) =>
-            type === 'rankedRoom'
-                ? { ...form, options: [vocalTypeOption] }
-                : form,
-        )
+        .map((form) => ({
+            ...form,
+            options: type === 'tournament'
+                ? [tournamentVisibilityOption]
+                : type === 'casualRoom'
+                    ? [customVisibilityOption]
+                    : [],
+        }))
 
 export type RoomSettings = {
     type: RoomType
@@ -328,10 +313,7 @@ export const serializeSettings = (s: RoomSettings) => {
 
     if (!isOpenType(s.type)) {
         values.push(`edition=${encodeURIComponent(s.edition || '')}`)
-    }
-
-    if (s.type === 'groupStage') {
-        values.push(`group=${encodeURIComponent(s.group || 'A')}`)
+        values.push(`group=${encodeURIComponent(s.group || '')}`)
     }
 
     if (s.type === 'casualRoom') {
@@ -342,7 +324,7 @@ export const serializeSettings = (s: RoomSettings) => {
     if (s.type === 'rankedRoom') {
         values.push(`tier=${encodeURIComponent(s.tier || 'master')}`)
         values.push(`customSongs=${encodeURIComponent(s.customSongs || 'off')}`)
-        values.push(`vocalType=${encodeURIComponent(s.vocalType || 'virtualSinger')}`)
+        values.push(`vocalType=${encodeURIComponent(s.vocalType || 'sekai')}`)
     }
 
     return values.join('&')
@@ -398,7 +380,11 @@ export function parseSettings(
         ? new URLSearchParams(input)
         : input
 
-    const type = p.get('type') || existing?.type || DEFAULT_TYPE
+    const rawType = p.get('type') || existing?.type || DEFAULT_TYPE
+    const type =
+        rawType === 'groupStage' || rawType === 'final' || rawType === 'ultimateEdition'
+            ? 'tournament'
+            : rawType
 
     if (!Object.prototype.hasOwnProperty.call(ROOM_TYPES, type)) {
         return null
@@ -420,23 +406,28 @@ export function parseSettings(
             p.get('edition') ??
             existing?.edition ??
             ''
-        ).trim().toUpperCase()
+        ).trim().replace(/\s+/g, ' ').toUpperCase()
 
-    if (!open && edition) {
-        const isValidForType = roomType === 'ultimateEdition'
-            ? ULTIMATE_RE.test(edition)
-            : SEASONAL_RE.test(edition)
-
-        if (!isValidForType) {
-            return null
-        }
+    if (!open && edition && !ANY_EDITION_RE.test(edition)) {
+        return null
     }
 
-    const group = (
-        p.get('group') ??
-        existing?.group ??
-        'A'
-    ).trim() || 'A'
+    const group = open
+        ? ''
+        : (
+            p.has('group')
+                ? (p.get('group') ?? '')
+                : (existing?.group ?? '')
+        ).trim()
+
+    if (!open && group.length > 24) {
+        return null
+    }
+
+    // Ultimate editions cannot have a group phase selected
+    if (!open && isUltimateEdition(edition) && group.length > 0) {
+        return null
+    }
 
     const rawTitle = p.has('title')
         ? (p.get('title') ?? '').trim()
@@ -491,10 +482,6 @@ export function parseSettings(
             : 'virtualSinger'
 
     if (!Object.prototype.hasOwnProperty.call(SCORING_MODES, scoring)) {
-        return null
-    }
-
-    if (roomType === 'groupStage' && group.length > 24) {
         return null
     }
 
