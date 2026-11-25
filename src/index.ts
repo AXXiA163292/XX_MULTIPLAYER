@@ -919,9 +919,10 @@ const RANKED_TIERS_UPPER = new Set([
 
 async function resolveRoomCover(
     env: WorkerEnv,
-    summary: {
+        summary: {
         type?: string
         tier?: string
+        hostHandle?: string
         level?: { address: string; name: string } | null
         coverUrl?: string | null
     },
@@ -931,6 +932,22 @@ async function resolveRoomCover(
     if (type === 'casualRoom') {
         if (summary.coverUrl) {
             return { url: summary.coverUrl }
+        }        if (!summary.level) {
+            const handle = String(summary.hostHandle ?? '').trim()
+            if (handle) {
+                const prefs = await getUserChatPrefs(env, handle)
+                const keys = [
+                    prefs.pfpKey,
+                    `chat/pfp/${handle}.png`,
+                ].filter((key): key is string => Boolean(key))
+
+                const profileImage = await getBucketObject(communityBucket(env), keys)
+                if (profileImage) {
+                    return {
+                        url: `/sonolus/chat/pfp/${encodeURIComponent(handle)}`,
+                    }
+                }
+            }
         }
         if (summary.level?.address && summary.level?.name) {
             const base = summary.level.address.replace(/\/+$/, '')
