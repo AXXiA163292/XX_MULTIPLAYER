@@ -589,12 +589,7 @@ export async function getAvailableEditions(): Promise<string[]> {
         .map((row) => normalizeEditionLabel(row[editionCol]))
         .filter((value) => /^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+\d{4}$/.test(value))
 
-    const unique = [...new Set(editions)].reverse()
-    const live = getLiveEdition()
-
-    if (!unique.includes(live)) unique.unshift(live)
-
-    return unique
+    return [...new Set(editions)].reverse()
 }
 
 export async function getEditionData(
