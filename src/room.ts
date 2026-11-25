@@ -153,30 +153,23 @@ const isOpenType = (type: RoomSettings['type']) =>
 const ROUND_SLOT_ID_RE = /^(?:G[1-6]|F[1-4])$/i
 
 const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
-    const selectedEdition = (edition || settings.edition || getLiveEdition()).trim().toUpperCase()
-    const year = selectedEdition.match(/\d{4}/)?.[0] ?? String(new Date().getFullYear())
-
     if (settings.type === 'rankedRoom') {
         return String(settings.tier || 'master').toUpperCase()
     }
 
     if (settings.type === 'groupStage') {
-        return `XX! Championship ${year} • Group ${settings.group || 'A'}`
-    }
-
-    if (settings.type === 'final') {
-        return `XX! Championship ${selectedEdition} • Final`
-    }
-
-    if (settings.type === 'ultimateEdition') {
-        return `XX! Ultimate Championship ${year}`
+        return `Group ${settings.group || 'A'}`
     }
 
     if (settings.type === 'casualRoom') {
         return settings.title || defaultCustomRoomTitle(hostName)
     }
 
-    return 'XX! Championship'
+    if (settings.type === 'ultimateEdition') {
+        return 'Ultimate Edition'
+    }
+
+    return `${edition || 'Final'} Final`
 }
 
 function buildRoundLabel(
@@ -892,23 +885,8 @@ export class Room extends DurableObject<Env> {
             return false
         }
 
-        if (
-            !isOpenType(settings.type) &&
-            host.handle !== TOURNAMENT_HOST_HANDLE
-        ) {
-            console.error('[ROOM CONFIG] Tournament room creation denied:', {
-                handle: host.handle,
-                type: settings.type,
-            })
-            return false
-        }
-
         if (settings.type === 'casualRoom' && !settings.title) {
             settings.title = defaultCustomRoomTitle(host.name)
-        }
-
-        if (!isOpenType(settings.type)) {
-            settings.edition = settings.edition || getLiveEdition()
         }
 
         const editionOptions = await getAvailableEditions().catch((error) => {
