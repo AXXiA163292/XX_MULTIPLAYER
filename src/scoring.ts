@@ -1,6 +1,5 @@
 import type { ScoringMode } from './config.ts'
 import type { GameplayResult, Sil } from './types.ts'
-import { calculatePP, roundPP } from './pp.ts'
 
 export type RoundKind = 'tournament' | 'warmup' | 'rewind' | 'freeplay'
 
@@ -25,7 +24,7 @@ export const PP_CONFIGURED = true
 
 export function isPlayerX(result: GameplayResult | undefined): boolean {
     if (!result) return false
-    return result.disqualified === true || result.grade === 'X'
+    return result.disqualified === true || (result.grade as string) === 'X'
 }
 
 export function formatGradeShortcut(result: GameplayResult | undefined): string {
@@ -45,52 +44,10 @@ export function formatGradeShortcut(result: GameplayResult | undefined): string 
     }
 }
 
-export function rawPpPoints(
-    result: GameplayResult | undefined,
-    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount' | 'difficulty'>,
-): number {
-    if (!result || isPlayerX(result)) return 0
-
-    const rating =
-        typeof round?.levelConstant === 'number' &&
-        Number.isFinite(round.levelConstant) &&
-        round.levelConstant > 0
-            ? round.levelConstant
-            : typeof round?.levelRating === 'number' &&
-                Number.isFinite(round.levelRating) &&
-                round.levelRating > 0
-                ? round.levelRating
-                : 30
-
-    const noteCount = Math.max(
-        1,
-        Number(round?.noteCount) ||
-            Number(result.totalCount) ||
-            (Number(result.perfect) || 0) +
-                (Number(result.great) || 0) +
-                (Number(result.good) || 0) +
-                (Number(result.bad) || 0) +
-                (Number(result.miss) || 0),
-    )
-
-    const calculated = calculatePP({
-        rating,
-        noteCount,
-        great: Number(result.great) || 0,
-        good: Number(result.good) || 0,
-        bad: Number(result.bad) || 0,
-        miss: Number(result.miss) || 0,
-        combo: Number(result.combo) || 0,
-        difficulty: round?.difficulty ?? 'MASTER',
-    })
-
-    return Number.isFinite(calculated.pp) ? calculated.pp : 0
-}
-
 export function roundPoints(
     result: GameplayResult | undefined,
     mode: ScoringMode,
-    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount' | 'difficulty'>,
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
 ): number {
     if (!result || isPlayerX(result)) return 0
 
@@ -101,7 +58,39 @@ export function roundPoints(
         return p * 3 + g * 2 + gd
     }
 
-    return roundPP(rawPpPoints(result, round))
+    const baseConstant =
+        typeof round?.levelConstant === 'number' &&
+        Number.isFinite(round.levelConstant) &&
+        round.levelConstant > 0
+            ? round.levelConstant
+            : typeof round?.levelRating === 'number' &&
+                Number.isFinite(round.levelRating) &&
+                round.levelRating > 0
+                ? round.levelRating
+                : 30
+
+    const totalNotes = Math.max(
+        1,
+        Number(round?.noteCount) ||
+            (Number(result.perfect) || 0) +
+                (Number(result.great) || 0) +
+                (Number(result.good) || 0) +
+                (Number(result.miss) || 0),
+    )
+
+    const p = Number(result.perfect) || 0
+    const g = Number(result.great) || 0
+    const gd = Number(result.good) || 0
+    const weightedNotes = p + g * 0.7 + gd * 0.3
+    const accuracyRatio = Math.max(0, Math.min(1, weightedNotes / totalNotes))
+
+    const gradeBonus =
+        result.grade === 'allPerfect' ? 1.05 :
+        result.grade === 'fullCombo' ? 1.02 :
+        1.0
+
+    const rawPp = baseConstant * Math.pow(accuracyRatio, 2) * gradeBonus * 10
+    return Math.ceil(rawPp)
 }
 
 export function fmtScore(score: number, mode: ScoringMode): string {
@@ -127,12 +116,9 @@ export function fmtIndividualScore(pts: number, mode: ScoringMode): string {
 export function fmtDetail(
     result: GameplayResult,
     mode: ScoringMode,
-    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount' | 'difficulty'>,
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
 ): string {
-    const pts = mode === 'rankedMatch'
-        ? roundPoints(result, mode, round)
-        : rawPpPoints(result, round)
-
+    const pts = roundPoints(result, mode, round)
     const gradeTag = formatGradeShortcut(result)
     const scoreText = fmtIndividualScore(pts, mode)
 
@@ -154,7 +140,7 @@ export function compareResults(
     a: GameplayResult,
     b: GameplayResult,
     mode: ScoringMode,
-    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount' | 'difficulty'>,
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
 ): number {
     const ptsDiff = roundPoints(b, mode, round) - roundPoints(a, mode, round)
     if (ptsDiff !== 0) return ptsDiff
