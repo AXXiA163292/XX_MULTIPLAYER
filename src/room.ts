@@ -1,40 +1,19 @@
 import { DurableObject } from 'cloudflare:workers'
 import {
-    DEFAULT_OPEN_SCORING,
-    DEFAULT_SCORING,
-    DEFAULT_TYPE,
-    RANKED_TIER_NAMES,
-    ROOM_TYPES,
+    EMPTY_ROOM_TTL_MS,
+    MAX_ROOM_LIFESPAN_MS,
+    RESERVED_ROOM_TTL_MS,
     SCORING_MODES,
     TOURNAMENT_HOST_HANDLE,
-    type RoomType,
-    type ScoringMode,
 } from './config.ts'
-import {
-    getAvailableEditions,
-    getEditionData,
-    getUltimateEditionData,
-    getSavedUltimatePicks,
-    saveUltimatePicks,
-    pickRankedLevel,
-    getConstantForAddress,
-    type EditionData,
-    type RankedTier,
-    type SheetChart,
-    type UltimatePoolSong,
-} from './sheets.ts'
 import {
     closeRoomForm,
     defaultCustomRoomTitle,
-    filterEditionsForRoomType,
+    normalizeCustomSongsMode,
+    normalizeRoundMode,
     parseSettings,
-    pickClosestEdition,
-    ROUND_MODES,
-    roomForms,
     roomFormsForType,
     serializeSettings,
-    type CustomSongsMode,
-    type RankedVocalType,
     type RoomSettings,
 } from './forms.ts'
 import {
@@ -42,8 +21,6 @@ import {
     fmtDetail,
     fmtScore,
     isPlayerX,
-    PP_CONFIGURED,
-    rawPpPoints,
     roundPoints,
     songKeyOf,
     totals,
@@ -51,15 +28,45 @@ import {
     type RoundKind,
     type RoundRecord,
 } from './scoring.ts'
-import { randomId } from './crypto.ts'
-import type { Env, GameplayResult, JoinSession, Sil, UserProfile } from './types.ts'
+import {
+    getAvailableEditions,
+    getLiveEdition,
+    getEditionData,
+    getUltimateEditionData,
+    getSavedUltimatePicks,
+    saveUltimatePicks,
+    pickRankedLevel,
+    type EditionData,
+    type RankedTier,
+    type SheetChart,
+    type UltimatePicks,
+} from './sheets.ts'
+import type {
+    Env,
+    GameplayResult,
+    JoinSession,
+    RoomStatus,
+    Sil,
+    UserStatus,
+} from './types.ts'
+
+type RoomUser = {
+    authentication: string
+    signature: string
+}
 
 type Member = {
-    user: UserProfile
-    ready: boolean
-    playing: boolean
-    joinedAt: number
-    leaveTimer?: ReturnType<typeof setTimeout>
+    id: string
+    name: string
+    handle: string
+    roomUser: RoomUser
+}
+
+type Reservation = {
+    key: string
+    hostId: string
+    hostName: string
+    hostHandle: string
 }
 
 type LevelInfo = {
@@ -69,151 +76,308 @@ type LevelInfo = {
     constant: number | null
     noteCount: number | null
     difficulty: string
-    coverUrl: string | null
+    coverUrl?: string | null
 }
 
-type State = {
-    initialized: boolean
+type RoomState = {
     name: string
-    key: string
+    createdAt: number
+    edition: string
+    editionOptions: string[]
+    divisions: Record<string, string>
+    poolCharts: SheetChart[]
+    reserved: Reservation | null
+    configured: boolean
     hostId: string
     hostName: string
-    hostHandle: string
     settings: RoomSettings
-    editionOptions: string[]
-    editionData: EditionData | null
-    poolCharts: SheetChart[]
-    ultimatePool: UltimatePoolSong[]
-    ultimateFixedCharts: SheetChart[]
-    rankedSongPool: SheetChart[]
+    hostHandle: string
+    status: RoomStatus
     level: Sil | null
     levelInfo: LevelInfo | null
-    playing: boolean
+    levelOptions: { name: string; value: number }[]
+    suggestions: { userId: string; level: Sil }[]
+    members: Member[]
+    ultimateParticipants: string[]
+    ultimateRoundIndex: number
+    ultimatePicksSaved: boolean
+    statuses: Record<string, UserStatus>
+    round: { state: string; seed: number; kind: RoundKind; label: string } | null
+    results: Record<string, GameplayResult>
     history: RoundRecord[]
-    lastResults: Record<string, GameplayResult>
-    lastResultLevel: Sil | null
-    lastResultRound?: RoundRecord
-    lastRoundWasWarmup: boolean
-    lastRoundKind?: RoundKind
-    lastRoundLabel?: string
-    lastRoundEligibleUserIds: string[]
 }
 
-const isOpenType = (type: RoomType) =>
+const fresh = (): RoomState => ({
+    name: '',
+    createdAt: 0,
+    edition: '',
+    editionOptions: [],
+    divisions: {},
+    poolCharts: [],
+    reserved: null,
+    configured: false,
+    hostId: '',
+    hostName: '',
+    hostHandle: '',
+    settings: {
+        type: 'groupStage',
+        edition: '',
+        scoring: 'pp',
+        roundMode: 'tournament',
+        group: 'A',
+        title: '',
+        visibility: 'locked',
+        random: false,
+        tier: 'master',
+        customSongs: 'off',
+        vocalType: 'sekai',
+    },
+    status: 'selecting',
+    level: null,
+    levelInfo: null,
+    levelOptions: [],
+    suggestions: [],
+    members: [],
+    ultimateParticipants: [],
+    ultimateRoundIndex: 0,
+    ultimatePicksSaved: false,
+    statuses: {},
+    round: null,
+    results: {},
+    history: [],
+})
+
+const isOpenType = (type: RoomSettings['type']) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-const isTournamentType = (type: RoomType) =>
-    type === 'groupStage' || type === 'final' || type === 'ultimateEdition'
+const ROUND_SLOT_ID_RE = /^(?:G[1-6]|F[1-4])$/i
 
-const hasRoundControls = (type: RoomType) =>
-    type === 'groupStage' || type === 'final' || type === 'ultimateEdition'
+const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
+    const selectedEdition = (edition || settings.edition || getLiveEdition()).trim().toUpperCase()
+    const year = selectedEdition.match(/\d{4}/)?.[0] ?? String(new Date().getFullYear())
 
-const isNum = (v: unknown): v is number =>
-    typeof v === 'number' && Number.isFinite(v)
+    if (settings.type === 'rankedRoom') {
+        return String(settings.tier || 'master').toUpperCase()
+    }
 
-const isResult = (r: any): r is GameplayResult =>
-    !!r &&
-    ['allPerfect', 'fullCombo', 'pass', 'fail', 'X'].includes(r.grade) &&
-    [
-        r.arcadeScore,
-        r.accuracyScore,
-        r.combo,
-        r.perfect,
-        r.great,
-        r.good,
-        r.miss,
-        r.totalCount,
-        ...(r.bad === undefined ? [] : [r.bad]),
-    ].every(isNum)
+    if (settings.type === 'groupStage') {
+        return `XX! Championship ${year} • Group ${settings.group || 'A'}`
+    }
+
+    if (settings.type === 'final') {
+        return `XX! Championship ${selectedEdition} • Final`
+    }
+
+    if (settings.type === 'ultimateEdition') {
+        return `XX! Ultimate Championship ${year}`
+    }
+
+    if (settings.type === 'casualRoom') {
+        return settings.title || defaultCustomRoomTitle(hostName)
+    }
+
+    return 'XX! Championship'
+}
+
+function buildRoundLabel(
+    level: Sil | null | undefined,
+    kind: RoundKind,
+    priorHistory: RoundRecord[],
+    isOpen: boolean,
+    ultimateRounds: SheetChart[] = [],
+): string {
+    if (isOpen) {
+        return `Round ${priorHistory.length + 1}`
+    }
+
+    if (kind === 'warmup') {
+        const warmupCount = priorHistory.filter((r) => (r.roundKind ?? 'tournament') === 'warmup').length + 1
+        return `Warmup ${warmupCount}`
+    }
+
+    if (kind === 'freeplay') {
+        const freeplayCount = priorHistory.filter((r) => (r.roundKind ?? 'tournament') === 'freeplay').length + 1
+        return `Freeplay ${freeplayCount}`
+    }
+
+    const ultimateIndex = ultimateRounds.findIndex((chart) => sameLevel(level, chart))
+
+    if (ultimateIndex >= 0) {
+        const chartId = ultimateRounds[ultimateIndex]!.id.toUpperCase()
+
+        const name = chartId.startsWith('WINTER-')
+            ? 'Winter'
+            : chartId.startsWith('SPRING-')
+                ? 'Spring'
+                : chartId.startsWith('SUMMER-')
+                    ? 'Summer'
+                    : chartId.startsWith('FALL-')
+                        ? 'Fall'
+                        : chartId === 'F1'
+                            ? 'Contest Winner'
+                            : 'XX! Ultimate'
+
+        const base = `Round ${ultimateIndex + 1} · ${name}`
+
+        if (kind === 'tournament') return base
+
+        const rewindCount = priorHistory.filter(
+            (record) => (record.roundKind ?? 'tournament') === 'rewind' && sameLevel(record.level, level),
+        ).length + 1
+
+        return rewindCount === 1 ? `${base} • Rewind` : `${base} • Rewind ${rewindCount}`
+    }
+
+    const targetKey = songKeyOf(level)
+    const tournamentRounds = priorHistory.filter((r) => (r.roundKind ?? 'tournament') === 'tournament')
+
+    if (kind === 'tournament') {
+        return `Round ${tournamentRounds.length + 1}`
+    }
+
+    let baseRoundIndex = -1
+    for (let i = 0; i < priorHistory.length; i++) {
+        const rec = priorHistory[i]!
+        if ((rec.roundKind ?? 'tournament') === 'tournament' && songKeyOf(rec.level) === targetKey) {
+            baseRoundIndex = priorHistory.slice(0, i + 1).filter(
+                (r) => (r.roundKind ?? 'tournament') === 'tournament',
+            ).length
+            break
+        }
+    }
+
+    const baseLabel = baseRoundIndex > 0 ? `Round ${baseRoundIndex}` : `Round ${Math.max(1, tournamentRounds.length)}`
+    const priorRewindCount = priorHistory.filter(
+        (r) => (r.roundKind ?? 'tournament') === 'rewind' && songKeyOf(r.level) === targetKey,
+    ).length
+    const rewindIndex = priorRewindCount + 1
+
+    return rewindIndex === 1
+        ? `${baseLabel} • Rewind`
+        : `${baseLabel} • Rewind ${rewindIndex}`
+}
 
 function sanitizeWireResult(result: GameplayResult): GameplayResult {
     const wireGrade: GameplayResult['grade'] =
         result.grade === 'allPerfect' ||
         result.grade === 'fullCombo' ||
         result.grade === 'pass' ||
-        result.grade === 'fail' ||
-        result.grade === 'X'
+        result.grade === 'fail'
             ? result.grade
             : 'fail'
 
     return {
         grade: wireGrade,
-        score: Number(result.score) || 0,
-        accuracy: Number(result.accuracy) || 0,
+        ...(result.disqualified ? { disqualified: true } : {}),
         arcadeScore: Number(result.arcadeScore) || 0,
         accuracyScore: Number(result.accuracyScore) || 0,
         combo: Number(result.combo) || 0,
         perfect: Number(result.perfect) || 0,
         great: Number(result.great) || 0,
         good: Number(result.good) || 0,
-        bad: Number(result.bad) || 0,
         miss: Number(result.miss) || 0,
         totalCount: Number(result.totalCount) || 0,
-        disqualified: result.disqualified === true,
     }
 }
 
-const sameLevel = (a: Sil | null | undefined, b: Sil | null | undefined) =>
-    !!a &&
-    !!b &&
-    a.address.replace(/\/+$/, '') === b.address.replace(/\/+$/, '') &&
-    a.name === b.name
+function chartsForType(edition: EditionData, type: RoomSettings['type']): SheetChart[] {
+    if (type === 'groupStage') return edition.groupStage
+    if (type === 'final') return edition.final
+    return []
+}
 
-function localize(v: unknown): string {
-    if (typeof v === 'string') return v
-    if (v && typeof v === 'object') {
-        const obj = v as Record<string, unknown>
-        for (const key of ['en', 'default', 'ja', 'ko', 'zhs', 'zht']) {
-            if (typeof obj[key] === 'string' && obj[key]) return obj[key] as string
-        }
-        for (const val of Object.values(obj)) {
-            if (typeof val === 'string' && val) return val
-        }
+function suggestionsFromCharts(
+    charts: SheetChart[],
+    userId: string,
+) {
+    return charts.map((chart) => ({
+        userId,
+        level: {
+            address: chart.address,
+            name: chart.name,
+        },
+    }))
+}
+
+function randomChart(charts: SheetChart[]): SheetChart {
+    if (!charts.length) throw new Error('Ultimate seasonal pool is empty.')
+    return charts[Math.floor(Math.random() * charts.length)]!
+}
+
+function sameLevel(
+    a: Sil | null | undefined,
+    b: { address?: string; name?: string } | null | undefined,
+): boolean {
+    if (!a || !b || !a.address || !a.name || !b.address || !b.name) return false
+    return (
+        a.address.replace(/\/+$/, '').toLowerCase() === b.address.replace(/\/+$/, '').toLowerCase() &&
+        a.name.trim().toLowerCase() === b.name.trim().toLowerCase()
+    )
+}
+
+const localize = (value: any): string => {
+    if (typeof value === 'string') return value
+
+    if (value && typeof value === 'object') {
+        if (typeof value.en === 'string') return value.en
+
+        const first = Object.values(value).find((v) => typeof v === 'string')
+        return typeof first === 'string' ? first : ''
     }
+
     return ''
 }
 
-function descriptionText(v: unknown): string {
-    if (typeof v === 'string') return v
-    if (Array.isArray(v)) {
-        return v.map((entry) => localize(entry)).filter(Boolean).join('\n')
+function descriptionText(value: any): string {
+    if (typeof value === 'string') return value
+
+    if (Array.isArray(value)) {
+        return value.map(descriptionText).join('\n')
     }
-    return localize(v)
+
+    if (value && typeof value === 'object') {
+        if (typeof value.en === 'string') return value.en
+
+        return Object.values(value)
+            .filter((v) => typeof v === 'string')
+            .join('\n')
+    }
+
+    return ''
+}
+
+function extractDescriptionNumber(
+    description: string,
+    label: string,
+): number | null {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const match = description.match(
+        new RegExp(`${escaped}\\s*(?:•|:)\\s*(\\d+(?:\\.\\d+)?)`, 'i'),
+    )
+
+    if (!match) return null
+    const value = Number(match[1])
+    return Number.isFinite(value) ? value : null
 }
 
 function extractDifficulty(description: string): string {
-    const match = description.match(/\b(APPEND|MASTER|EXPERT|HARD|NORMAL|EASY)\b/i)
-    return match ? match[1]!.toUpperCase() : ''
+    const match = description.match(
+        /(?:^|\n)\s*Difficulty\s*(?:•|:)\s*(EASY|NORMAL|HARD|EXPERT|MASTER|APPEND)\b/i,
+    )
+    return match?.[1]?.toUpperCase() ?? ''
 }
 
 function extractComboCount(description: string): number | null {
-    const patterns = [
-        /(?:total\s*)?(?:combo|notes?)\s*[:=\-]?\s*(\d{2,5})/i,
-        /(\d{2,5})\s*(?:total\s*)?(?:combo|notes?)/i,
-    ]
-    for (const pattern of patterns) {
-        const match = description.match(pattern)
-        if (match) {
-            const val = Number(match[1])
-            if (Number.isFinite(val) && val > 0 && val < 20000) return val
-        }
-    }
-    return null
-}
-
-function extractDescriptionNumber(description: string, label: string): number | null {
-    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const match = description.match(new RegExp(`(?:^|\\n|\\s)${escaped}\\s*[:=]\\s*(\\d+(?:\\.\\d+)?)`, 'i'))
+    const match = description.match(
+        /(?:^|\n)\s*(?:#COMBO\s*:\s*#SEPARATOR_COLON\s*:\s*|#COMBO\s*:\s*|Combo\s*(?:•|:)\s*)([\d,]+)/i,
+    )
     if (!match) return null
-    const val = Number(match[1])
-    return Number.isFinite(val) && val > 0 ? Math.round(val * 100) / 100 : null
+
+    const value = Number(match[1].replace(/,/g, ''))
+    return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
-async function fetchLevelInfo(
-    level: Sil,
-    env?: Env,
-    tournamentConstant?: number,
-): Promise<LevelInfo | null> {
+async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
     try {
         const base = new URL(level.address)
 
@@ -287,16 +451,8 @@ async function fetchLevelInfo(
                     ? Math.round(parsedRating * 10) / 10
                     : null
 
-                const spreadsheetConstant = tournamentConstant == null
-                    ? await getConstantForAddress(level.address, env, level.name)
-                    : null
-
                 const descriptionConstant = extractDescriptionNumber(description, 'Constant')
-                const constant =
-                    tournamentConstant ??
-                    spreadsheetConstant ??
-                    descriptionConstant ??
-                    rating
+                const constant = descriptionConstant ?? rating
 
                 const rawCoverUrl = typeof item?.cover?.url === 'string' && item.cover.url
                     ? (item.cover.url.startsWith('/')
@@ -324,882 +480,2108 @@ async function fetchLevelInfo(
     return null
 }
 
-function roundLabelFor(
-    type: RoomType,
-    roundKind: RoundKind,
-    roundNumber: number,
-    group: string,
-    customLabel?: string,
-): string {
-    if (customLabel && customLabel.trim()) return customLabel.trim()
-    if (type === 'casualRoom') return 'Freeplay'
-    if (type === 'rankedRoom') return 'Ranked Match'
-    if (roundKind === 'warmup') return 'Warmup'
-    if (roundKind === 'freeplay') return 'Freeplay'
-    if (roundKind === 'rewind') return 'Rewind'
+type Ev = Record<string, unknown>
+type Cmd = Record<string, any>
 
-    if (type === 'groupStage') {
-        const g = (group || 'A').trim().toUpperCase()
-        return `Group ${g} · Round ${roundNumber}`
+const isSil = (x: any): x is Sil =>
+    !!x &&
+    typeof x.address === 'string' &&
+    typeof x.name === 'string'
+
+const isNum = (x: unknown): x is number =>
+    typeof x === 'number' &&
+    Number.isFinite(x) &&
+    x >= 0
+
+const isResult = (r: any): r is GameplayResult =>
+    !!r &&
+    ['allPerfect', 'fullCombo', 'pass', 'fail', 'X'].includes(r.grade) &&
+    [
+        r.arcadeScore,
+        r.accuracyScore,
+        r.combo,
+        r.perfect,
+        r.great,
+        r.good,
+        r.miss,
+        r.totalCount,
+    ].every(isNum)
+
+function isRoomStatus(value: unknown): value is RoomStatus {
+    return ['selecting', 'preparing', 'playing'].includes(String(value))
+}
+
+function isUserStatus(value: unknown): value is UserStatus {
+    return ['waiting', 'ready', 'skipped', 'playing'].includes(String(value))
+}
+
+function cleanDivisions(value: unknown): Record<string, string> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return {}
     }
-    if (type === 'final') {
-        return `Final · Round ${roundNumber}`
+
+    const result: Record<string, string> = {}
+
+    for (const [handle, division] of Object.entries(value)) {
+        if (
+            typeof handle === 'string' &&
+            typeof division === 'string' &&
+            division.trim()
+        ) {
+            result[handle.trim()] = division.trim()
+        }
     }
-    if (type === 'ultimateEdition') {
-        return `Ultimate · Round ${roundNumber}`
-    }
-    return `Round ${roundNumber}`
+
+    return result
+}
+
+function cleanPoolCharts(value: unknown): SheetChart[] {
+    if (!Array.isArray(value)) return []
+    return value.filter(
+        (entry): entry is SheetChart =>
+            !!entry &&
+            typeof entry === 'object' &&
+            typeof (entry as SheetChart).address === 'string' &&
+            typeof (entry as SheetChart).name === 'string',
+    )
 }
 
 export class Room extends DurableObject<Env> {
-    private st!: State
-    private members = new Map<string, Member>()
-    private sockets = new Map<WebSocket, string>()
-    private ready: Promise<void> | null = null
-    private nextRoundSeq = 1
-    private roundFinished = false
+    st: RoomState = fresh()
 
     constructor(ctx: DurableObjectState, env: Env) {
         super(ctx, env)
-        this.ctx.blockConcurrencyWhile(async () => {
-            const saved = await this.ctx.storage.get<State>('state')
-            this.st = saved ?? this.freshState()
-            if (Array.isArray(this.st.history)) {
-                this.nextRoundSeq = this.st.history.length + 1
+
+        this.ctx.setWebSocketAutoResponse(
+            new WebSocketRequestResponsePair('ping', 'pong'),
+        )
+
+        ctx.blockConcurrencyWhile(async () => {
+            const saved = await ctx.storage.get<Partial<RoomState>>('st')
+            const base = fresh()
+
+            this.st = {
+                ...base,
+                ...(saved ?? {}),
+                createdAt: typeof saved?.createdAt === 'number' && saved.createdAt > 0
+                    ? saved.createdAt
+                    : Date.now(),
+                settings: {
+                    ...base.settings,
+                    ...(saved?.settings ?? {}),
+                },
+                edition: typeof saved?.edition === 'string' ? saved.edition : '',
+                editionOptions: Array.isArray(saved?.editionOptions)
+                    ? saved.editionOptions.filter((value): value is string => typeof value === 'string')
+                    : [],
+                divisions: cleanDivisions(saved?.divisions),
+                poolCharts: cleanPoolCharts(saved?.poolCharts),
+                ultimateParticipants: Array.isArray(saved?.ultimateParticipants)
+                    ? saved.ultimateParticipants.filter((x): x is string => typeof x === 'string')
+                    : [],
+                ultimateRoundIndex: Number.isInteger(saved?.ultimateRoundIndex)
+                    ? Math.max(0, Math.min(6, saved!.ultimateRoundIndex as number))
+                    : 0,
+                ultimatePicksSaved: saved?.ultimatePicksSaved === true,
+                reserved: saved?.reserved ?? null,
+                configured: saved?.configured === true,
+                hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
+                hostName: typeof saved?.hostName === 'string' ? saved.hostName : '',
+                hostHandle: typeof saved?.hostHandle === 'string' ? saved.hostHandle : '',
+                status: isRoomStatus(saved?.status) ? saved.status : 'selecting',
+                level: saved?.level && isSil(saved.level) ? saved.level : null,
+                levelInfo: saved?.levelInfo ?? null,
+                levelOptions: Array.isArray(saved?.levelOptions)
+                    ? saved.levelOptions.filter(
+                        (x) =>
+                            x &&
+                            typeof x.name === 'string' &&
+                            typeof x.value === 'number' &&
+                            Number.isFinite(x.value),
+                    )
+                    : [],
+                suggestions: Array.isArray(saved?.suggestions)
+                    ? saved.suggestions.filter(
+                        (x) =>
+                            x &&
+                            typeof x.userId === 'string' &&
+                            isSil(x.level),
+                    )
+                    : [],
+                members: Array.isArray(saved?.members)
+                    ? saved.members.filter(
+                        (x) =>
+                            x &&
+                            typeof x.id === 'string' &&
+                            typeof x.name === 'string' &&
+                            typeof x.handle === 'string' &&
+                            x.roomUser &&
+                            typeof x.roomUser.authentication === 'string' &&
+                            typeof x.roomUser.signature === 'string',
+                    )
+                    : [],
+                statuses: saved?.statuses && typeof saved.statuses === 'object'
+                    ? Object.fromEntries(
+                        Object.entries(saved.statuses).filter(
+                            ([, value]) => isUserStatus(value),
+                        ),
+                    ) as Record<string, UserStatus>
+                    : {},
+                results: saved?.results && typeof saved.results === 'object'
+                    ? Object.fromEntries(
+                        Object.entries(saved.results).filter(
+                            ([, value]) => isResult(value),
+                        ),
+                    )
+                    : {},
+                history: Array.isArray(saved?.history) ? saved.history : [],
+                round: saved?.round &&
+                    typeof saved.round.state === 'string' &&
+                    typeof saved.round.seed === 'number'
+                    ? {
+                        state: saved.round.state,
+                        seed: saved.round.seed,
+                        kind: normalizeRoundMode(saved.round.kind),
+                        label: typeof saved.round.label === 'string' ? saved.round.label : '',
+                    }
+                    : null,
             }
+
+            this.st.settings.group ||= 'A'
+            this.st.settings.edition ||= this.st.edition || getLiveEdition()
+            this.st.settings.title ??= ''
+            this.st.settings.random = this.st.settings.random === true
+
+            if (!['public', 'private', 'locked'].includes(this.st.settings.visibility)) {
+                this.st.settings.visibility =
+                    this.st.settings.type === 'casualRoom' ? 'public' : 'locked'
+            }
+
+            if (!['groupStage', 'final', 'casualRoom', 'rankedRoom', 'ultimateEdition'].includes(this.st.settings.type)) {
+                this.st.settings.type = 'casualRoom'
+            }
+
+            if (!['master', 'diamond', 'platinum', 'gold', 'silver', 'bronze', 'beginner'].includes(this.st.settings.tier)) {
+                this.st.settings.tier = 'master'
+            }
+
+            this.st.settings.customSongs = normalizeCustomSongsMode(this.st.settings.customSongs)
+
+            if (this.st.settings.type === 'rankedRoom') {
+                this.st.settings.scoring = 'rankedMatch'
+                this.st.settings.visibility = 'public'
+                this.st.settings.random = false
+            }
+
+            if (!['pp', 'rankedMatch'].includes(this.st.settings.scoring)) {
+                this.st.settings.scoring = 'pp'
+            }
+
+            const uniqueMembers = new Map<string, Member>()
+            for (const member of this.st.members) {
+                uniqueMembers.set(member.id, member)
+            }
+            this.st.members = [...uniqueMembers.values()]
+
+            for (const member of this.st.members) {
+                this.st.statuses[member.id] ??= 'waiting'
+            }
+
+            const memberIds = new Set(this.st.members.map((member) => member.id))
+            for (const id of Object.keys(this.st.statuses)) {
+                if (!memberIds.has(id)) delete this.st.statuses[id]
+            }
+            for (const id of Object.keys(this.st.results)) {
+                if (!memberIds.has(id)) delete this.st.results[id]
+            }
+
+            if (this.st.status === 'playing' && !this.st.round) {
+                this.st.status = 'selecting'
+                for (const member of this.st.members) {
+                    this.st.statuses[member.id] = 'waiting'
+                }
+            }
+
+            if (this.st.status === 'playing') {
+                for (const member of this.st.members) {
+                    if (this.st.statuses[member.id] === 'skipped') {
+                        this.st.statuses[member.id] = 'waiting'
+                    }
+                }
+            }
+
+            await ctx.storage.put('st', this.st)
         })
     }
 
-    private freshState(): State {
-        return {
-            initialized: false,
-            name: '',
-            key: '',
-            hostId: '',
-            hostName: '',
-            hostHandle: '',
-            settings: {
-                type: DEFAULT_TYPE,
-                edition: '',
-                scoring: DEFAULT_OPEN_SCORING,
-                roundMode: 'tournament',
-                group: 'A',
-                title: '',
-                visibility: 'public',
-                random: false,
-                tier: 'master',
-                customSongs: 'off',
-                vocalType: 'sekai',
-            },
-            editionOptions: [],
-            editionData: null,
-            poolCharts: [],
-            ultimatePool: [],
-            ultimateFixedCharts: [],
-            rankedSongPool: [],
-            level: null,
-            levelInfo: null,
-            playing: false,
-            history: [],
-            lastResults: {},
-            lastResultLevel: null,
-            lastResultRound: undefined,
-            lastRoundWasWarmup: false,
-            lastRoundKind: undefined,
-            lastRoundLabel: undefined,
-            lastRoundEligibleUserIds: [],
+    private isPoolSong(
+        level: Sil | null | undefined,
+        pool: SheetChart[] = this.st.poolCharts,
+    ): boolean {
+        if (!level) return false
+        return pool.some(
+            (chart) =>
+                ROUND_SLOT_ID_RE.test(chart.id) &&
+                sameLevel(level, chart),
+        )
+    }
+
+    private computeRoundKind(
+        level: Sil | null | undefined,
+        priorHistory: RoundRecord[],
+        pool: SheetChart[] = this.st.poolCharts,
+    ): RoundKind {
+        const editionHistory = priorHistory.filter(
+            (record) => !record.edition || record.edition === this.st.edition,
+        )
+
+        if (this.st.settings.type === 'ultimateEdition') {
+            const index = pool.findIndex((chart) => sameLevel(level, chart))
+            if (index < 0) return 'freeplay'
+
+            const alreadyPlayed = editionHistory.some(
+                (record) => sameLevel(record.level, level),
+            )
+
+            if (alreadyPlayed) return 'rewind'
+            return index === this.st.ultimateRoundIndex ? 'tournament' : 'freeplay'
         }
-    }
 
-    private async persist() {
-        await this.ctx.storage.put('state', this.st)
-    }
-
-    private lobby() {
-        return this.env.LOBBY.get(this.env.LOBBY.idFromName('main'))
-    }
-
-    private async loadLevelInfo(level: Sil | null): Promise<LevelInfo | null> {
-        if (!level) return null
-
-        const tournamentChart = this.st.poolCharts.find(
-            (chart) => sameLevel(level, chart),
-        )
-
-        return fetchLevelInfo(
-            level,
-            this.env,
-            tournamentChart?.constant,
-        )
-    }
-
-    private isHostUser(userId: string, handle?: string): boolean {
-        if (this.st.hostId && userId === this.st.hostId) return true
-        if (this.st.hostHandle && handle && handle === this.st.hostHandle) return true
-        return false
-    }
-
-    private isTournamentHost(user: UserProfile): boolean {
-        return user.handle === TOURNAMENT_HOST_HANDLE
-    }
-
-    private canControlRoom(user: UserProfile): boolean {
         if (isOpenType(this.st.settings.type)) {
-            return this.isHostUser(user.id, user.handle)
+            return 'tournament'
         }
-        return this.isTournamentHost(user) || this.isHostUser(user.id, user.handle)
-    }
 
-    private isPlayerUser(userId: string): boolean {
-        if (isOpenType(this.st.settings.type)) return true
-        return !this.isHostUser(userId)
-    }
+        if (pool.length === 0) return 'freeplay'
 
-    private activePlayers(): Member[] {
-        return [...this.members.values()].filter((m) => this.isPlayerUser(m.user.id))
-    }
-
-    private roomTitle(): string {
-        const s = this.st.settings
-        if (s.type === 'casualRoom') {
-            return s.title.trim() || defaultCustomRoomTitle(this.st.hostName || this.st.hostHandle)
-        }
-        if (s.type === 'rankedRoom') {
-            return `Ranked · ${s.tier.toUpperCase()}`
-        }
-        if (s.type === 'groupStage') {
-            return `${s.edition} · Group ${s.group || 'A'}`
-        }
-        if (s.type === 'final') {
-            return `${s.edition} · Final`
-        }
-        return `${s.edition} · Ultimate`
-    }
-
-    private roomSubtitle(): string {
-        const s = this.st.settings
-        const modeLabel = SCORING_MODES[s.scoring] ?? s.scoring
-        const playerCount = this.activePlayers().length
-
-        if (s.type === 'casualRoom') {
-            return `${modeLabel} · ${playerCount} player${playerCount === 1 ? '' : 's'}`
-        }
-        if (s.type === 'rankedRoom') {
-            const vocalLabel = s.vocalType === 'sekai' ? 'SEKAI' : 'VIRTUAL SINGER'
-            return `${modeLabel} · ${vocalLabel} · ${playerCount} player${playerCount === 1 ? '' : 's'}`
-        }
-        const roundLabel = roundLabelFor(
-            s.type,
-            s.roundMode,
-            this.nextRoundSeq,
-            s.group,
+        const inPool = this.isPoolSong(level, pool)
+        const hasPlayedPoolSongBefore = editionHistory.some((record) =>
+            this.isPoolSong(record.level, pool),
         )
-        return `${roundLabel} · ${modeLabel}`
+
+        if (inPool) {
+            const alreadyPlayedThisSong = editionHistory.some((record) =>
+                sameLevel(record.level, level),
+            )
+
+            return alreadyPlayedThisSong ? 'rewind' : 'tournament'
+        }
+
+        return hasPlayedPoolSongBefore ? 'freeplay' : 'warmup'
     }
 
-    private async publishLobby() {
-        if (!this.st.initialized || !this.st.name) return
-        if (this.st.settings.visibility === 'private') {
-            await this.lobby().remove(this.st.name).catch(() => {})
+    private activeSocketCount(): number {
+        return this.ctx.getWebSockets().filter((ws) => !this.closing.has(ws)).length
+    }
+
+    private remainingLifespanMs(now = Date.now()): number {
+        if (!this.st.createdAt) return MAX_ROOM_LIFESPAN_MS
+        return Math.max(0, this.st.createdAt + MAX_ROOM_LIFESPAN_MS - now)
+    }
+
+    private isExpired(now = Date.now()): boolean {
+        return this.st.createdAt > 0 && now >= this.st.createdAt + MAX_ROOM_LIFESPAN_MS
+    }
+
+    private async scheduleNextAlarm(delayMs?: number): Promise<void> {
+        const now = Date.now()
+        const maxRemaining = this.remainingLifespanMs(now)
+
+        if (maxRemaining <= 0) {
+            await this.expireAndDestroy('room max lifespan reached')
             return
         }
-        await this.lobby().upsert({
-            name: this.st.name,
-            title: this.roomTitle(),
-            subtitle: this.roomSubtitle(),
-            master: this.st.hostName || this.st.hostHandle || 'Host',
-            visibility: this.st.settings.visibility,
-            updatedAt: Date.now(),
-        }).catch(() => {})
+
+        const connected = this.activeSocketCount()
+        const defaultIdleDelay = connected === 0 ? EMPTY_ROOM_TTL_MS : maxRemaining
+        const targetDelay = delayMs === undefined
+            ? defaultIdleDelay
+            : Math.min(Math.max(1000, delayMs), maxRemaining)
+
+        await this.ctx.storage.setAlarm(now + targetDelay)
     }
 
-    async reserve(
-        name: string,
-        meta: {
-            key: string
-            hostId: string
-            hostName: string
-            hostHandle: string
-        },
-    ) {
-        this.st = {
-            ...this.freshState(),
-            initialized: true,
-            name,
-            key: meta.key,
-            hostId: meta.hostId,
-            hostName: meta.hostName,
-            hostHandle: meta.hostHandle,
+    private async expireAndDestroy(reason = 'room closed'): Promise<void> {
+        const roomName = this.st.name
+        const sockets = this.ctx.getWebSockets()
+
+        this.st = fresh()
+        await this.ctx.storage.deleteAll()
+
+        if (roomName) {
+            await this.env.LOBBY
+                .get(this.env.LOBBY.idFromName('main'))
+                .remove(roomName)
+                .catch(() => {})
         }
-        await this.persist()
+
+        for (const socket of sockets) {
+            try {
+                socket.close(4002, reason)
+            } catch {
+                // Socket may already be closed.
+            }
+        }
+    }
+
+    private diag(event: string, extra?: Record<string, unknown>) {
+        const connectedIds = this.st.members
+            .filter((m) => this.socketsOf(m.id).length > 0)
+            .map((m) => m.id)
+
+        console.log(`[Room:${this.st.name || 'init'}] ${event}`, {
+            type: this.st.settings.type,
+            scoring: this.st.settings.scoring,
+            status: this.st.status,
+            round: this.st.round?.state ?? null,
+            roundKind: this.st.round?.kind ?? null,
+            historyLen: this.st.history.length,
+            resultsKeys: Object.keys(this.st.results),
+            connectedIds,
+            statuses: this.st.statuses,
+            ...extra,
+        })
+    }
+
+    async closeForOwner(ownerId: string): Promise<void> {
+        const currentOwner = this.st.configured
+            ? this.st.hostId
+            : this.st.reserved?.hostId
+
+        if (!currentOwner || currentOwner !== ownerId) return
+
+        await this.expireAndDestroy('replaced by a newer room')
+    }
+
+    async reserve(name: string, reservation: Reservation): Promise<void> {
+        this.st = {
+            ...fresh(),
+            name,
+            createdAt: Date.now(),
+            reserved: reservation,
+        }
+
+        await this.save()
+        await this.scheduleNextAlarm(RESERVED_ROOM_TTL_MS)
     }
 
     async configure(
         key: string,
         settings: RoomSettings,
-        host: UserProfile,
+        host: { id: string; name: string; handle: string },
     ): Promise<boolean> {
-        if (!this.st.initialized || this.st.key !== key) return false
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room expired')
+            return false
+        }
 
-        this.st.hostId = host.id
-        this.st.hostName = host.name
-        this.st.hostHandle = host.handle
+        const reservation = this.st.reserved
 
-        const editionOptions = await getAvailableEditions(this.env).catch((error) => {
+        if (
+            !reservation ||
+            reservation.key !== key ||
+            reservation.hostId !== host.id ||
+            reservation.hostHandle !== host.handle
+        ) {
+            console.error('[ROOM CONFIG] Reservation rejected:', {
+                hasReservation: !!reservation,
+                keyMatches: reservation?.key === key,
+                hostIdMatches: reservation?.hostId === host.id,
+                hostHandleMatches: reservation?.hostHandle === host.handle,
+                expired: this.isExpired(),
+            })
+            return false
+        }
+
+        if (
+            !isOpenType(settings.type) &&
+            host.handle !== TOURNAMENT_HOST_HANDLE
+        ) {
+            console.error('[ROOM CONFIG] Tournament room creation denied:', {
+                handle: host.handle,
+                type: settings.type,
+            })
+            return false
+        }
+
+        if (settings.type === 'casualRoom' && !settings.title) {
+            settings.title = defaultCustomRoomTitle(host.name)
+        }
+
+        if (!isOpenType(settings.type)) {
+            settings.edition = settings.edition || getLiveEdition()
+        }
+
+        const editionOptions = await getAvailableEditions().catch((error) => {
             console.error('[ROOM CONFIG] Could not load edition options:', error)
-            return [] as string[]
+            return [settings.edition || getLiveEdition()]
         })
 
         this.st.editionOptions = editionOptions
 
-        if (!isOpenType(settings.type)) {
-            const eligibleEditions = filterEditionsForRoomType(editionOptions, settings.type)
-            if (eligibleEditions.length === 0) {
-                console.error('[ROOM CONFIG] No eligible editions found:', {
-                    type: settings.type,
-                    editionOptions,
-                })
-                return false
-            }
+        let editionData: EditionData | null = null
+        let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
+        let hadSavedUltimatePicks = false
+        let poolCharts: SheetChart[] = []
 
-            const normalizedEdition = String(settings.edition ?? '').trim().toUpperCase()
-            settings.edition = eligibleEditions.includes(normalizedEdition)
-                ? normalizedEdition
-                : pickClosestEdition(eligibleEditions)
-        }
+        try {
+            if (settings.type === 'ultimateEdition') {
+                ultimateData = await getUltimateEditionData(settings.edition)
 
-        this.st.settings = settings
-        this.st.editionData = null
-        this.st.poolCharts = []
-        this.st.ultimatePool = []
-        this.st.ultimateFixedCharts = []
-        this.st.rankedSongPool = []
+                const savedPicks = await getSavedUltimatePicks(
+                    this.env,
+                    ultimateData.edition,
+                )
 
-        if (settings.type === 'groupStage' || settings.type === 'final') {
-            const data = await getEditionData(settings.edition, this.env).catch(() => null)
-            this.st.editionData = data
-            if (data) {
-                this.st.poolCharts = settings.type === 'groupStage'
-                    ? [...data.group1, ...data.group2]
-                    : [...data.final]
-            }
-        } else if (settings.type === 'ultimateEdition') {
-            const ult = await getUltimateEditionData(settings.edition, this.env).catch(() => null)
-            if (ult) {
-                this.st.ultimateFixedCharts = ult.fixedCharts
-                this.st.ultimatePool = ult.pool
-                this.st.poolCharts = [
-                    ...ult.fixedCharts,
-                    ...ult.pool.map((p) => p.chart),
+                hadSavedUltimatePicks = !!savedPicks
+
+                const seasonalPicks: Partial<UltimatePicks> = {}
+
+                for (const season of ['winter', 'spring', 'summer', 'fall'] as const) {
+                    const saved = savedPicks?.[season]
+                    const available = ultimateData.seasons[season]
+
+                    if (saved) {
+                        seasonalPicks[season] = saved
+                    } else if (available.length > 0) {
+                        seasonalPicks[season] = randomChart(available)
+                    }
+                }
+
+                poolCharts = [
+                    ...(['winter', 'spring', 'summer', 'fall'] as const)
+                        .flatMap((season) =>
+                            seasonalPicks[season] ? [seasonalPicks[season]!] : [],
+                        ),
+                    ...(ultimateData.contestWinner ? [ultimateData.contestWinner] : []),
+                    ...(ultimateData.ultimate ? [ultimateData.ultimate] : []),
                 ]
+            } else if (settings.type === 'groupStage' || settings.type === 'final') {
+                editionData = await getEditionData(settings.edition)
+                poolCharts = chartsForType(editionData, settings.type)
             }
-        } else if (settings.type === 'rankedRoom') {
-            const tier = (RANKED_TIER_NAMES as readonly string[]).includes(settings.tier)
-                ? settings.tier as RankedTier
-                : 'master'
-            const picked = await pickRankedLevel(this.env, tier, settings.customSongs)
-            if (picked) {
-                this.st.level = { address: picked.address, name: picked.name }
-                this.st.levelInfo = await this.loadLevelInfo(this.st.level)
-            }
-        } else if (settings.type === 'casualRoom' && settings.random) {
-            const picked = await pickRankedLevel(this.env, 'master', 'customOnly')
-            if (picked) {
-                this.st.level = { address: picked.address, name: picked.name }
-                this.st.levelInfo = await this.loadLevelInfo(this.st.level)
-            }
+        } catch (error) {
+            console.error(
+                '[ROOM CONFIG] Edition sheet failure. Opening room without edition data:',
+                error instanceof Error ? error.message : String(error),
+                error instanceof Error ? error.stack : '',
+            )
+
+            editionData = null
+            ultimateData = null
+            hadSavedUltimatePicks = false
+            poolCharts = []
         }
 
-        await this.persist()
-        await this.publishLobby()
-        this.broadcastState()
+        this.st.edition = isOpenType(settings.type) ? '' : settings.edition
+        this.st.divisions = editionData
+            ? cleanDivisions(editionData.divisions)
+            : {}
+        this.st.ultimateParticipants = ultimateData?.participants ?? []
+        this.st.ultimateRoundIndex = 0
+        this.st.ultimatePicksSaved = hadSavedUltimatePicks
+        this.st.poolCharts = poolCharts
+        this.st.suggestions = suggestionsFromCharts(poolCharts, host.id)
+
+        const firstPoolChart = !isOpenType(settings.type)
+            ? (poolCharts[0] ?? null)
+            : null
+
+        this.st.createdAt = Date.now()
+        this.st.configured = true
+        this.st.hostId = host.id
+        this.st.hostName = host.name
+        this.st.hostHandle = host.handle
+        this.st.settings = {
+            ...settings,
+            roundMode: 'tournament',
+        }
+        this.st.reserved = null
+        this.st.status = 'selecting'
+        this.st.level = firstPoolChart
+            ? { address: firstPoolChart.address, name: firstPoolChart.name }
+            : null
+        this.st.levelInfo = this.st.level
+            ? await fetchLevelInfo(this.st.level)
+            : null
+        this.st.levelOptions = []
+        this.st.round = null
+        this.st.results = {}
+        this.st.history = []
+
+        await this.save()
+        await this.syncLobby()
+        await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
+        this.diag('configured')
+
         return true
-    }
-
-    async summary() {
-        if (!this.st.initialized || !this.st.name) return null
-        return {
-            name: this.st.name,
-            title: this.roomTitle(),
-            subtitle: this.roomSubtitle(),
-            master: this.st.hostName || this.st.hostHandle || 'Host',
-            visibility: this.st.settings.visibility,
-        }
     }
 
     async isOpen(): Promise<boolean> {
-        return this.st.initialized && Boolean(this.st.name)
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room expired')
+            return false
+        }
+        return this.st.configured
     }
 
-    async canJoin(user: UserProfile): Promise<string | null> {
-        if (!this.st.initialized || !this.st.name) return 'Room does not exist.'
-        if (this.st.playing) return 'Match is currently in progress.'
-        if (
-            this.st.settings.visibility === 'private' &&
-            !this.isHostUser(user.id, user.handle) &&
-            !this.isTournamentHost(user)
-        ) {
-            return 'This room is private.'
+    async summary() {
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room expired')
+            return null
         }
+
+        if (!this.st.configured) return null
+
+        return {
+            name: this.st.name,
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
+            subtitle: this.subtitle(),
+            master: this.st.hostName,
+            hostId: this.st.hostId,
+            hostHandle: this.st.hostHandle || this.st.members.find((member) => member.id === this.st.hostId)?.handle || '',
+            visibility: this.st.settings.visibility,
+            type: this.st.settings.type,
+            tier: this.st.settings.tier,
+            level: this.st.level,
+            coverUrl: this.st.levelInfo?.coverUrl ?? null,
+        }
+    }
+
+    async canJoin(user: { id: string; handle: string }): Promise<string | null> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room expired')
+            return 'This room has expired.'
+        }
+
+        if (!this.st.configured) return 'This room does not exist.'
+
+        const s = this.st.settings
+        if (user.id === this.st.hostId || user.handle === TOURNAMENT_HOST_HANDLE) return null
+        if (s.visibility === 'locked') return 'This room is locked.'
+
         return null
     }
 
-    async closeForOwner(userId: string): Promise<boolean> {
-        if (!this.isHostUser(userId)) return false
-        await this.closeRoom()
-        return true
+    private subtitle(): string {
+        const s = this.st.settings
+        const access = s.visibility === 'locked' ? 'Locked' : s.visibility === 'private' ? 'Private' : 'Public'
+        return `${SCORING_MODES[s.scoring]} · ${access}${s.random ? ' · Random' : ''}`
     }
 
-    private async closeRoom() {
-        for (const m of this.members.values()) {
-            if (m.leaveTimer) clearTimeout(m.leaveTimer)
+    async fetch(request: Request): Promise<Response> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room expired')
+            return new Response('Room expired', { status: 404 })
         }
-        this.members.clear()
-        if (this.st.name) {
-            await this.lobby().remove(this.st.name).catch(() => {})
-        }
-        this.st = this.freshState()
-        await this.persist()
-        for (const ws of [...this.sockets.keys()]) {
-            try { ws.close(1000, 'Room closed') } catch {}
-        }
-        this.sockets.clear()
-    }
 
-    override async fetch(req: Request): Promise<Response> {
-        if (req.headers.get('Upgrade') !== 'websocket') {
+        if (request.headers.get('Upgrade') !== 'websocket') {
             return new Response('Expected WebSocket', { status: 426 })
         }
 
-        const rawJoin = req.headers.get('x-join')
-        if (!rawJoin) return new Response('Unauthorized', { status: 401 })
-
-        let join: JoinSession
+        let join: JoinSession | null
         try {
-            join = JSON.parse(decodeURIComponent(rawJoin))
+            join = JSON.parse(
+                decodeURIComponent(request.headers.get('x-join') ?? 'null'),
+            ) as JoinSession | null
         } catch {
-            return new Response('Unauthorized', { status: 401 })
+            return new Response('Invalid join session', { status: 400 })
         }
 
-        const pair = new WebSocketPair()
-        const [client, server] = Object.values(pair)
-        server.accept()
-
-        const uid = join.user.id
-        this.sockets.set(server, uid)
-
-        const existing = this.members.get(uid)
-        if (existing?.leaveTimer) {
-            clearTimeout(existing.leaveTimer)
-            existing.leaveTimer = undefined
+        if (
+            !join ||
+            !this.st.configured ||
+            join.room !== this.st.name ||
+            !join.user ||
+            typeof join.user.id !== 'string' ||
+            !join.roomUser ||
+            typeof join.roomUser.authentication !== 'string' ||
+            typeof join.roomUser.signature !== 'string'
+        ) {
+            return new Response('No such room', { status: 404 })
         }
 
-        this.members.set(uid, {
-            user: join.user,
-            ready: existing?.ready ?? false,
-            playing: existing?.playing ?? false,
-            joinedAt: existing?.joinedAt ?? Date.now(),
-        })
+        const { 0: client, 1: server } = new WebSocketPair()
+        const user = join.user
 
-        await this.publishLobby()
-        this.sendTo(server, this.roomDataMessage(uid))
-        this.broadcastState()
+        const oldSockets = this.socketsOf(user.id)
+        const wasConnected = oldSockets.length > 0
 
-        server.addEventListener('message', (event) => {
-            void this.onMessage(server, event.data)
-        })
+        const existingMember = this.st.members.find((member) => member.id === user.id)
+        const member: Member = existingMember ?? {
+            id: user.id,
+            name: user.name,
+            handle: user.handle,
+            roomUser: join.roomUser,
+        }
 
-        const onClose = () => {
-            this.sockets.delete(server)
-            const stillConnected = [...this.sockets.values()].includes(uid)
-            if (!stillConnected) {
-                const member = this.members.get(uid)
-                if (member) {
-                    member.leaveTimer = setTimeout(() => {
-                        void this.dropMember(uid)
-                    }, 3000)
-                }
+        member.name = user.name
+        member.handle = user.handle
+        member.roomUser = join.roomUser
+
+        this.st.members = this.st.members.filter((entry) => entry.id !== user.id)
+        this.st.members.push(member)
+        this.st.statuses[user.id] = 'waiting'
+
+        this.ctx.acceptWebSocket(server)
+        server.serializeAttachment({ userId: user.id })
+
+        for (const oldSocket of oldSockets) {
+            this.closing.add(oldSocket)
+            try {
+                oldSocket.close(4000, 'replaced')
+            } catch {
+                // Previous socket may already be closed.
             }
         }
 
-        server.addEventListener('close', onClose)
-        server.addEventListener('error', onClose)
+        await this.save()
 
-        return new Response(null, { status: 101, webSocket: client })
-    }
+        this.send(server, this.view(user.id))
 
-    private async dropMember(uid: string) {
-        const member = this.members.get(uid)
-        if (!member) return
-        if (member.leaveTimer) clearTimeout(member.leaveTimer)
-        this.members.delete(uid)
-
-        if (this.st.playing && this.isPlayerUser(uid)) {
-            const result: GameplayResult = {
-                grade: 'X',
-                score: 0,
-                accuracy: 0,
-                arcadeScore: 0,
-                accuracyScore: 0,
-                combo: 0,
-                perfect: 0,
-                great: 0,
-                good: 0,
-                bad: 0,
-                miss: 0,
-                totalCount: 0,
-                disqualified: true,
-            }
-            this.st.lastResults[uid] = result
-            await this.maybeFinishRound()
+        if (!wasConnected) {
+            this.sendExcept(user.id, {
+                type: 'addUser',
+                user: member.roomUser,
+            })
         }
 
-        if (this.members.size === 0) {
-            await this.closeRoom()
-            return
-        }
-
-        await this.publishLobby()
-        this.broadcastState()
-    }
-
-    private sendTo(ws: WebSocket, payload: unknown) {
-        try {
-            ws.send(JSON.stringify(payload))
-        } catch {}
-    }
-
-    private broadcast(payload: unknown) {
-        for (const ws of this.sockets.keys()) {
-            this.sendTo(ws, payload)
-        }
-    }
-
-    private broadcastState() {
-        const users = [...this.members.values()].map((m) => ({
-            userProfile: m.user,
-            ready: m.ready,
-            playing: m.playing,
-        }))
-
-        for (const [ws, uid] of this.sockets.entries()) {
-            this.sendTo(ws, {
-                type: 'roomState',
+        if (user.id === this.st.hostId) {
+            this.sendExcept(user.id, {
+                type: 'updateMaster',
                 master: this.st.hostId,
-                users,
-                level: this.st.level,
-                playing: this.st.playing,
-                options: this.optionsFor(uid),
             })
-        }
-    }
 
-    private optionsFor(uid: string) {
-        const member = this.members.get(uid)
-        const user = member?.user ?? { id: uid, handle: uid, name: uid }
-        const canControl = this.canControlRoom(user)
-
-        if (!canControl) return []
-
-        const s = this.st.settings
-        const forms: any[] = []
-
-        if (isOpenType(s.type)) {
-            forms.push(...roomFormsForType(s.type, this.isTournamentHost(user), this.st.editionOptions))
-        } else {
-            forms.push(...roomForms(this.isTournamentHost(user), this.st.editionOptions))
-        }
-
-        if (hasRoundControls(s.type) && !this.st.playing) {
-            forms.push({
-                type: 'roundKind',
-                title: 'Round Type',
-                requireConfirmation: false,
-                options: [
-                    {
-                        query: 'roundMode',
-                        name: 'Round mode',
-                        required: false,
-                        type: 'select',
-                        def: s.roundMode,
-                        values: Object.entries(ROUND_MODES).map(([name, title]) => ({ name, title })),
-                    },
-                ],
+            this.sendExcept(user.id, {
+                type: 'updateLead',
+                lead: this.st.hostId,
             })
         }
 
-        if (this.st.history.length > 0 && !this.st.playing) {
-            forms.push({
-                type: 'undoRound',
-                title: 'Undo Last Round',
-                icon: 'undo',
-                requireConfirmation: true,
-                options: [],
-            })
-        }
+        this.pushScoreboard()
+        await this.maybeSaveUltimatePicks()
 
-        forms.push(closeRoomForm)
-        return forms
+        this.send(server, {
+            type: 'updateTitle',
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
+        })
+
+        this.diag('ws-join', { userId: user.id, wasConnected })
+        await this.maybeFinishRound(true)
+        await this.save()
+        await this.scheduleNextAlarm()
+
+        return new Response(null, {
+            status: 101,
+            webSocket: client,
+        })
     }
 
-    private leaderboardText(): string {
-        const s = this.st.settings
-        if (this.st.history.length === 0) {
-            return 'No rounds played yet.'
+    async webSocketMessage(
+        ws: WebSocket,
+        raw: string | ArrayBuffer,
+    ): Promise<void> {
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room expired')
+            return
         }
 
-        const standings = totals(this.st.history, s.scoring)
-        if (standings.length === 0) {
-            return 'No scores recorded yet.'
-        }
+        const attachment = ws.deserializeAttachment() as { userId: string } | null
+        if (!attachment || typeof raw !== 'string') return
 
-        return standings
-            .map((entry, idx) => {
-                const name = this.members.get(entry.userId)?.user.name || entry.userId
-                return `${idx + 1}. ${name} — ${fmtScore(entry.score, s.scoring)}`
-            })
-            .join('\n')
-    }
-
-    private roomDataMessage(uid: string) {
-        const s = this.st.settings
-        const info = this.st.levelInfo
-        const title = info?.title || this.st.level?.name || 'No song selected'
-        const ratingPart = info?.constant != null
-            ? `Const ${info.constant}`
-            : info?.rating != null
-                ? `Lv.${info.rating}`
-                : ''
-        const diffPart = info?.difficulty || info?.firstTag || ''
-        const metaLine = [diffPart, ratingPart].filter(Boolean).join(' · ')
-
-        const lines: string[] = [
-            `<b>${this.roomTitle()}</b>`,
-            this.st.level ? `${title}${metaLine ? ` (${metaLine})` : ''}` : 'Waiting for level selection...',
-        ]
-
-        if (s.type === 'ultimateEdition' && this.st.ultimatePool.length > 0) {
-            const picks = this.st.ultimatePool.slice(0, 6).map((p) => `${p.season[0]}${p.slot}`).join(' ')
-            lines.push(`Pool: ${picks}`)
-        }
-
-        if (!isOpenType(s.type) || s.scoring === 'pp') {
-            lines.push(PP_CONFIGURED ? 'PP Scoring Active' : 'PP Scoring Inactive')
-        }
-
-        lines.push(this.leaderboardText())
-
-        return {
-            type: 'roomData',
-            name: this.st.name,
-            title: this.roomTitle(),
-            cover: info?.coverUrl ? { url: info.coverUrl } : undefined,
-            bgm: undefined,
-            master: this.st.hostId,
-            users: [...this.members.values()].map((m) => ({
-                userProfile: m.user,
-                ready: m.ready,
-                playing: m.playing,
-            })),
-            level: this.st.level,
-            playing: this.st.playing,
-            options: this.optionsFor(uid),
-            description: lines.join('\n'),
-        }
-    }
-
-    private async onMessage(ws: WebSocket, rawData: unknown) {
-        const uid = this.sockets.get(ws)
-        if (!uid) return
-        const member = this.members.get(uid)
-        if (!member) return
-
-        let cmd: any
+        let command: Cmd
         try {
-            cmd = JSON.parse(typeof rawData === 'string' ? rawData : new TextDecoder().decode(rawData as ArrayBuffer))
+            command = JSON.parse(raw)
         } catch {
             return
         }
 
-        if (this.ready) {
-            await this.ready
+        if (!this.st.members.some((member) => member.id === attachment.userId)) {
+            return
         }
 
-        this.ready = this.handleCommand(ws, uid, member, cmd)
         try {
-            await this.ready
-        } finally {
-            this.ready = null
+            await this.handle(attachment.userId, command)
+        } catch (error) {
+            console.error('Room command failed:', command?.type, error)
+            this.diag('command-error', {
+                userId: attachment.userId,
+                cmdType: command?.type,
+                error: error instanceof Error ? error.message : String(error),
+            })
+            this.resync(attachment.userId)
         }
+
+        await this.save()
+        await this.scheduleNextAlarm()
     }
 
-    private async handleCommand(
-        ws: WebSocket,
-        uid: string,
-        member: Member,
-        cmd: any,
-    ) {
-        const type = cmd?.type
+    async webSocketClose(ws: WebSocket): Promise<void> {
+        const attachment = ws.deserializeAttachment() as { userId: string } | null
+        if (!attachment) return
 
-        if (type === 'setReady') {
-            member.ready = Boolean(cmd.ready)
-            this.broadcastState()
+        this.closing.add(ws)
+
+        if (this.socketsOf(attachment.userId).some((socket) => socket !== ws)) {
             return
         }
 
-        if (type === 'chatMessage') {
-            const text = String(cmd.message ?? '').trim().slice(0, 240)
-            if (!text) return
-            this.broadcast({
-                type: 'chatMessage',
-                userProfile: member.user,
-                message: text,
-                time: Date.now(),
-            })
+        this.diag('ws-close', { userId: attachment.userId })
+        await this.dropMember(attachment.userId, true, true)
+    }
+
+    async webSocketError(ws: WebSocket): Promise<void> {
+        this.diag('ws-error')
+        await this.webSocketClose(ws)
+    }
+
+    async alarm(): Promise<void> {
+        this.diag('alarm-fired')
+
+        if (this.isExpired()) {
+            await this.expireAndDestroy('room max lifespan reached')
             return
         }
 
-        if (type === 'selectLevel') {
-            if (!this.canControlRoom(member.user)) return
-            const nextLevel: Sil | null = cmd.level && typeof cmd.level.address === 'string' && typeof cmd.level.name === 'string'
-                ? { address: cmd.level.address, name: cmd.level.name }
-                : null
+        await this.maybeFinishRound(true)
+        await this.save()
 
-            if (nextLevel && this.st.poolCharts.length > 0 && !isOpenType(this.st.settings.type)) {
-                const allowed = this.st.poolCharts.some((c) => sameLevel(c, nextLevel))
-                if (!allowed) {
-                    this.sendTo(ws, {
-                        type: 'chatMessage',
-                        userProfile: { id: 'system', handle: 'system', name: 'System' },
-                        message: 'That song is not in the current round pool.',
-                        time: Date.now(),
-                    })
-                    return
+        if (this.activeSocketCount() === 0) {
+            await this.expireAndDestroy('empty room closed after 3m')
+            return
+        }
+
+        await this.scheduleNextAlarm()
+    }
+
+    private async closeRoom(uid: string): Promise<void> {
+        if (uid !== this.st.hostId) {
+            return this.resync(uid)
+        }
+
+        await this.expireAndDestroy('room closed by host')
+    }
+
+    private async handle(uid: string, cmd: Cmd): Promise<void> {
+        const state = this.st
+        const isHost = uid === state.hostId
+
+        switch (cmd.type) {
+            case 'updateLevel': {
+                if (
+                    !isHost ||
+                    state.status !== 'selecting' ||
+                    !isSil(cmd.level)
+                ) {
+                    return this.resync(uid)
                 }
-            }
 
-            this.st.level = nextLevel
-            this.st.levelInfo = await this.loadLevelInfo(nextLevel)
-            await this.persist()
-            await this.publishLobby()
-            this.broadcastState()
-            return
-        }
+                if (
+                    state.settings.type === 'rankedRoom' ||
+                    (state.settings.type === 'casualRoom' && state.settings.random) ||
+                    (state.settings.type === 'ultimateEdition' && state.hostHandle !== TOURNAMENT_HOST_HANDLE)
+                ) {
+                    return this.resync(uid)
+                }
 
-        if (type === 'startGameplay') {
-            if (!this.canControlRoom(member.user)) return
-            if (!this.st.level) return
+                if (state.levelOptions.length > 0) {
+                    state.levelOptions = []
+                    this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+                }
 
-            if (!this.st.levelInfo) {
-                this.st.levelInfo = await this.loadLevelInfo(this.st.level)
-            }
+                state.level = {
+                    address: cmd.level.address,
+                    name: cmd.level.name,
+                }
+                state.levelInfo = null
 
-            this.st.playing = true
-            this.roundFinished = false
-            this.st.lastResults = {}
-            this.st.lastResultLevel = this.st.level
+                this.sendLevel()
+                this.pushScoreboard()
 
-            const s = this.st.settings
-            const eligible = s.roundMode === 'rewind'
-                ? [...unresolvedXUsersForSong(this.st.level, this.st.history)]
-                : []
-
-            this.st.lastRoundWasWarmup = s.roundMode === 'warmup' || s.roundMode === 'freeplay'
-            this.st.lastRoundKind = s.roundMode
-            this.st.lastRoundLabel = roundLabelFor(s.type, s.roundMode, this.nextRoundSeq, s.group)
-            this.st.lastRoundEligibleUserIds = eligible
-
-            for (const m of this.members.values()) {
-                m.playing = this.isPlayerUser(m.user.id)
-            }
-
-            await this.persist()
-            await this.publishLobby()
-            this.broadcast({
-                type: 'startGameplay',
-                level: this.st.level,
-            })
-            this.broadcastState()
-            return
-        }
-
-        if (type === 'finishGameplay') {
-            if (!isResult(cmd.result)) return
-
-            const expectedCount = this.st.levelInfo?.noteCount ?? null
-
-            const judgedCount =
-                (Number(cmd.result.perfect) || 0) +
-                (Number(cmd.result.great) || 0) +
-                (Number(cmd.result.good) || 0) +
-                (Number(cmd.result.bad) || 0) +
-                (Number(cmd.result.miss) || 0)
-
-            const incomplete =
-                expectedCount !== null && judgedCount < expectedCount
-
-            const isX =
-                incomplete ||
-                cmd.result.grade === 'X' ||
-                cmd.result.disqualified === true
-
-            const result: GameplayResult = {
-                ...cmd.result,
-                grade: isX ? 'X' : cmd.result.grade,
-                disqualified: isX,
-            }
-
-            member.playing = false
-            member.ready = false
-            this.st.lastResults[uid] = result
-            await this.persist()
-            await this.maybeFinishRound()
-            this.broadcastState()
-            return
-        }
-
-        if (type === 'updateOptionValues') {
-            if (!this.canControlRoom(member.user)) return
-            const parsed = parseSettings(
-                String(cmd.values ?? ''),
-                this.st.settings,
-                member.user.name || member.user.handle,
-            )
-            if (!parsed) return
-
-            const next: RoomSettings = {
-                ...this.st.settings,
-                ...parsed,
-            }
-
-            if (next.type === 'casualRoom') {
-                next.scoring = 'pp'
-            }
-
-            const eligibleForNext = !isOpenType(next.type)
-                ? filterEditionsForRoomType(this.st.editionOptions, next.type)
-                : []
-
-            if (!isOpenType(next.type) && eligibleForNext.length === 0) {
+                state.levelInfo = await fetchLevelInfo(state.level)
+                this.pushScoreboard()
                 return
             }
 
-            if (!isOpenType(next.type)) {
-                const normalizedNextEdition = String(next.edition ?? '').trim().toUpperCase()
-                next.edition = eligibleForNext.includes(normalizedNextEdition)
-                    ? normalizedNextEdition
-                    : pickClosestEdition(eligibleForNext)
+            case 'updateOptionValues': {
+                if (
+                    typeof cmd.optionValues === 'string' &&
+                    new URLSearchParams(cmd.optionValues).get('type') === 'closeRoom'
+                ) {
+                    return this.closeRoom(uid)
+                }
+
+                const next =
+                    typeof cmd.optionValues === 'string'
+                        ? parseSettings(cmd.optionValues, state.settings, state.hostName)
+                        : null
+
+                const member = state.members.find((entry) => entry.id === uid)
+                const tournamentHost = member?.handle === TOURNAMENT_HOST_HANDLE
+
+                if (
+                    !isHost ||
+                    !next ||
+                    next.type !== state.settings.type ||
+                    (!tournamentHost && !isOpenType(next.type)) ||
+                    state.status !== 'selecting'
+                ) {
+                    return this.resync(uid)
+                }
+
+                const editionChanged =
+                    next.edition !== state.settings.edition &&
+                    !isOpenType(next.type)
+
+                if (editionChanged) {
+                    try {
+                        let nextPool: SheetChart[] = []
+                        let nextDivisions: Record<string, string> = {}
+                        let nextParticipants: string[] = []
+                        let nextPicksSaved = false
+
+                        if (next.type === 'ultimateEdition') {
+                            const data = await getUltimateEditionData(next.edition)
+                            const saved = await getSavedUltimatePicks(this.env, data.edition)
+
+                            nextPicksSaved = !!saved
+                            const picks: Partial<UltimatePicks> = {}
+
+                            for (const season of ['winter', 'spring', 'summer', 'fall'] as const) {
+                                if (saved?.[season]) {
+                                    picks[season] = saved[season]
+                                } else if (data.seasons[season].length > 0) {
+                                    picks[season] = randomChart(data.seasons[season])
+                                }
+                            }
+
+                            nextPool = [
+                                ...(['winter', 'spring', 'summer', 'fall'] as const)
+                                    .flatMap((season) => picks[season] ? [picks[season]!] : []),
+                                ...(data.contestWinner ? [data.contestWinner] : []),
+                                ...(data.ultimate ? [data.ultimate] : []),
+                            ]
+
+                            nextParticipants = data.participants
+                        } else {
+                            const data = await getEditionData(next.edition)
+                            nextPool = chartsForType(data, next.type)
+                            nextDivisions = cleanDivisions(data.divisions)
+                        }
+
+                        state.edition = next.edition
+                        state.poolCharts = nextPool
+                        state.divisions = nextDivisions
+                        state.ultimateParticipants = nextParticipants
+                        state.ultimateRoundIndex = 0
+                        state.ultimatePicksSaved = nextPicksSaved
+                        state.suggestions = suggestionsFromCharts(nextPool, state.hostId)
+                        state.level = nextPool[0]
+                            ? {
+                                address: nextPool[0].address,
+                                name: nextPool[0].name,
+                            }
+                            : null
+                        state.levelInfo = state.level
+                            ? await fetchLevelInfo(state.level)
+                            : null
+                        state.levelOptions = []
+                        state.results = {}
+                        state.round = null
+
+                        this.sendAll({
+                            type: 'updateLevel',
+                            level: state.level,
+                        })
+                    } catch (error) {
+                        console.error(
+                            '[ROOM] Could not load selected edition. Continuing without edition data:',
+                            error,
+                        )
+
+                        state.edition = next.edition
+                        state.poolCharts = []
+                        state.divisions = {}
+                        state.ultimateParticipants = []
+                        state.ultimateRoundIndex = 0
+                        state.ultimatePicksSaved = false
+                        state.suggestions = []
+                        state.level = null
+                        state.levelInfo = null
+                        state.levelOptions = []
+                        state.results = {}
+                        state.round = null
+
+                        this.sendAll({
+                            type: 'updateLevel',
+                            level: null,
+                        })
+                    }
+                }
+
+                if (next.type === 'rankedRoom') {
+                    next.tier = state.settings.tier
+                    next.customSongs = state.settings.customSongs
+                }
+
+                const randomChanged = next.random !== state.settings.random
+                const modeChanged = next.scoring !== state.settings.scoring
+
+                if (next.type === 'casualRoom' && !next.title) {
+                    next.title = defaultCustomRoomTitle(state.hostName)
+                }
+
+                state.settings = {
+                    ...next,
+                    roundMode: 'tournament',
+                }
+
+                this.sendAll({
+                    type: 'updateOptionValues',
+                    optionValues: serializeSettings(state.settings),
+                })
+
+                this.sendAll({
+                    type: 'updateTitle',
+                    title: getRoomTitle(state.settings, state.edition, state.hostName),
+                })
+
+                if (modeChanged || editionChanged) {
+                    this.sendAll({
+                        type: 'updateScoreboardDescription',
+                        scoreboardDescription: '',
+                    })
+
+                    this.pushScoreboard()
+                }
+
+                if (randomChanged) await this.applyRandomLevel(true)
+
+                await this.syncLobby()
+                return
             }
 
-            const editionChanged =
-                !isOpenType(next.type) &&
-                next.edition !== this.st.settings.edition
+            case 'updateStatus': {
+                this.diag('updateStatus-command', {
+                    userId: uid,
+                    requested: cmd.status,
+                    current: state.status,
+                    isHost,
+                })
+                return isHost
+                    ? this.changeStatus(uid, cmd.status)
+                    : this.resync(uid)
+            }
 
-            this.st.settings = next
+            case 'removeUser': {
+                if (
+                    !isHost ||
+                    cmd.userId === uid ||
+                    !state.members.some((member) => member.id === cmd.userId)
+                ) {
+                    return this.resync(uid)
+                }
 
-            if (editionChanged) {
-                if (next.type === 'groupStage' || next.type === 'final') {
-                    const data = await getEditionData(next.edition, this.env).catch(() => null)
-                    this.st.editionData = data
-                    this.st.poolCharts = data
-                        ? (next.type === 'groupStage' ? [...data.group1, ...data.group2] : [...data.final])
-                        : []
-                } else if (next.type === 'ultimateEdition') {
-                    const ult = await getUltimateEditionData(next.edition, this.env).catch(() => null)
-                    if (ult) {
-                        this.st.ultimateFixedCharts = ult.fixedCharts
-                        this.st.ultimatePool = ult.pool
-                        this.st.poolCharts = [...ult.fixedCharts, ...ult.pool.map((p) => p.chart)]
+                const target = cmd.userId as string
+
+                for (const socket of this.socketsOf(target)) {
+                    this.closing.add(socket)
+                    try {
+                        socket.close(4001, 'kicked')
+                    } catch {
+                        // Socket may already be closed.
+                    }
+                }
+
+                await this.dropMember(target, true, true)
+                return
+            }
+
+            case 'resetScoreboard': {
+                if (!isHost) return this.resync(uid)
+
+                state.history = []
+                state.results = {}
+                this.pushScoreboard()
+                return
+            }
+
+            case 'addSuggestion': {
+                if (
+                    state.settings.type === 'rankedRoom' ||
+                    (!isHost && state.settings.type !== 'casualRoom') ||
+                    !isSil(cmd.level)
+                ) {
+                    return this.resync(uid)
+                }
+
+                const alreadyExists = state.suggestions.some(
+                    (entry) =>
+                        entry.level.address === cmd.level.address &&
+                        entry.level.name === cmd.level.name,
+                )
+
+                if (!alreadyExists) {
+                    const suggestion = {
+                        userId: uid,
+                        level: {
+                            address: cmd.level.address,
+                            name: cmd.level.name,
+                        },
+                    }
+
+                    state.suggestions.push(suggestion)
+
+                    const event = {
+                        type: 'addSuggestion',
+                        suggestion,
+                    }
+
+                    if (state.settings.type === 'casualRoom') {
+                        this.sendAll(event)
+                    } else {
+                        this.sendHost(event)
+                    }
+                }
+
+                await this.applyRandomLevel(false)
+                return
+            }
+
+            case 'removeSuggestion': {
+                const index = state.suggestions.findIndex(
+                    (entry) =>
+                        entry.userId === cmd.suggestion?.userId &&
+                        entry.level.address === cmd.suggestion?.level?.address &&
+                        entry.level.name === cmd.suggestion?.level?.name,
+                )
+
+                if (!isHost || index < 0) {
+                    return this.resync(uid)
+                }
+
+                const [removed] = state.suggestions.splice(index, 1)
+
+                this.sendHost({
+                    type: 'removeSuggestion',
+                    suggestion: removed,
+                })
+
+                return
+            }
+
+            case 'clearSuggestions': {
+                if (!isHost) return this.resync(uid)
+
+                state.suggestions = []
+                this.sendHost({ type: 'clearSuggestions' })
+                return
+            }
+
+            case 'swapSuggestions': {
+                const find = (suggestion: any) =>
+                    state.suggestions.findIndex(
+                        (entry) =>
+                            entry.userId === suggestion?.userId &&
+                            entry.level.address === suggestion?.level?.address &&
+                            entry.level.name === suggestion?.level?.name,
+                    )
+
+                const a = find(cmd.suggestionA)
+                const b = find(cmd.suggestionB)
+
+                if (!isHost || a < 0 || b < 0 || a === b) {
+                    return this.resync(uid)
+                }
+
+                ;[state.suggestions[a], state.suggestions[b]] = [
+                    state.suggestions[b]!,
+                    state.suggestions[a]!,
+                ]
+
+                this.sendHost({
+                    type: 'swapSuggestions',
+                    suggestionA: cmd.suggestionA,
+                    suggestionB: cmd.suggestionB,
+                })
+
+                return
+            }
+
+            case 'updateLead':
+            case 'updateMaster':
+            case 'updateAutoExit':
+            case 'updateIsSuggestionsLocked':
+                return this.resync(uid)
+
+            case 'updateLevelOption': {
+                const entry = cmd.levelOption
+
+                if (
+                    !isHost ||
+                    state.settings.type !== 'casualRoom' ||
+                    state.status !== 'selecting' ||
+                    !entry ||
+                    typeof entry.name !== 'string' ||
+                    typeof entry.value !== 'number' ||
+                    !Number.isFinite(entry.value)
+                ) {
+                    return this.resync(uid)
+                }
+
+                const next = { name: entry.name, value: entry.value }
+                const at = state.levelOptions.findIndex((x) => x.name === next.name)
+
+                if (at >= 0) state.levelOptions[at] = next
+                else state.levelOptions.push(next)
+
+                this.sendAll({ type: 'updateLevelOption', levelOption: next })
+                return
+            }
+
+            case 'updateUserStatus': {
+                const wanted = cmd.status as UserStatus
+                const allowed: UserStatus[] = isHost
+                    ? ['waiting', 'ready', 'skipped']
+                    : ['waiting', 'ready']
+
+                if (
+                    state.status !== 'preparing' ||
+                    !allowed.includes(wanted)
+                ) {
+                    return this.resync(uid)
+                }
+
+                state.statuses[uid] = wanted
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: wanted,
+                    },
+                })
+
+                return
+            }
+
+            case 'startGameplay': {
+                if (
+                    state.status !== 'playing' ||
+                    !state.round ||
+                    cmd.state !== state.round.state ||
+                    state.statuses[uid] !== 'ready'
+                ) {
+                    return this.resync(uid)
+                }
+
+                state.statuses[uid] = 'playing'
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: 'playing',
+                    },
+                })
+
+                return
+            }
+
+            case 'finishGameplay': {
+                const valid =
+                    state.status === 'playing' &&
+                    state.round &&
+                    cmd.state === state.round.state &&
+                    isResult(cmd.result) &&
+                    !state.results[uid]
+
+                if (!valid) {
+                    this.diag('finishGameplay-rejected', { userId: uid })
+                    return this.resync(uid)
+                }
+
+                const expectedCount = state.levelInfo?.noteCount ?? null
+                const judgedCount =
+                    (Number(cmd.result.perfect) || 0) +
+                    (Number(cmd.result.great) || 0) +
+                    (Number(cmd.result.good) || 0) +
+                    (Number(cmd.result.miss) || 0)
+
+                const incomplete =
+                    expectedCount !== null && judgedCount < expectedCount
+
+                const result: GameplayResult = {
+                    ...cmd.result,
+                    grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
+                    disqualified:
+                        incomplete ||
+                        cmd.result.disqualified === true ||
+                        cmd.result.grade === 'X',
+                }
+
+                state.results[uid] = result
+                state.statuses[uid] = 'waiting'
+
+                this.sendAll({
+                    type: 'updateUserStatus',
+                    userStatus: {
+                        userId: uid,
+                        status: 'waiting',
+                    },
+                })
+
+                this.sendResult(uid, result)
+                this.pushScoreboard()
+                this.diag('finishGameplay-accepted', {
+                    userId: uid,
+                    grade: result.grade,
+                    disqualified: result.disqualified === true,
+                })
+
+                await this.maybeFinishRound(true)
+                return
+            }
+
+            case 'addChatMessage': {
+                const incoming = cmd.message
+                let message: Ev | null = null
+
+                if (
+                    incoming?.type === 'quick' &&
+                    ['hello', 'glhf', 'gg', 'ns', 'ty'].includes(incoming.value)
+                ) {
+                    message = {
+                        userId: uid,
+                        type: 'quick',
+                        value: incoming.value,
+                    }
+                } else if (
+                    incoming?.type === 'text' &&
+                    typeof incoming.value === 'string' &&
+                    incoming.value.trim()
+                ) {
+                    message = {
+                        userId: uid,
+                        type: 'text',
+                        value: incoming.value.slice(0, 200),
+                    }
+                }
+
+                if (!message) return
+
+                for (const member of state.members) {
+                    const event: Ev = {
+                        type: 'addChatMessage',
+                        message,
+                    }
+
+                    if (member.id === uid && typeof cmd.nonce === 'number') {
+                        event.nonce = cmd.nonce
+                    }
+
+                    this.sendTo(member.id, event)
+                }
+
+                return
+            }
+
+            case 'reportUser':
+            default:
+                return
+        }
+    }
+
+    private async changeStatus(
+        uid: string,
+        next: RoomStatus,
+    ): Promise<void> {
+        const state = this.st
+        const current = state.status
+
+        const waitAll = () => {
+            for (const member of state.members) {
+                state.statuses[member.id] = 'waiting'
+            }
+        }
+
+        if (current === 'selecting' && next === 'preparing') {
+            if (state.settings.type === 'rankedRoom') {
+                let pick: SheetChart | null = null
+
+                try {
+                    pick = await pickRankedLevel(
+                        state.settings.tier as RankedTier,
+                        state.settings.customSongs,
+                        state.settings.vocalType ?? 'virtualSinger',
+                        this.env,
+                    )
+                } catch (error) {
+                    console.error('Could not pick a ranked level:', error)
+                }
+
+                if (state.status !== 'selecting' || !pick) {
+                    return this.resync(uid)
+                }
+
+                state.level = { address: pick.address, name: pick.name }
+                state.levelInfo = await fetchLevelInfo(state.level)
+                state.levelOptions = []
+
+                this.sendAll({ type: 'updateLevel', level: state.level })
+                this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
+            } else if (
+                state.settings.type === 'casualRoom' &&
+                state.settings.random
+            ) {
+                await this.applyRandomLevel(true)
+                if (state.status !== 'selecting') return this.resync(uid)
+            }
+        }
+
+        if (current === 'selecting' && next === 'preparing' && state.level) {
+            state.status = 'preparing'
+            waitAll()
+
+            if (!isOpenType(state.settings.type)) {
+                for (const member of state.members) {
+                    if (member.id !== state.hostId) {
+                        this.sendTo(member.id, {
+                            type: 'updateLevel',
+                            level: state.level,
+                        })
                     }
                 }
             }
 
-            await this.persist()
-            await this.publishLobby()
-            this.broadcastState()
-            return
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'preparing',
+            })
+            this.diag('status-preparing', { level: state.level.name })
+        } else if (current === 'preparing' && next === 'selecting') {
+            state.status = 'selecting'
+            waitAll()
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'selecting',
+            })
+            this.diag('status-selecting-from-preparing')
+        } else if (current === 'preparing' && next === 'playing') {
+            const readyMembers = state.members.filter(
+                (member) =>
+                    this.socketsOf(member.id).length > 0 &&
+                    state.statuses[member.id] === 'ready',
+            )
+
+            if (!state.level || readyMembers.length === 0) {
+                return this.resync(uid)
+            }
+
+            const editionHistory = state.history.filter(
+                (record) => !record.edition || record.edition === this.st.edition,
+            )
+
+            const kind = this.computeRoundKind(state.level, editionHistory)
+            const label = buildRoundLabel(
+                state.level,
+                kind,
+                editionHistory,
+                isOpenType(state.settings.type),
+                state.settings.type === 'ultimateEdition' ? state.poolCharts : [],
+            )
+
+            state.settings.roundMode = kind
+            state.status = 'playing'
+            state.results = {}
+            state.round = {
+                state: crypto.randomUUID(),
+                seed: Math.random(),
+                kind,
+                label,
+            }
+
+            for (const member of state.members) {
+                if (state.statuses[member.id] === 'skipped') {
+                    state.statuses[member.id] = 'waiting'
+                }
+            }
+
+            this.sendAll({
+                type: 'updateStatus',
+                status: 'playing',
+            })
+
+            const start = {
+                type: 'startRound',
+                state: state.round.state,
+                seed: state.round.seed,
+            }
+
+            for (const member of readyMembers) {
+                this.sendTo(member.id, start)
+            }
+
+            this.pushScoreboard()
+            this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
+        } else if (current === 'playing' && next === 'selecting') {
+            let completedRound: RoundRecord | null = null
+
+            if (Object.keys(state.results).length > 0) {
+                completedRound = this.makeRoundRecord(state.history)
+                state.history.push(completedRound)
+            }
+
+            state.round = null
+            state.status = 'selecting'
+            waitAll()
+
+            if (state.settings.type === 'rankedRoom') {
+                state.level = null
+                state.levelInfo = null
+                this.sendAll({ type: 'updateLevel', level: null })
+            }
+
+            if (state.settings.type === 'ultimateEdition' && completedRound?.roundKind === 'tournament') {
+                const completedIndex = state.poolCharts.findIndex(
+                    (chart) => sameLevel(completedRound!.level, chart),
+                )
+
+                if (completedIndex === state.ultimateRoundIndex) {
+                    state.ultimateRoundIndex++
+
+                    if (state.ultimateRoundIndex < state.poolCharts.length) {
+                        const nextChart = state.poolCharts[state.ultimateRoundIndex]!
+                        state.level = { address: nextChart.address, name: nextChart.name }
+                        state.levelInfo = await fetchLevelInfo(state.level)
+                        state.levelOptions = []
+                        this.sendLevel()
+                    } else {
+                        await this.maybeSaveUltimatePicks()
+                    }
+                }
+            }
+
+            this.sendAll({ type: 'updateStatus', status: 'selecting' })
+            this.pushScoreboard()
+            await this.applyRandomLevel(true)
+
+            for (const member of state.members) {
+                if (this.socketsOf(member.id).length > 0) this.resync(member.id)
+            }
+
+            this.diag('status-selecting-from-playing')
+        }
+    }
+
+    private makeRoundRecord(priorHistory: RoundRecord[] = this.st.history): RoundRecord {
+        const info = this.st.levelInfo
+        const editionHistory = priorHistory.filter(
+            (record) => !record.edition || record.edition === this.st.edition,
+        )
+        const kind: RoundKind =
+            this.st.round?.kind ?? this.computeRoundKind(this.st.level, editionHistory)
+        const label =
+            this.st.round?.label ||
+            buildRoundLabel(
+                this.st.level,
+                kind,
+                editionHistory,
+                isOpenType(this.st.settings.type),
+                this.st.settings.type === 'ultimateEdition' ? this.st.poolCharts : [],
+            )
+        const rewindEligibleUserIds =
+            kind === 'rewind'
+                ? [...unresolvedXUsersForSong(this.st.level, editionHistory)]
+                : []
+
+        return {
+            level: this.st.level,
+            edition: this.st.edition,
+            levelTitle: info?.title,
+            levelTag: info?.firstTag,
+            levelRating: info?.rating ?? undefined,
+            levelConstant: info?.constant ?? undefined,
+            noteCount: info?.noteCount ?? undefined,
+            difficulty: info?.difficulty || info?.firstTag || undefined,
+            roundKind: kind,
+            roundLabel: label,
+            countsTowardScore: kind === 'tournament' || kind === 'rewind',
+            isReplay: kind === 'rewind' || kind === 'freeplay',
+            rewindEligibleUserIds,
+            results: { ...this.st.results },
+        }
+    }
+
+    private canSee(_uid: string): boolean {
+        return true
+    }
+
+    private async maybeSaveUltimatePicks(): Promise<void> {
+        const state = this.st
+
+        if (
+            state.settings.type !== 'ultimateEdition' ||
+            state.ultimateRoundIndex < state.poolCharts.length ||
+            state.ultimatePicksSaved
+        ) return
+
+        const assignedPresent = state.members.some(
+            (member) =>
+                state.ultimateParticipants.includes(member.handle) &&
+                this.socketsOf(member.id).length > 0,
+        )
+
+        if (!assignedPresent) return
+
+        const findSeason = (season: 'winter' | 'spring' | 'summer' | 'fall') =>
+            state.poolCharts.find((chart) =>
+                chart.id.toUpperCase().startsWith(`${season.toUpperCase()}-`),
+            )
+
+        const winter = findSeason('winter')
+        const spring = findSeason('spring')
+        const summer = findSeason('summer')
+        const fall = findSeason('fall')
+
+        if (!winter || !spring || !summer || !fall) return
+
+        const picks: UltimatePicks = {
+            winter,
+            spring,
+            summer,
+            fall,
         }
 
-        if (type === 'optionAction') {
-            if (!this.canControlRoom(member.user)) return
-            const actionType = String(cmd.action ?? cmd.typeAction ?? '')
-            if (actionType === 'closeRoom') {
-                await this.closeRoom()
-                return
-            }
-            if (actionType === 'undoRound' && this.st.history.length > 0) {
-                this.st.history.pop()
-                this.nextRoundSeq = Math.max(1, this.st.history.length + 1)
-                await this.persist()
-                await this.publishLobby()
-                this.broadcastState()
+        try {
+            await saveUltimatePicks(this.env, state.edition, picks)
+            state.ultimatePicksSaved = true
+            await this.save()
+        } catch (error) {
+            console.error('[Ultimate] Could not save completed picks:', error)
+        }
+    }
+
+    private sendLevel(): void {
+        if (!this.st.level) return
+
+        const event = { type: 'updateLevel', level: this.st.level }
+        if (isOpenType(this.st.settings.type)) this.sendAll(event)
+        else this.sendHost(event)
+    }
+
+    private sendResult(uid: string, result: GameplayResult): void {
+        const activeIds = new Set(
+            this.st.members
+                .filter((member) => this.socketsOf(member.id).length > 0)
+                .map((member) => member.id),
+        )
+        if (!activeIds.has(uid)) return
+
+        const wireResult = sanitizeWireResult(result)
+
+        for (const member of this.st.members) {
+            if (activeIds.has(member.id) && this.canSee(member.id)) {
+                this.sendTo(member.id, {
+                    type: 'addResult',
+                    result: { userId: uid, result: wireResult },
+                })
             }
         }
     }
 
-    private async maybeFinishRound() {
-        if (!this.st.playing || this.roundFinished) return
+    private async applyRandomLevel(force: boolean): Promise<void> {
+        const s = this.st
 
-        const stillPlaying = [...this.members.values()].filter((m) => m.playing)
-        if (stillPlaying.length > 0) return
+        if (
+            s.settings.type !== 'casualRoom' ||
+            !s.settings.random ||
+            s.status !== 'selecting' ||
+            s.suggestions.length === 0
+        ) return
 
-        this.roundFinished = true
-        this.st.playing = false
+        if (s.level && !force) return
 
-        const s = this.st.settings
-        const info = this.st.levelInfo
-        const roundKind: RoundKind = this.st.lastRoundKind ?? s.roundMode ?? 'tournament'
-        const roundLabel = this.st.lastRoundLabel ?? roundLabelFor(s.type, roundKind, this.nextRoundSeq, s.group)
+        const pool = s.suggestions.filter(
+            (x) =>
+                !(
+                    s.level &&
+                    x.level.address === s.level.address &&
+                    x.level.name === s.level.name
+                ),
+        )
 
-        const record: RoundRecord = {
-            level: this.st.level,
-            edition: s.edition || undefined,
-            levelTitle: info?.title || this.st.level?.name || undefined,
-            levelTag: info?.firstTag || undefined,
-            levelRating: info?.rating ?? undefined,
-            levelConstant: info?.constant ?? undefined,
-            noteCount: info?.noteCount ?? undefined,
-            difficulty: info?.difficulty || undefined,
-            roundKind,
-            roundLabel,
-            countsTowardScore: roundKind === 'tournament' || roundKind === 'rewind',
-            rewindEligibleUserIds: this.st.lastRoundEligibleUserIds,
-            results: { ...this.st.lastResults },
+        const list = pool.length > 0 ? pool : s.suggestions
+        const pick = list[Math.floor(Math.random() * list.length)]!.level
+
+        s.level = { address: pick.address, name: pick.name }
+        s.levelInfo = null
+
+        if (s.levelOptions.length > 0) {
+            s.levelOptions = []
+            this.sendAll({ type: 'updateLevelOptions', levelOptions: [] })
         }
 
-        this.st.history.push(record)
-        this.st.lastResultRound = record
-        if (roundKind === 'tournament') {
-            this.nextRoundSeq += 1
+        this.sendLevel()
+        this.pushScoreboard()
+
+        s.levelInfo = await fetchLevelInfo(s.level)
+        this.pushScoreboard()
+    }
+
+    private hostIsTournament(): boolean {
+        const host = this.st.members.find((m) => m.id === this.st.hostId)
+        return (host?.handle ?? '') === TOURNAMENT_HOST_HANDLE
+    }
+
+    private roundBusy(): boolean {
+        const s = this.st
+
+        return s.members.some(
+            (member) =>
+                this.socketsOf(member.id).length > 0 &&
+                (s.statuses[member.id] === 'ready' ||
+                    s.statuses[member.id] === 'playing'),
+        )
+    }
+
+    private async maybeFinishRound(immediate: boolean): Promise<void> {
+        const s = this.st
+
+        if (s.status !== 'playing' || !s.round || this.roundBusy()) return
+
+        if (!immediate) {
+            if (this.activeSocketCount() > 0) {
+                await this.scheduleNextAlarm(8000)
+            }
+            return
         }
 
-        if (s.type === 'ultimateEdition' && this.st.ultimatePool.length > 0) {
-            await saveUltimatePicks(this.env, s.edition, this.st.ultimatePool).catch(() => {})
-            await getSavedUltimatePicks(this.env, s.edition).catch(() => {})
+        await this.changeStatus(s.hostId, 'selecting')
+    }
+
+    private hostPresent = () =>
+        this.socketsOf(this.st.hostId).length > 0
+
+    private view(uid: string): Ev {
+        const state = this.st
+        const isHost = uid === state.hostId
+        const master = this.hostPresent() ? state.hostId : null
+
+        const activeMembers = state.members.filter(
+            (member) => this.socketsOf(member.id).length > 0,
+        )
+        const canEditLevelOptions = state.settings.type === 'casualRoom' && state.status === 'selecting'
+
+        return {
+            type: 'update',
+            allowOtherServers: true,
+            reportUserOptions: [],
+            title: getRoomTitle(state.settings, state.edition, state.hostName),
+            status: state.status,
+            master,
+            lead: master,
+            options: [
+                ...roomFormsForType(
+                    state.settings.type,
+                    this.hostIsTournament(),
+                    state.editionOptions,
+                ),
+                ...(isHost ? [closeRoomForm] : []),
+            ],
+            optionValues: serializeSettings(state.settings),
+            level: isHost ||
+                isOpenType(state.settings.type) ||
+                state.status !== 'selecting'
+                ? state.level
+                : null,
+            levelOptions: canEditLevelOptions
+                ? state.levelOptions
+                : [],
+            autoExit: 'off',
+            isSuggestionsLocked: state.settings.type === 'rankedRoom' ||
+                (state.settings.type !== 'casualRoom' && !isHost),
+            suggestions: isHost || state.settings.type === 'casualRoom'
+                ? state.suggestions
+                : [],
+            scoreboardDescription: '',
+            scoreboardSections: this.canSee(uid) ? this.sections() : [],
+            results: Object.entries(state.results)
+                .filter(([id]) => this.canSee(uid) || id === uid)
+                .map(([userId, result]) => ({
+                    userId,
+                    result: sanitizeWireResult(result),
+                })),
+            users: activeMembers.map((member) => member.roomUser),
+            userStatuses: activeMembers.map((member) => ({
+                userId: member.id,
+                status: state.statuses[member.id] ?? 'waiting',
+            })),
+        }
+    }
+
+    private effectiveRoundScore(
+        userId: string,
+        result: GameplayResult,
+        round: RoundRecord,
+        priorHistory: RoundRecord[],
+        mode: RoomSettings['scoring'],
+    ): number {
+        if (isOpenType(this.st.settings.type)) {
+            return roundPoints(result, mode, round)
         }
 
-        const wireResults: Record<string, GameplayResult> = {}
-        for (const [userId, res] of Object.entries(record.results)) {
-            wireResults[userId] = sanitizeWireResult(res)
+        const kind = round.roundKind ?? 'tournament'
+        if (kind === 'warmup' || kind === 'freeplay') {
+            return 0
         }
 
-        const summaryLines = Object.entries(record.results)
-            .sort(([, a], [, b]) => compareResults(a, b, s.scoring, record))
-            .map(([userId, res]) => {
-                const name = this.members.get(userId)?.user.name || userId
-                const pts = roundPoints(res, s.scoring, record)
-                const raw = rawPpPoints(res, record)
-                void raw
-                return `${name}: ${fmtDetail(res, s.scoring, record)} (${fmtScore(pts, s.scoring)})`
-            })
+        if (kind === 'rewind') {
+            const eligible = unresolvedXUsersForSong(round.level, priorHistory)
+            if (!eligible.has(userId) || isPlayerX(result)) {
+                return 0
+            }
+        }
 
-        await this.persist()
-        await this.publishLobby()
+        return roundPoints(result, mode, round)
+    }
 
-        this.broadcast({
-            type: 'finishGameplay',
-            results: wireResults,
-            summary: summaryLines.join('\n'),
+    private sections() {
+        try {
+            const state = this.st
+            const mode = state.settings.scoring
+            const open = isOpenType(state.settings.type)
+
+            const presentMembers = state.members.filter(
+                (member) => this.socketsOf(member.id).length > 0,
+            )
+            const present = new Set(presentMembers.map((member) => member.id))
+
+            const live: RoundRecord | null =
+                state.status === 'playing' &&
+                Object.keys(state.results).length > 0
+                    ? this.makeRoundRecord(state.history)
+                    : null
+
+            const history = live ? [...state.history, live] : state.history
+            const allTotals = open ? totals(history, mode) : (() => {
+                const map = new Map<string, number>()
+                for (const member of state.members) {
+                    map.set(member.id, 0)
+                }
+
+                for (let idx = 0; idx < history.length; idx++) {
+                    const rec = history[idx]!
+                    const prior = history.slice(0, idx)
+                    for (const [userId, res] of Object.entries(rec.results ?? {})) {
+                        const gained = this.effectiveRoundScore(userId, res, rec, prior, mode)
+                        map.set(userId, (map.get(userId) ?? 0) + gained)
+                    }
+                }
+
+                return [...map.entries()]
+                    .map(([userId, score]) => ({ userId, score }))
+                    .sort((a, b) => b.score - a.score)
+            })()
+
+            const output: {
+                title: string
+                scores: {
+                    userId: string
+                    value: string
+                }[]
+            }[] = []
+
+            const divisions = this.getDivisions(presentMembers)
+
+            for (const division of divisions) {
+                const divisionIds = new Set(division.members.map((member) => member.id))
+                const divisionTotals = allTotals
+                    .filter((total) => divisionIds.has(total.userId) && present.has(total.userId))
+
+                output.push({
+                    title: division.title
+                        ? `Standings · ${division.title}`
+                        : 'Standings',
+                    scores: divisionTotals.map((total) => ({
+                        userId: total.userId,
+                        value: fmtScore(total.score, mode),
+                    })),
+                })
+            }
+
+            if (state.settings.type !== 'casualRoom') {
+                for (const member of state.members) {
+                    if (present.has(member.id)) continue
+
+                    const total = allTotals.find((t) => t.userId === member.id)
+                    if (!total) continue
+
+                    output.push({
+                        title: `Left · ${member.name || member.handle} · ${fmtScore(total.score, mode)}`,
+                        scores: [],
+                    })
+                }
+            }
+
+            const roundSection = (
+                round: RoundRecord,
+                priorHistory: RoundRecord[],
+                isLive = false,
+            ) => {
+                const kind = round.roundKind ?? 'tournament'
+                const baseLabel =
+                    round.roundLabel ||
+                    buildRoundLabel(round.level, kind, priorHistory, open, state.settings.type === 'ultimateEdition' ? state.poolCharts : [])
+                const label = isLive ? `${baseLabel} (live)` : baseLabel
+                const song = round.levelTitle || round.level?.name
+                const title = song
+                    ? `${label} · ${song}${round.levelTag ? ` ${round.levelTag}` : ''}${round.levelRating != null ? ` Lvl.${round.levelRating}` : ''}`
+                    : label
+
+                const scores = Object.entries(round.results)
+                    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
+                    .map(([userId, result]) => ({
+                        userId,
+                        value: fmtDetail(result, mode, round),
+                    }))
+
+                output.push({ title, scores })
+            }
+
+            if (live) {
+                roundSection(live, state.history, true)
+            }
+
+            for (let index = state.history.length - 1; index >= 0; index--) {
+                const rec = state.history[index]!
+                roundSection(rec, state.history.slice(0, index), false)
+            }
+
+            return output
+        } catch (error) {
+            console.error('[Room] Failed building scoreboard sections:', error)
+            return []
+        }
+    }
+
+    private getDivisions(members: Member[]) {
+        const type = this.st.settings.type
+
+        if (isOpenType(type)) {
+            return [{ title: '', members }]
+        }
+
+        if (type === 'ultimateEdition') {
+            const assigned = members.filter(
+                (member) => this.st.ultimateParticipants.includes(member.handle),
+            )
+            const unassigned = members.filter(
+                (member) => !this.st.ultimateParticipants.includes(member.handle),
+            )
+
+            return [
+                ...(assigned.length ? [{ title: '', members: assigned }] : []),
+                ...(unassigned.length ? [{ title: 'Unassigned', members: unassigned }] : []),
+            ]
+        }
+
+        if (type === 'groupStage') {
+            const groupNames = [
+                ...new Set(
+                    Object.values(this.st.divisions)
+                        .filter((division) => /^Group\s+/i.test(division))
+                        .map((division) => division.replace(/^Group\s+/i, '').trim()),
+                ),
+            ].sort((a, b) => a.localeCompare(b, undefined, {
+                numeric: true,
+                sensitivity: 'base',
+            }))
+
+            const groups = groupNames.map((group) => ({
+                title: `Group ${group}`,
+                members: members.filter(
+                    (member) => this.st.divisions[member.handle] === `Group ${group}`,
+                ),
+            })).filter((division) => division.members.length > 0)
+
+            const assigned = new Set(
+                groups.flatMap((division) => division.members.map((member) => member.id)),
+            )
+
+            const unassigned = members.filter((member) => !assigned.has(member.id))
+            if (unassigned.length > 0) {
+                groups.push({ title: 'Unassigned', members: unassigned })
+            }
+
+            return groups
+        }
+
+        const brackets = [
+            {
+                title: 'Upper Bracket',
+                members: members.filter(
+                    (member) => this.st.divisions[member.handle] === 'Upper Bracket',
+                ),
+            },
+            {
+                title: 'Lower Bracket',
+                members: members.filter(
+                    (member) => this.st.divisions[member.handle] === 'Lower Bracket',
+                ),
+            },
+        ].filter((division) => division.members.length > 0)
+
+        const assigned = new Set(
+            brackets.flatMap((division) => division.members.map((member) => member.id)),
+        )
+
+        const unassigned = members.filter((member) => !assigned.has(member.id))
+        if (unassigned.length > 0) {
+            brackets.push({ title: 'Unassigned', members: unassigned })
+        }
+
+        return brackets
+    }
+
+    private pushScoreboard(): void {
+        const scoreboardSections = this.sections()
+
+        for (const member of this.st.members) {
+            if (this.canSee(member.id)) {
+                this.sendTo(member.id, {
+                    type: 'updateScoreboardSections',
+                    scoreboardSections,
+                })
+            }
+        }
+    }
+
+    private async dropMember(
+        uid: string,
+        announce: boolean,
+        retain = false,
+    ): Promise<void> {
+        const state = this.st
+        const member = state.members.find((entry) => entry.id === uid)
+        if (!member) return
+
+        if (retain) {
+            if (
+                state.status === 'playing' &&
+                (state.statuses[uid] === 'playing' || state.statuses[uid] === 'ready') &&
+                !state.results[uid]
+            ) {
+                const result: GameplayResult = {
+                    grade: 'fail',
+                    disqualified: true,
+                    arcadeScore: 0,
+                    accuracyScore: 0,
+                    combo: 0,
+                    perfect: 0,
+                    great: 0,
+                    good: 0,
+                    miss: 0,
+                    totalCount: 0,
+                }
+
+                state.results[uid] = result
+                if (announce) this.sendResult(uid, result)
+            }
+
+            state.statuses[uid] = 'waiting'
+
+            if (announce) {
+                this.sendAll({
+                    type: 'removeUser',
+                    user: member.roomUser,
+                })
+            }
+        } else {
+            state.members = state.members.filter((entry) => entry.id !== uid)
+            delete state.statuses[uid]
+            delete state.results[uid]
+
+            if (announce) {
+                this.sendAll({
+                    type: 'removeUser',
+                    user: member.roomUser,
+                })
+            }
+        }
+
+        if (announce) this.pushScoreboard()
+
+        await this.save()
+        await this.maybeFinishRound(true)
+        await this.save()
+
+        if (this.activeSocketCount() === 0) {
+            await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
+        } else {
+            await this.scheduleNextAlarm()
+        }
+    }
+
+    private closing = new WeakSet<WebSocket>()
+
+    private socketsOf = (uid: string) =>
+        this.ctx.getWebSockets().filter(
+            (socket) =>
+                !this.closing.has(socket) &&
+                (socket.deserializeAttachment() as { userId?: string } | null)?.userId === uid,
+        )
+
+    private send(ws: WebSocket, event: Ev) {
+        try {
+            ws.send(JSON.stringify(event))
+        } catch {
+            // Socket already closed.
+        }
+    }
+
+    private sendTo(uid: string, event: Ev) {
+        for (const socket of this.socketsOf(uid)) {
+            this.send(socket, event)
+        }
+    }
+
+    private sendAll(event: Ev) {
+        for (const member of this.st.members) {
+            this.sendTo(member.id, event)
+        }
+    }
+
+    private sendExcept(uid: string, event: Ev) {
+        for (const member of this.st.members) {
+            if (member.id !== uid) {
+                this.sendTo(member.id, event)
+            }
+        }
+    }
+
+    private sendHost(event: Ev) {
+        this.sendTo(this.st.hostId, event)
+    }
+
+    private resync(uid: string) {
+        this.sendTo(uid, this.view(uid))
+    }
+
+    private async save(): Promise<void> {
+        await this.ctx.storage.put('st', this.st)
+    }
+
+    private async syncLobby(): Promise<void> {
+        const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName('main'))
+
+        await lobby.upsert({
+            name: this.st.name,
+            title: getRoomTitle(this.st.settings, this.st.edition, this.st.hostName),
+            subtitle: this.subtitle(),
+            master: this.st.hostName,
+            hostId: this.st.hostId,
+            visibility: this.st.settings.visibility,
         })
     }
 }
