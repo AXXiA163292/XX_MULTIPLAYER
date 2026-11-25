@@ -4799,7 +4799,7 @@ await sendChatEmailNotifications(env, newMessage)
             const stub = roomStub(env, name)
             const key = req.headers.get('Sonolus-Room-Key')
                         const authSession = await sessionOf(req, env, url)
-            console.error('[ROOM CONFIG AUTH]', {
+            console.log('[ROOM CONFIG AUTH]', {
                 signedHandle: user.handle,
                 sessionHandle: authSession?.user.handle ?? null,
                 sessionIdMatches: authSession?.user.id === user.id,
