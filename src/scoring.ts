@@ -84,9 +84,10 @@ export function roundPoints(
         1.0
 
     const rawPp = baseConstant * Math.pow(accuracyRatio, 2) * gradeBonus * 10
-    return Math.ceil(rawPp)
+    return Math.round(rawPp * 10) / 10
 }
 
+/** Standings score: rounded up on PP. */
 export function fmtScore(score: number, mode: ScoringMode): string {
     const safe = Number.isFinite(score) ? score : 0
     if (mode === 'rankedMatch') {
@@ -95,12 +96,14 @@ export function fmtScore(score: number, mode: ScoringMode): string {
     return `${Math.ceil(safe)}pp`
 }
 
+/** Individual round score: exact 1-decimal PP without rounding up. */
 export function fmtIndividualScore(pts: number, mode: ScoringMode): string {
     const safe = Number.isFinite(pts) ? pts : 0
     if (mode === 'rankedMatch') {
         return `${Math.round(safe)}`
     }
-    return `${safe.toFixed(1)}pp`
+    const truncatedOrTenths = Math.round(safe * 10) / 10
+    return `${truncatedOrTenths.toFixed(1)}pp`
 }
 
 export function fmtDetail(
