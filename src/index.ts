@@ -4749,13 +4749,9 @@ await sendChatEmailNotifications(env, newMessage)
                 hostHandle: session.user.handle,
             }
 
-            if (session.user.handle === TOURNAMENT_HOST_HANDLE) {
-                await roomStub(env, name).reserve(name, reservation)
-            } else {
-                await env.LOBBY
-                    .get(env.LOBBY.idFromName('main'))
-                    .reserveHostRoom(session.user.id, name, reservation)
-            }
+                        await env.LOBBY
+                .get(env.LOBBY.idFromName('main'))
+                .reserveHostRoom(session.user.id, name, reservation)
 
             return json({ name, key })
         }
