@@ -70,7 +70,7 @@ const titleOption = {
 
 const tierOption = {
     query: 'tier',
-    name: 'Room title',
+    name: 'Division',
     description: 'Pick the rank of this room.',
     required: false,
     type: 'select' as const,
@@ -166,10 +166,7 @@ export const roomForms = (isTournamentHost = false) =>
                         : [tournamentScoringOption, tournamentVisibilityOption],
         }))
 
-export const roomFormsForType = (
-    type: RoomType,
-    isTournamentHost = false,
-) => roomForms(isTournamentHost).filter((form) => form.type === type)
+export const roomFormsForType = (type: RoomType, isTournamentHost = false) => roomForms(isTournamentHost).filter((form) => form.type === type).map((form) => type === 'rankedRoom' ? {...form,options:[vocalTypeOption]} : form)
 
 export type RoomSettings = {
     type: RoomType
