@@ -29,6 +29,8 @@ import {
     type RoundRecord,
 } from './scoring.ts'
 import {
+    getAvailableEditions,
+    getLiveEdition,
     getEditionData,
     getUltimateEditionData,
     getSavedUltimatePicks,
@@ -81,6 +83,7 @@ type RoomState = {
     name: string
     createdAt: number
     edition: string
+    editionOptions: string[]
     divisions: Record<string, string>
     poolCharts: SheetChart[]
     reserved: Reservation | null
@@ -108,6 +111,7 @@ const fresh = (): RoomState => ({
     name: '',
     createdAt: 0,
     edition: '',
+    editionOptions: [],
     divisions: {},
     poolCharts: [],
     reserved: null,
@@ -117,6 +121,7 @@ const fresh = (): RoomState => ({
     hostHandle: '',
     settings: {
         type: 'groupStage',
+        edition: '',
         scoring: 'pp',
         roundMode: 'tournament',
         group: 'A',
@@ -124,7 +129,7 @@ const fresh = (): RoomState => ({
         visibility: 'locked',
         random: false,
         tier: 'master',
-                customSongs: 'off',
+        customSongs: 'off',
         vocalType: 'sekai',
     },
     status: 'selecting',
@@ -132,7 +137,7 @@ const fresh = (): RoomState => ({
     levelInfo: null,
     levelOptions: [],
     suggestions: [],
-        members: [],
+    members: [],
     ultimateParticipants: [],
     ultimateRoundIndex: 0,
     ultimatePicksSaved: false,
@@ -188,33 +193,33 @@ function buildRoundLabel(
         return `Freeplay ${freeplayCount}`
     }
 
-            const ultimateIndex = ultimateRounds.findIndex((chart) => sameLevel(level, chart))
+    const ultimateIndex = ultimateRounds.findIndex((chart) => sameLevel(level, chart))
 
-if (ultimateIndex >= 0) {
-    const chartId = ultimateRounds[ultimateIndex]!.id.toUpperCase()
+    if (ultimateIndex >= 0) {
+        const chartId = ultimateRounds[ultimateIndex]!.id.toUpperCase()
 
-    const name = chartId.startsWith('WINTER-')
-        ? 'Winter'
-        : chartId.startsWith('SPRING-')
-            ? 'Spring'
-            : chartId.startsWith('SUMMER-')
-                ? 'Summer'
-                : chartId.startsWith('FALL-')
-                    ? 'Fall'
-                    : chartId === 'F1'
-                        ? 'Contest Winner'
-                        : 'XX! Ultimate'
+        const name = chartId.startsWith('WINTER-')
+            ? 'Winter'
+            : chartId.startsWith('SPRING-')
+                ? 'Spring'
+                : chartId.startsWith('SUMMER-')
+                    ? 'Summer'
+                    : chartId.startsWith('FALL-')
+                        ? 'Fall'
+                        : chartId === 'F1'
+                            ? 'Contest Winner'
+                            : 'XX! Ultimate'
 
-    const base = `Round ${ultimateIndex + 1} · ${name}`
+        const base = `Round ${ultimateIndex + 1} · ${name}`
 
-    if (kind === 'tournament') return base
+        if (kind === 'tournament') return base
 
-    const rewindCount = priorHistory.filter(
-        (record) => (record.roundKind ?? 'tournament') === 'rewind' && sameLevel(record.level, level),
-    ).length + 1
+        const rewindCount = priorHistory.filter(
+            (record) => (record.roundKind ?? 'tournament') === 'rewind' && sameLevel(record.level, level),
+        ).length + 1
 
-    return rewindCount === 1 ? `${base} • Rewind` : `${base} • Rewind ${rewindCount}`
-}
+        return rewindCount === 1 ? `${base} • Rewind` : `${base} • Rewind ${rewindCount}`
+    }
 
     const targetKey = songKeyOf(level)
     const tournamentRounds = priorHistory.filter((r) => (r.roundKind ?? 'tournament') === 'tournament')
@@ -290,21 +295,6 @@ function suggestionsFromCharts(
 function randomChart(charts: SheetChart[]): SheetChart {
     if (!charts.length) throw new Error('Ultimate seasonal pool is empty.')
     return charts[Math.floor(Math.random() * charts.length)]!
-}
-
-async function songPoolSuggestions(
-    type: RoomSettings['type'],
-    userId: string,
-) {
-    if (isOpenType(type)) return []
-
-    try {
-        const edition = await getEditionData()
-        return suggestionsFromCharts(chartsForType(edition, type), userId)
-    } catch (error) {
-        console.error('Could not load tournament songs:', error)
-        return []
-    }
 }
 
 function sameLevel(
@@ -574,9 +564,12 @@ export class Room extends DurableObject<Env> {
                     ...(saved?.settings ?? {}),
                 },
                 edition: typeof saved?.edition === 'string' ? saved.edition : '',
+                editionOptions: Array.isArray(saved?.editionOptions)
+                    ? saved.editionOptions.filter((value): value is string => typeof value === 'string')
+                    : [],
                 divisions: cleanDivisions(saved?.divisions),
                 poolCharts: cleanPoolCharts(saved?.poolCharts),
-                                ultimateParticipants: Array.isArray(saved?.ultimateParticipants)
+                ultimateParticipants: Array.isArray(saved?.ultimateParticipants)
                     ? saved.ultimateParticipants.filter((x): x is string => typeof x === 'string')
                     : [],
                 ultimateRoundIndex: Number.isInteger(saved?.ultimateRoundIndex)
@@ -648,6 +641,7 @@ export class Room extends DurableObject<Env> {
             }
 
             this.st.settings.group ||= 'A'
+            this.st.settings.edition ||= this.st.edition || getLiveEdition()
             this.st.settings.title ??= ''
             this.st.settings.random = this.st.settings.random === true
 
@@ -656,7 +650,7 @@ export class Room extends DurableObject<Env> {
                     this.st.settings.type === 'casualRoom' ? 'public' : 'locked'
             }
 
-                        if (!['groupStage', 'final', 'casualRoom', 'rankedRoom', 'ultimateEdition'].includes(this.st.settings.type)) {
+            if (!['groupStage', 'final', 'casualRoom', 'rankedRoom', 'ultimateEdition'].includes(this.st.settings.type)) {
                 this.st.settings.type = 'casualRoom'
             }
 
@@ -726,41 +720,46 @@ export class Room extends DurableObject<Env> {
     }
 
     private computeRoundKind(
-    level: Sil | null | undefined,
-    priorHistory: RoundRecord[],
-    pool: SheetChart[] = this.st.poolCharts,
-): RoundKind {
-    if (this.st.settings.type === 'ultimateEdition') {
-        const index = pool.findIndex((chart) => sameLevel(level, chart))
-        if (index < 0) return 'freeplay'
-
-        const alreadyPlayed = priorHistory.some(
-            (record) => sameLevel(record.level, level),
+        level: Sil | null | undefined,
+        priorHistory: RoundRecord[],
+        pool: SheetChart[] = this.st.poolCharts,
+    ): RoundKind {
+        const editionHistory = priorHistory.filter(
+            (record) => !record.edition || record.edition === this.st.edition,
         )
 
-        if (alreadyPlayed) return 'rewind'
-        return index === this.st.ultimateRoundIndex ? 'tournament' : 'freeplay'
-    }
+        if (this.st.settings.type === 'ultimateEdition') {
+            const index = pool.findIndex((chart) => sameLevel(level, chart))
+            if (index < 0) return 'freeplay'
 
-    if (isOpenType(this.st.settings.type)) {
-        return 'tournament'
-    }
+            const alreadyPlayed = editionHistory.some(
+                (record) => sameLevel(record.level, level),
+            )
 
-    if (pool.length === 0) return 'freeplay'
+            if (alreadyPlayed) return 'rewind'
+            return index === this.st.ultimateRoundIndex ? 'tournament' : 'freeplay'
+        }
 
-    const inPool = this.isPoolSong(level, pool)
-    const hasPlayedPoolSongBefore = priorHistory.some((rec) =>
-        this.isPoolSong(rec.level, pool),
-    )
+        if (isOpenType(this.st.settings.type)) {
+            return 'tournament'
+        }
 
-    if (inPool) {
-        const alreadyPlayedThisSong = priorHistory.some((rec) =>
-            sameLevel(rec.level, level),
+        if (pool.length === 0) return 'freeplay'
+
+        const inPool = this.isPoolSong(level, pool)
+        const hasPlayedPoolSongBefore = editionHistory.some((record) =>
+            this.isPoolSong(record.level, pool),
         )
-        return alreadyPlayedThisSong ? 'rewind' : 'tournament'
-    }
 
-    return hasPlayedPoolSongBefore ? 'freeplay' : 'warmup'
+        if (inPool) {
+            const alreadyPlayedThisSong = editionHistory.some((record) =>
+                sameLevel(record.level, level),
+            )
+
+            return alreadyPlayedThisSong ? 'rewind' : 'tournament'
+        }
+
+        return hasPlayedPoolSongBefore ? 'freeplay' : 'warmup'
     }
 
     private activeSocketCount(): number {
@@ -836,7 +835,7 @@ export class Room extends DurableObject<Env> {
         })
     }
 
-        async closeForOwner(ownerId: string): Promise<void> {
+    async closeForOwner(ownerId: string): Promise<void> {
         const currentOwner = this.st.configured
             ? this.st.hostId
             : this.st.reserved?.hostId
@@ -844,7 +843,7 @@ export class Room extends DurableObject<Env> {
         if (!currentOwner || currentOwner !== ownerId) return
 
         await this.expireAndDestroy('replaced by a newer room')
-        }
+    }
 
     async reserve(name: string, reservation: Reservation): Promise<void> {
         this.st = {
@@ -870,7 +869,7 @@ export class Room extends DurableObject<Env> {
 
         const reservation = this.st.reserved
 
-                if (
+        if (
             !reservation ||
             reservation.key !== key ||
             reservation.hostId !== host.id ||
@@ -890,72 +889,55 @@ export class Room extends DurableObject<Env> {
             settings.title = defaultCustomRoomTitle(host.name)
         }
 
-                let editionData: EditionData | null = null
+        const editionOptions = await getAvailableEditions().catch((error) => {
+            console.error('[ROOM CONFIG] Could not load edition options:', error)
+            return [settings.edition || getLiveEdition()]
+        })
+
+        this.st.editionOptions = editionOptions
+
+        let editionData: EditionData | null = null
         let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
-        let ultimatePicks: UltimatePicks | null = null
         let hadSavedUltimatePicks = false
         let poolCharts: SheetChart[] = []
 
         try {
-    if (settings.type === 'ultimateEdition') {
-        ultimateData = await getUltimateEditionData()
+            if (settings.type === 'ultimateEdition') {
+                ultimateData = await getUltimateEditionData(settings.edition)
 
-        const savedPicks = await getSavedUltimatePicks(
-            this.env,
-            ultimateData.edition,
-        )
+                const savedPicks = await getSavedUltimatePicks(
+                    this.env,
+                    ultimateData.edition,
+                )
 
-        hadSavedUltimatePicks = !!savedPicks
+                hadSavedUltimatePicks = !!savedPicks
 
-        const seasonalPicks: Partial<UltimatePicks> = {}
+                const seasonalPicks: Partial<UltimatePicks> = {}
 
-        for (const season of ['winter', 'spring', 'summer', 'fall'] as const) {
-            const saved = savedPicks?.[season]
-            const available = ultimateData.seasons[season]
+                for (const season of ['winter', 'spring', 'summer', 'fall'] as const) {
+                    const saved = savedPicks?.[season]
+                    const available = ultimateData.seasons[season]
 
-            if (saved) {
-                seasonalPicks[season] = saved
-            } else if (available.length > 0) {
-                seasonalPicks[season] = randomChart(available)
-            }
-        }
+                    if (saved) {
+                        seasonalPicks[season] = saved
+                    } else if (available.length > 0) {
+                        seasonalPicks[season] = randomChart(available)
+                    }
+                }
 
-        if (
-            seasonalPicks.winter &&
-            seasonalPicks.spring &&
-            seasonalPicks.summer &&
-            seasonalPicks.fall
-        ) {
-            ultimatePicks = {
-                winter: seasonalPicks.winter,
-                spring: seasonalPicks.spring,
-                summer: seasonalPicks.summer,
-                fall: seasonalPicks.fall,
-            }
-        }
-
-        poolCharts = [
-            ...(['winter', 'spring', 'summer', 'fall'] as const)
-                .flatMap((season) => seasonalPicks[season] ? [seasonalPicks[season]!] : []),
-            ...(ultimateData.contestWinner ? [ultimateData.contestWinner] : []),
-            ...(ultimateData.ultimate ? [ultimateData.ultimate] : []),
-        ]
-    } else if (!isOpenType(settings.type)) {
-        editionData = await getEditionData()
-        poolCharts = chartsForType(editionData, settings.type)
-    }
-} catch (error) {
-    console.error(
-        '[ROOM CONFIG] Edition sheet failure:',
-        error instanceof Error ? error.message : String(error),
-        error instanceof Error ? error.stack : '',
-    )
-    return false
-}else if (!isOpenType(settings.type)) {
-                editionData = await getEditionData()
+                poolCharts = [
+                    ...(['winter', 'spring', 'summer', 'fall'] as const)
+                        .flatMap((season) =>
+                            seasonalPicks[season] ? [seasonalPicks[season]!] : [],
+                        ),
+                    ...(ultimateData.contestWinner ? [ultimateData.contestWinner] : []),
+                    ...(ultimateData.ultimate ? [ultimateData.ultimate] : []),
+                ]
+            } else if (settings.type === 'groupStage' || settings.type === 'final') {
+                editionData = await getEditionData(settings.edition)
                 poolCharts = chartsForType(editionData, settings.type)
             }
-                } catch (error) {
+        } catch (error) {
             console.error(
                 '[ROOM CONFIG] Edition sheet failure:',
                 error instanceof Error ? error.message : String(error),
@@ -964,33 +946,19 @@ export class Room extends DurableObject<Env> {
             return false
         }
 
-        if (ultimateData) {
-            this.st.edition = ultimateData.edition
-            this.st.divisions = {}
-            this.st.ultimateParticipants = ultimateData.participants
-            this.st.ultimateRoundIndex = 0
-            this.st.ultimatePicksSaved = hadSavedUltimatePicks
-            this.st.poolCharts = poolCharts
-            this.st.suggestions = []
-        } else if (editionData) {
-            this.st.edition = editionData.edition
-            this.st.divisions = cleanDivisions(editionData.divisions)
-            this.st.ultimateParticipants = []
-            this.st.ultimateRoundIndex = 0
-            this.st.ultimatePicksSaved = false
-            this.st.poolCharts = poolCharts
-            this.st.suggestions = suggestionsFromCharts(poolCharts, host.id)
-        } else {
-            this.st.edition ||= 'Final'
-            this.st.divisions = {}
-            this.st.ultimateParticipants = []
-            this.st.ultimateRoundIndex = 0
-            this.st.ultimatePicksSaved = false
-            this.st.poolCharts = []
-            this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
-        }
+        this.st.edition = isOpenType(settings.type) ? '' : settings.edition
+        this.st.divisions = editionData
+            ? cleanDivisions(editionData.divisions)
+            : {}
+        this.st.ultimateParticipants = ultimateData?.participants ?? []
+        this.st.ultimateRoundIndex = 0
+        this.st.ultimatePicksSaved = hadSavedUltimatePicks
+        this.st.poolCharts = poolCharts
+        this.st.suggestions = suggestionsFromCharts(poolCharts, host.id)
 
-        const firstPoolChart = !isOpenType(settings.type) ? (poolCharts[0] ?? null) : null
+        const firstPoolChart = !isOpenType(settings.type)
+            ? (poolCharts[0] ?? null)
+            : null
 
         this.st.createdAt = Date.now()
         this.st.configured = true
@@ -1272,7 +1240,7 @@ export class Room extends DurableObject<Env> {
         const isHost = uid === state.hostId
 
         switch (cmd.type) {
-                                        case 'updateLevel': {
+            case 'updateLevel': {
                 if (
                     !isHost ||
                     state.status !== 'selecting' ||
@@ -1334,14 +1302,84 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                                if (next.type === 'rankedRoom') {
+                const editionChanged =
+                    next.edition !== state.settings.edition &&
+                    !isOpenType(next.type)
+
+                if (editionChanged) {
+                    try {
+                        let nextPool: SheetChart[] = []
+                        let nextDivisions: Record<string, string> = {}
+                        let nextParticipants: string[] = []
+                        let nextPicksSaved = false
+
+                        if (next.type === 'ultimateEdition') {
+                            const data = await getUltimateEditionData(next.edition)
+                            const saved = await getSavedUltimatePicks(this.env, data.edition)
+
+                            nextPicksSaved = !!saved
+                            const picks: Partial<UltimatePicks> = {}
+
+                            for (const season of ['winter', 'spring', 'summer', 'fall'] as const) {
+                                if (saved?.[season]) {
+                                    picks[season] = saved[season]
+                                } else if (data.seasons[season].length > 0) {
+                                    picks[season] = randomChart(data.seasons[season])
+                                }
+                            }
+
+                            nextPool = [
+                                ...(['winter', 'spring', 'summer', 'fall'] as const)
+                                    .flatMap((season) => picks[season] ? [picks[season]!] : []),
+                                ...(data.contestWinner ? [data.contestWinner] : []),
+                                ...(data.ultimate ? [data.ultimate] : []),
+                            ]
+
+                            nextParticipants = data.participants
+                        } else {
+                            const data = await getEditionData(next.edition)
+                            nextPool = chartsForType(data, next.type)
+                            nextDivisions = cleanDivisions(data.divisions)
+                        }
+
+                        state.edition = next.edition
+                        state.poolCharts = nextPool
+                        state.divisions = nextDivisions
+                        state.ultimateParticipants = nextParticipants
+                        state.ultimateRoundIndex = 0
+                        state.ultimatePicksSaved = nextPicksSaved
+                        state.suggestions = suggestionsFromCharts(nextPool, state.hostId)
+                        state.level = nextPool[0]
+                            ? {
+                                address: nextPool[0].address,
+                                name: nextPool[0].name,
+                            }
+                            : null
+                        state.levelInfo = state.level
+                            ? await fetchLevelInfo(state.level)
+                            : null
+                        state.levelOptions = []
+                        state.results = {}
+                        state.round = null
+
+                        this.sendAll({
+                            type: 'updateLevel',
+                            level: state.level,
+                        })
+                    } catch (error) {
+                        console.error('[ROOM] Could not change edition:', error)
+                        return this.resync(uid)
+                    }
+                }
+
+                if (next.type === 'rankedRoom') {
                     next.tier = state.settings.tier
                     next.customSongs = state.settings.customSongs
-                                }
+                }
 
-                                const randomChanged = next.random !== state.settings.random
+                const randomChanged = next.random !== state.settings.random
                 const modeChanged = next.scoring !== state.settings.scoring
-        
+
                 if (next.type === 'casualRoom' && !next.title) {
                     next.title = defaultCustomRoomTitle(state.hostName)
                 }
@@ -1356,12 +1394,12 @@ export class Room extends DurableObject<Env> {
                     optionValues: serializeSettings(state.settings),
                 })
 
-                    this.sendAll({
+                this.sendAll({
                     type: 'updateTitle',
                     title: getRoomTitle(state.settings, state.edition, state.hostName),
                 })
 
-                if (modeChanged) {
+                if (modeChanged || editionChanged) {
                     this.sendAll({
                         type: 'updateScoreboardDescription',
                         scoreboardDescription: '',
@@ -1724,7 +1762,8 @@ export class Room extends DurableObject<Env> {
             if (state.settings.type === 'rankedRoom') {
                 let pick: SheetChart | null = null
 
-                try {                    pick = await pickRankedLevel(
+                try {
+                    pick = await pickRankedLevel(
                         state.settings.tier as RankedTier,
                         state.settings.customSongs,
                         state.settings.vocalType ?? 'virtualSinger',
@@ -1793,11 +1832,15 @@ export class Room extends DurableObject<Env> {
                 return this.resync(uid)
             }
 
-            const kind = this.computeRoundKind(state.level, state.history)
+            const editionHistory = state.history.filter(
+                (record) => !record.edition || record.edition === state.edition,
+            )
+
+            const kind = this.computeRoundKind(state.level, editionHistory)
             const label = buildRoundLabel(
                 state.level,
                 kind,
-                state.history,
+                editionHistory,
                 isOpenType(state.settings.type),
                 state.settings.type === 'ultimateEdition' ? state.poolCharts : [],
             )
@@ -1835,7 +1878,7 @@ export class Room extends DurableObject<Env> {
 
             this.pushScoreboard()
             this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
-                } else if (current === 'playing' && next === 'selecting') {
+        } else if (current === 'playing' && next === 'selecting') {
             let completedRound: RoundRecord | null = null
 
             if (Object.keys(state.results).length > 0) {
@@ -1861,7 +1904,7 @@ export class Room extends DurableObject<Env> {
                 if (completedIndex === state.ultimateRoundIndex) {
                     state.ultimateRoundIndex++
 
-                    if (state.ultimateRoundIndex < 6) {
+                    if (state.ultimateRoundIndex < state.poolCharts.length) {
                         const nextChart = state.poolCharts[state.ultimateRoundIndex]!
                         state.level = { address: nextChart.address, name: nextChart.name }
                         state.levelInfo = await fetchLevelInfo(state.level)
@@ -1882,29 +1925,33 @@ export class Room extends DurableObject<Env> {
             }
 
             this.diag('status-selecting-from-playing')
-                    }
+        }
     }
 
     private makeRoundRecord(priorHistory: RoundRecord[] = this.st.history): RoundRecord {
         const info = this.st.levelInfo
+        const editionHistory = priorHistory.filter(
+            (record) => !record.edition || record.edition === this.st.edition,
+        )
         const kind: RoundKind =
-            this.st.round?.kind ?? this.computeRoundKind(this.st.level, priorHistory)
+            this.st.round?.kind ?? this.computeRoundKind(this.st.level, editionHistory)
         const label =
             this.st.round?.label ||
             buildRoundLabel(
                 this.st.level,
                 kind,
-                priorHistory,
+                editionHistory,
                 isOpenType(this.st.settings.type),
                 this.st.settings.type === 'ultimateEdition' ? this.st.poolCharts : [],
             )
         const rewindEligibleUserIds =
             kind === 'rewind'
-                ? [...unresolvedXUsersForSong(this.st.level, priorHistory)]
+                ? [...unresolvedXUsersForSong(this.st.level, editionHistory)]
                 : []
 
         return {
             level: this.st.level,
+            edition: this.st.edition,
             levelTitle: info?.title,
             levelTag: info?.firstTag,
             levelRating: info?.rating ?? undefined,
@@ -1927,19 +1974,37 @@ export class Room extends DurableObject<Env> {
     private async maybeSaveUltimatePicks(): Promise<void> {
         const state = this.st
 
-        if (state.settings.type !== 'ultimateEdition' || state.ultimateRoundIndex < 6 || state.ultimatePicksSaved || state.poolCharts.length < 6) return
+        if (
+            state.settings.type !== 'ultimateEdition' ||
+            state.ultimateRoundIndex < state.poolCharts.length ||
+            state.ultimatePicksSaved
+        ) return
 
         const assignedPresent = state.members.some(
-            (member) => state.ultimateParticipants.includes(member.handle) && this.socketsOf(member.id).length > 0,
+            (member) =>
+                state.ultimateParticipants.includes(member.handle) &&
+                this.socketsOf(member.id).length > 0,
         )
 
         if (!assignedPresent) return
 
+        const findSeason = (season: 'winter' | 'spring' | 'summer' | 'fall') =>
+            state.poolCharts.find((chart) =>
+                chart.id.toUpperCase().startsWith(`${season.toUpperCase()}-`),
+            )
+
+        const winter = findSeason('winter')
+        const spring = findSeason('spring')
+        const summer = findSeason('summer')
+        const fall = findSeason('fall')
+
+        if (!winter || !spring || !summer || !fall) return
+
         const picks: UltimatePicks = {
-            winter: state.poolCharts[0]!,
-            spring: state.poolCharts[1]!,
-            summer: state.poolCharts[2]!,
-            fall: state.poolCharts[3]!,
+            winter,
+            spring,
+            summer,
+            fall,
         }
 
         try {
@@ -2018,40 +2083,6 @@ export class Room extends DurableObject<Env> {
         this.pushScoreboard()
     }
 
-        private async maybeSaveUltimatePicks(): Promise<void> {
-        const state = this.st
-
-        if (
-            state.settings.type !== 'ultimateEdition' ||
-            state.ultimateRoundIndex < 6 ||
-            state.ultimatePicksSaved ||
-            state.poolCharts.length < 6
-        ) return
-
-        const assignedPresent = state.members.some(
-            (member) =>
-                state.ultimateParticipants.includes(member.handle) &&
-                this.socketsOf(member.id).length > 0,
-        )
-
-        if (!assignedPresent) return
-
-        const picks: UltimatePicks = {
-            winter: state.poolCharts[0]!,
-            spring: state.poolCharts[1]!,
-            summer: state.poolCharts[2]!,
-            fall: state.poolCharts[3]!,
-        }
-
-        try {
-            await saveUltimatePicks(this.env, state.edition, picks)
-            state.ultimatePicksSaved = true
-            await this.save()
-        } catch (error) {
-            console.error('[Ultimate] Could not save completed picks:', error)
-        }
-        }
-
     private hostIsTournament(): boolean {
         const host = this.st.members.find((m) => m.id === this.st.hostId)
         return (host?.handle ?? '') === TOURNAMENT_HOST_HANDLE
@@ -2105,7 +2136,11 @@ export class Room extends DurableObject<Env> {
             master,
             lead: master,
             options: [
-                ...roomFormsForType(state.settings.type, this.hostIsTournament()),
+                ...roomFormsForType(
+                    state.settings.type,
+                    this.hostIsTournament(),
+                    state.editionOptions,
+                ),
                 ...(isHost ? [closeRoomForm] : []),
             ],
             optionValues: serializeSettings(state.settings),
@@ -2287,7 +2322,7 @@ export class Room extends DurableObject<Env> {
     private getDivisions(members: Member[]) {
         const type = this.st.settings.type
 
-                        if (isOpenType(type)) {
+        if (isOpenType(type)) {
             return [{ title: '', members }]
         }
 
@@ -2304,7 +2339,7 @@ export class Room extends DurableObject<Env> {
                 ...(unassigned.length ? [{ title: 'Unassigned', members: unassigned }] : []),
             ]
         }
-        
+
         if (type === 'groupStage') {
             const groupNames = [
                 ...new Set(
