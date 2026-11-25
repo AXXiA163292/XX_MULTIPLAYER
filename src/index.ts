@@ -4705,12 +4705,20 @@ await sendChatEmailNotifications(env, newMessage)
             const name = randomId(8)
             const key = randomId(24)
 
-            await roomStub(env, name).reserve(name, {
+                        const reservation = {
                 key,
                 hostId: session.user.id,
                 hostName: session.user.name,
                 hostHandle: session.user.handle,
-            })
+            }
+
+            if (session.user.handle === TOURNAMENT_HOST_HANDLE) {
+                await roomStub(env, name).reserve(name, reservation)
+            } else {
+                await env.LOBBY
+                    .get(env.LOBBY.idFromName('main'))
+                    .reserveHostRoom(session.user.id, name, reservation)
+            }
 
             return json({ name, key })
         }
