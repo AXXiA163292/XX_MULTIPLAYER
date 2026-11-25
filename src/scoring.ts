@@ -5,7 +5,6 @@ export type RoundKind = 'tournament' | 'warmup' | 'rewind' | 'freeplay'
 
 export type RoundRecord = {
     level: Sil | null
-    edition?: string
     levelTitle?: string
     levelTag?: string
     levelRating?: number
@@ -30,7 +29,6 @@ export function isPlayerX(result: GameplayResult | undefined): boolean {
 export function formatGradeShortcut(result: GameplayResult | undefined): string {
     if (!result) return 'F'
     if (isPlayerX(result)) return 'X'
-
     switch (result.grade) {
         case 'allPerfect':
             return 'AP'
@@ -59,13 +57,9 @@ export function roundPoints(
     }
 
     const baseConstant =
-        typeof round?.levelConstant === 'number' &&
-        Number.isFinite(round.levelConstant) &&
-        round.levelConstant > 0
+        typeof round?.levelConstant === 'number' && Number.isFinite(round.levelConstant) && round.levelConstant > 0
             ? round.levelConstant
-            : typeof round?.levelRating === 'number' &&
-                Number.isFinite(round.levelRating) &&
-                round.levelRating > 0
+            : typeof round?.levelRating === 'number' && Number.isFinite(round.levelRating) && round.levelRating > 0
                 ? round.levelRating
                 : 30
 
@@ -95,21 +89,17 @@ export function roundPoints(
 
 export function fmtScore(score: number, mode: ScoringMode): string {
     const safe = Number.isFinite(score) ? score : 0
-
     if (mode === 'rankedMatch') {
         return `${Math.round(safe)}`
     }
-
     return `${Math.ceil(safe)}pp`
 }
 
 export function fmtIndividualScore(pts: number, mode: ScoringMode): string {
     const safe = Number.isFinite(pts) ? pts : 0
-
     if (mode === 'rankedMatch') {
         return `${Math.round(safe)}`
     }
-
     return `${safe.toFixed(1)}pp`
 }
 
@@ -162,12 +152,10 @@ export function unresolvedXUsersForSong(
 ): Set<string> {
     const targetKey = songKeyOf(level)
     const hasUnresolvedX = new Map<string, boolean>()
-
     if (!targetKey) return new Set()
 
     for (const rec of priorHistory) {
         if (songKeyOf(rec.level) !== targetKey) continue
-
         const kind: RoundKind = rec.roundKind ?? 'tournament'
         if (kind !== 'tournament' && kind !== 'rewind') continue
 
@@ -181,11 +169,9 @@ export function unresolvedXUsersForSong(
     }
 
     const eligible = new Set<string>()
-
     for (const [userId, activeX] of hasUnresolvedX.entries()) {
         if (activeX) eligible.add(userId)
     }
-
     return eligible
 }
 
@@ -199,11 +185,8 @@ export function totals(
         const rec = history[i]!
         const kind: RoundKind = rec.roundKind ?? 'tournament'
         const prior = history.slice(0, i)
-
         const eligibleForRewind =
-            kind === 'rewind'
-                ? unresolvedXUsersForSong(rec.level, prior)
-                : new Set<string>()
+            kind === 'rewind' ? unresolvedXUsersForSong(rec.level, prior) : new Set<string>()
 
         for (const [userId, res] of Object.entries(rec.results ?? {})) {
             map.set(userId, map.get(userId) ?? 0)
@@ -213,19 +196,13 @@ export function totals(
             }
 
             if (kind === 'tournament') {
-                map.set(
-                    userId,
-                    (map.get(userId) ?? 0) + roundPoints(res, mode, rec),
-                )
+                map.set(userId, (map.get(userId) ?? 0) + roundPoints(res, mode, rec))
                 continue
             }
 
             if (kind === 'rewind') {
                 if (eligibleForRewind.has(userId) && !isPlayerX(res)) {
-                    map.set(
-                        userId,
-                        (map.get(userId) ?? 0) + roundPoints(res, mode, rec),
-                    )
+                    map.set(userId, (map.get(userId) ?? 0) + roundPoints(res, mode, rec))
                 }
             }
         }
