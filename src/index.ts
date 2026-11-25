@@ -3305,8 +3305,9 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-        const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
-
+                const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
+        if (pfpMatch && req.method === 'GET') {
+            const handle = decodeURIComponent(pfpMatch[1]!).trim()
             const prefs = await getUserChatPrefs(env, handle)
             const keys = [
                 prefs.pfpKey,
