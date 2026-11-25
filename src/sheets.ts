@@ -527,11 +527,11 @@ function parseIndexSheet(rows: string[][]): {
     editionCol: number
     dataRows: string[][]
 } {
-    const headerRow = rows[1] ?? []
+    const headerRow = rows[0] ?? []
     const headers = headerRow.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => normalizeEditionLabel(cell))
     const editionCol = 0
-    const dataRows = rows.slice(2)
+    const dataRows = rows.slice(1)
 
     return { headers, normalized, editionCol, dataRows }
 }
