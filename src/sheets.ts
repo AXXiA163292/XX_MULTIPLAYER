@@ -518,49 +518,21 @@ function isGroupHeader(header: string): boolean {
 export async function getEditionData(): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
-            const headerIndex = rows.findIndex((row) =>
-        normalizeId(row[0]).toUpperCase() === 'EDITION',
-    )
-
-    if (headerIndex < 0 || headerIndex >= rows.length - 1) {
-        console.error(
-            '[INDEX DEBUG] First rows returned by Google Sheets:',
-            rows.slice(0, 10).map((row, index) => ({
-                row: index + 1,
-                cells: row.slice(0, 8),
-            })),
-        )
-        throw new Error(`[INDEX] Could not find the edition header row or its data rows in "${INDEX_SHEET_TAB}".`)
+    if (rows.length < 3) {
+        throw new Error(`The "${INDEX_SHEET_TAB}" tab must contain a title row, a header row and at least one edition row.`)
     }
 
-    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
+    const headers = rows[1]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
-    const dataRows = rows.slice(headerIndex + 1)
+    const dataRows = rows.slice(2)
 
     if (normalized[0] !== 'EDITION') {
         throw new Error(`[INDEX] Expected cell A2 to be "edition", received "${headers[0] ?? ''}".`)
     }
 
-    if (!normalized.includes('G1') || !normalized.includes('F1')) {
-        throw new Error(`[INDEX] Expected G1 and F1 columns in row 2 of "${INDEX_SHEET_TAB}".`)
-    }
-
-    let activeRow: string[] | null = null
-    for (let i = dataRows.length - 1; i >= 0; i--) {
-        if (normalizeId(dataRows[i]![0])) {
-            activeRow = dataRows[i]!
-            break
-        }
-    }
-
-    if (!activeRow) {
-        throw new Error(`No edition found in column A of "${INDEX_SHEET_TAB}".`)
-    }
+    const activeRow = dataRows[dataRows.length - 1]!
 
     const edition = normalizeId(activeRow[0])
-    if (!edition) {
-        throw new Error(`Current edition name in column A of "${INDEX_SHEET_TAB}" is empty.`)
-    }
 
     const groupStage: SheetChart[] = []
     const final: SheetChart[] = []
