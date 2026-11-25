@@ -9,9 +9,11 @@ import {
 import {
     closeRoomForm,
     defaultCustomRoomTitle,
+    filterEditionsForRoomType,
     normalizeCustomSongsMode,
     normalizeRoundMode,
     parseSettings,
+    pickClosestEdition,
     roomFormsForType,
     serializeSettings,
     type RoomSettings,
@@ -911,16 +913,28 @@ export class Room extends DurableObject<Env> {
             settings.title = defaultCustomRoomTitle(host.name)
         }
 
-        if (!isOpenType(settings.type)) {
-            settings.edition = settings.edition || getLiveEdition()
-        }
-
         const editionOptions = await getAvailableEditions().catch((error) => {
             console.error('[ROOM CONFIG] Could not load edition options:', error)
-            return [settings.edition || getLiveEdition()]
+            return [] as string[]
         })
 
         this.st.editionOptions = editionOptions
+
+        if (!isOpenType(settings.type)) {
+            const eligibleEditions = filterEditionsForRoomType(editionOptions, settings.type)
+            if (eligibleEditions.length === 0) {
+                console.error('[ROOM CONFIG] No eligible editions found:', {
+                    type: settings.type,
+                    editionOptions,
+                })
+                return false
+            }
+
+            const normalizedEdition = String(settings.edition ?? '').trim().toUpperCase()
+            settings.edition = eligibleEditions.includes(normalizedEdition)
+                ? normalizedEdition
+                : pickClosestEdition(eligibleEditions)
+        }
 
         let editionData: EditionData | null = null
         let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
@@ -1332,9 +1346,24 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
+                const eligibleForNext = !isOpenType(next.type)
+                    ? filterEditionsForRoomType(state.editionOptions, next.type)
+                    : []
+
+                if (!isOpenType(next.type) && eligibleForNext.length === 0) {
+                    return this.resync(uid)
+                }
+
+                if (!isOpenType(next.type)) {
+                    const normalizedNextEdition = String(next.edition ?? '').trim().toUpperCase()
+                    next.edition = eligibleForNext.includes(normalizedNextEdition)
+                        ? normalizedNextEdition
+                        : pickClosestEdition(eligibleForNext)
+                }
+
                 const editionChanged =
-                    next.edition !== state.settings.edition &&
-                    !isOpenType(next.type)
+                    !isOpenType(next.type) &&
+                    next.edition !== state.settings.edition
 
                 if (editionChanged) {
                     try {
