@@ -25,6 +25,85 @@ export const ROUND_MODES: Record<RoundKind, string> = {
     freeplay: 'Freeplay',
 }
 
+const SEASON_RANK: Record<string, number> = {
+    WINTER: 1,
+    SPRING: 2,
+    SUMMER: 3,
+    FALL: 4,
+}
+
+const SEASONAL_RE = /^(WINTER|SPRING|SUMMER|FALL)\s+(\d{4})$/
+const ULTIMATE_RE = /^ULTIMATE\s+(\d{4})$/
+
+function editionTimestamp(edition: string, now = new Date()): number {
+    const clean = edition.trim().toUpperCase()
+    const seasonal = clean.match(SEASONAL_RE)
+    if (seasonal) {
+        const season = seasonal[1]!
+        const year = Number(seasonal[2]!)
+        const monthBySeason: Record<string, number> = {
+            WINTER: 0,
+            SPRING: 3,
+            SUMMER: 6,
+            FALL: 9,
+        }
+        return Date.UTC(year, monthBySeason[season] ?? 0, 1)
+    }
+
+    const ultimate = clean.match(ULTIMATE_RE)
+    if (ultimate) {
+        const year = Number(ultimate[1]!)
+        // Anchor Ultimate editions around late year (November) to match annual edition timing
+        return Date.UTC(year, 10, 25)
+    }
+
+    return now.getTime()
+}
+
+export function pickClosestEdition(
+    candidates: string[],
+    now = new Date(),
+): string {
+    if (candidates.length === 0) return ''
+    const targetMs = now.getTime()
+
+    return [...candidates].sort((a, b) => {
+        const diffA = Math.abs(editionTimestamp(a, now) - targetMs)
+        const diffB = Math.abs(editionTimestamp(b, now) - targetMs)
+        if (diffA !== diffB) return diffA - diffB
+
+        const matchA = a.match(SEASONAL_RE)
+        const matchB = b.match(SEASONAL_RE)
+        if (matchA && matchB) {
+            const yearDiff = Number(matchB[2]) - Number(matchA[2])
+            if (yearDiff !== 0) return yearDiff
+            return (SEASON_RANK[matchB[1]!] ?? 0) - (SEASON_RANK[matchA[1]!] ?? 0)
+        }
+        return b.localeCompare(a)
+    })[0]!
+}
+
+export function filterEditionsForRoomType(
+    availableEditions: string[],
+    type: RoomType,
+): string[] {
+    const normalized = [...new Set(
+        availableEditions
+            .map((edition) => String(edition).trim().toUpperCase())
+            .filter(Boolean),
+    )]
+
+    if (type === 'ultimateEdition') {
+        return normalized.filter((edition) => ULTIMATE_RE.test(edition))
+    }
+
+    if (type === 'groupStage' || type === 'final') {
+        return normalized.filter((edition) => SEASONAL_RE.test(edition))
+    }
+
+    return normalized
+}
+
 export function defaultCustomRoomTitle(hostName?: string): string {
     const clean = String(hostName ?? '').trim()
     return clean ? `${clean}'s room` : 'Custom Room'
@@ -44,13 +123,15 @@ const customScoringOption = {
     def: DEFAULT_OPEN_SCORING,
 }
 
-const editionOption = (editions: string[]) => ({
+const editionOption = (editions: string[], defaultEdition?: string) => ({
     query: 'edition',
     name: 'Edition',
     description: 'Choose the championship edition.',
     required: false,
     type: 'select' as const,
-    def: editions[0] ?? '',
+    def: (defaultEdition && editions.includes(defaultEdition))
+        ? defaultEdition
+        : (pickClosestEdition(editions) || editions[0] || ''),
     values: editions.map((edition) => ({
         name: edition,
         title: edition,
@@ -166,11 +247,10 @@ export const roomForms = (
     isTournamentHost = false,
     availableEditions: string[] = [],
 ) => {
-    const editions = [...new Set(
-        availableEditions
-            .map((edition) => String(edition).trim().toUpperCase())
-            .filter(Boolean),
-    )]
+    const seasonalEditions = filterEditionsForRoomType(availableEditions, 'groupStage')
+    const ultimateEditions = filterEditionsForRoomType(availableEditions, 'ultimateEdition')
+    const defaultSeasonal = pickClosestEdition(seasonalEditions)
+    const defaultUltimate = pickClosestEdition(ultimateEditions)
 
     return (Object.keys(ROOM_TYPES) as RoomType[])
         .filter((type) => isTournamentHost || isOpenType(type))
@@ -180,29 +260,35 @@ export const roomForms = (
             requireConfirmation: false,
             options: type === 'groupStage'
                 ? [
-                    editionOption(editions),
+                    editionOption(seasonalEditions, defaultSeasonal),
                     groupOption,
                     tournamentScoringOption,
                     tournamentVisibilityOption,
                 ]
-                : type === 'final' || type === 'ultimateEdition'
+                : type === 'final'
                     ? [
-                        editionOption(editions),
+                        editionOption(seasonalEditions, defaultSeasonal),
                         tournamentScoringOption,
                         tournamentVisibilityOption,
                     ]
-                    : type === 'casualRoom'
+                    : type === 'ultimateEdition'
                         ? [
-                            titleOption,
-                            customScoringOption,
-                            customVisibilityOption,
-                            randomOption,
+                            editionOption(ultimateEditions, defaultUltimate),
+                            tournamentScoringOption,
+                            tournamentVisibilityOption,
                         ]
-                        : [
-                            tierOption,
-                            customSongsOption,
-                            vocalTypeOption,
-                        ],
+                        : type === 'casualRoom'
+                            ? [
+                                titleOption,
+                                customScoringOption,
+                                customVisibilityOption,
+                                randomOption,
+                            ]
+                            : [
+                                tierOption,
+                                customSongsOption,
+                                vocalTypeOption,
+                            ],
         }))
 }
 
@@ -335,6 +421,16 @@ export function parseSettings(
             existing?.edition ??
             ''
         ).trim().toUpperCase()
+
+    if (!open && edition) {
+        const isValidForType = roomType === 'ultimateEdition'
+            ? ULTIMATE_RE.test(edition)
+            : SEASONAL_RE.test(edition)
+
+        if (!isValidForType) {
+            return null
+        }
+    }
 
     const group = (
         p.get('group') ??
