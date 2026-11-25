@@ -150,6 +150,10 @@ const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
         return settings.title || defaultCustomRoomTitle(hostName)
     }
 
+    if (settings.type === 'ultimateEdition') {
+        return 'Ultimate Edition'
+    }
+
     return `${edition || 'Final'} Final`
 }
 
@@ -225,12 +229,10 @@ function sanitizeWireResult(result: GameplayResult): GameplayResult {
     }
 }
 
-function chartsForType(
-    edition: EditionData,
-    type: RoomSettings['type'],
-): SheetChart[] {
-    if (isOpenType(type)) return []
-    return type === 'groupStage' ? edition.groupStage : edition.final
+function chartsForType(edition: EditionData, type: RoomSettings['type']): SheetChart[] {
+    if (type === 'groupStage') return edition.groupStage
+    if (type === 'final') return edition.final
+    return []
 }
 
 function suggestionsFromCharts(
@@ -603,7 +605,7 @@ export class Room extends DurableObject<Env> {
                     this.st.settings.type === 'casualRoom' ? 'public' : 'locked'
             }
 
-            if (!['groupStage', 'final', 'casualRoom', 'rankedRoom'].includes(this.st.settings.type)) {
+                        if (!['groupStage', 'final', 'casualRoom', 'rankedRoom', 'ultimateEdition'].includes(this.st.settings.type)) {
                 this.st.settings.type = 'casualRoom'
             }
 
@@ -677,6 +679,9 @@ export class Room extends DurableObject<Env> {
         priorHistory: RoundRecord[],
         pool: SheetChart[] = this.st.poolCharts,
     ): RoundKind {
+                if (this.st.settings.type === 'ultimateEdition') {
+            return 'tournament'
+                }
         if (isOpenType(this.st.settings.type)) {
             return 'tournament'
         }
@@ -1130,18 +1135,10 @@ export class Room extends DurableObject<Env> {
         const isHost = uid === state.hostId
 
         switch (cmd.type) {
-            case 'updateLevel': {
-                if (
-                    !isHost ||
-                    state.status !== 'selecting' ||
-                    !isSil(cmd.level)
-                ) {
-                    return this.resync(uid)
-                }
-
-                if (
+                            if (
                     state.settings.type === 'rankedRoom' ||
-                    (state.settings.type === 'casualRoom' && state.settings.random)
+                    (state.settings.type === 'casualRoom' && state.settings.random) ||
+                    (state.settings.type === 'ultimateEdition' && state.hostHandle !== TOURNAMENT_HOST_HANDLE)
                 ) {
                     return this.resync(uid)
                 }
@@ -1196,13 +1193,9 @@ export class Room extends DurableObject<Env> {
                     next.customSongs = state.settings.customSongs
                                 }
 
-                const randomChanged = next.random !== state.settings.random
+                                const randomChanged = next.random !== state.settings.random
                 const modeChanged = next.scoring !== state.settings.scoring
-                const titleChanged =
-                    next.group !== state.settings.group ||
-                    next.title !== state.settings.title ||
-                    next.tier !== state.settings.tier
-
+        
                 if (next.type === 'casualRoom' && !next.title) {
                     next.title = defaultCustomRoomTitle(state.hostName)
                 }
@@ -1217,12 +1210,10 @@ export class Room extends DurableObject<Env> {
                     optionValues: serializeSettings(state.settings),
                 })
 
-                if (titleChanged) {
                     this.sendAll({
-                        type: 'updateTitle',
-                        title: getRoomTitle(state.settings, state.edition, state.hostName),
-                    })
-                }
+                    type: 'updateTitle',
+                    title: getRoomTitle(state.settings, state.edition, state.hostName),
+                })
 
                 if (modeChanged) {
                     this.sendAll({
@@ -2072,7 +2063,7 @@ export class Room extends DurableObject<Env> {
     private getDivisions(members: Member[]) {
         const type = this.st.settings.type
 
-        if (isOpenType(type)) {
+                if (isOpenType(type) || type === 'ultimateEdition') {
             return [{ title: '', members }]
         }
 
