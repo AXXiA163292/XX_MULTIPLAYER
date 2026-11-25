@@ -45,6 +45,7 @@ export const ROOM_TYPES = {
     final: 'Final',
     casualRoom: 'Custom Room',
     rankedRoom: 'Ranked Match',
+    ultimateEdition: 'Ultimate Edition',
 } as const
 
 export const RANKED_TIER_NAMES = [
