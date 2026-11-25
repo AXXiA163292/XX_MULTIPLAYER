@@ -54,12 +54,12 @@ export type SheetChart = {
     sekaiVocalVersion?: number
 }
 
-export type EditionData = {
+export type UltimateEditionData = {
     edition: string
-    groupStage: SheetChart[]
-    final: SheetChart[]
-    divisions: Record<string, string>
-    ultimateParticipants: string[]
+    seasons: Record<UltimateSeason, SheetChart[]>
+    contestWinner: SheetChart | null
+    ultimate: SheetChart | null
+    participants: string[]
 }
 
 export type UltimateSeason = 'winter' | 'spring' | 'summer' | 'fall'
@@ -515,25 +515,46 @@ function isGroupHeader(header: string): boolean {
     return /^[A-Z]$/i.test(header)
 }
 
-export async function getEditionData(): Promise<EditionData> {
+export function getLiveEdition(date = new Date()): string {
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Europe/Paris',
+        year: 'numeric',
+        month: 'numeric',
+    }).formatToParts(date)
+
+    const year = Number(parts.find((part) => part.type === 'year')?.value)
+    const month = Number(parts.find((part) => part.type === 'month')?.value)
+
+    if (month === 11) return `ULTIMATE ${year}`
+    if (month === 12) return `WINTER ${year + 1}`
+    if (month <= 2) return `WINTER ${year}`
+    if (month <= 5) return `SPRING ${year}`
+    if (month <= 8) return `SUMMER ${year}`
+    return `FALL ${year}`
+}
+
+export async function getEditionData(
+    requestedEdition = getLiveEdition(),
+): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
-        const headerIndex = rows.findIndex((row) => {
+    const headerIndex = rows.findIndex((row) => {
         const values = row.map((cell) => normalizeId(cell).toUpperCase())
-        return values.includes('G1') && values.includes('F1')
+        return values.includes('EDITION') && values.includes('G1') && values.includes('F1')
     })
 
-    if (headerIndex < 0 || headerIndex >= rows.length - 1) {
-        throw new Error(`[INDEX] Could not find the G1/F1 header row or edition data in "${INDEX_SHEET_TAB}".`)
+    if (headerIndex < 0) {
+        throw new Error(`[INDEX] Could not find the EDITION/G1/F1 header row in "${INDEX_SHEET_TAB}".`)
     }
 
     const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
     const dataRows = rows.slice(headerIndex + 1)
 
-    const activeRow = dataRows[dataRows.length - 1]!
-
-    const edition = normalizeId(activeRow[0])
+    const edition = normalizeId(requestedEdition).toUpperCase()
+    const activeRow = dataRows.find((row) =>
+        normalizeId(row[0]).toUpperCase() === edition,
+    ) ?? []
 
     const groupStage: SheetChart[] = []
     const final: SheetChart[] = []
@@ -542,7 +563,7 @@ export async function getEditionData(): Promise<EditionData> {
 
     for (let column = 0; column < headers.length; column++) {
         const header = normalized[column] ?? ''
-        const value = String(activeRow[column] ?? '').trim()
+        const value = normalizeId(activeRow[column])
         if (!header || !value) continue
 
         const groupMatch = header.match(/^G(\d+)$/)
@@ -611,30 +632,49 @@ function ultimatePicksKey(edition: string): string {
     return `ultimate-editions/${edition.toLowerCase().replace(/\s+/g, '-')}/picks.json`
 }
 
-export async function getUltimateEditionData(): Promise<UltimateEditionData> {
+export async function getUltimateEditionData(
+    requestedEdition = getLiveEdition(),
+): Promise<UltimateEditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
-    if (rows.length < 3) {
-        throw new Error('[ULTIMATE] Edition sheet must contain a title row, a header row and data rows.')
+    const headerIndex = rows.findIndex((row) => {
+        const values = row.map((cell) => normalizeId(cell).toUpperCase())
+        return values.includes('EDITION') && values.includes('G1') && values.includes('F1')
+    })
+
+    if (headerIndex < 0) {
+        throw new Error('[ULTIMATE] Could not find the EDITION/G1/F1 header row.')
     }
 
-    const headers = rows[1]!.map((cell) => normalizeId(cell))
+    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
-    const dataRows = rows.slice(2)
-    const ultimateRow = dataRows.find((row) =>
-        /^ULTIMATE\s+\d{4}$/i.test(normalizeId(row[0])),
-    )
-    if (!ultimateRow) throw new Error('[ULTIMATE] Could not find an ULTIMATE year row.')
+    const dataRows = rows.slice(headerIndex + 1)
 
-    const edition = normalizeId(ultimateRow[0]).toUpperCase()
-    const year = edition.match(/\d{4}$/)?.[0]
-    if (!year) throw new Error('[ULTIMATE] Invalid edition year.')
+    const edition = normalizeId(requestedEdition).toUpperCase()
+    if (!/^ULTIMATE\s+\d{4}$/.test(edition)) {
+        throw new Error(`[ULTIMATE] Invalid edition: ${edition}`)
+    }
+
+    const ultimateRow = dataRows.find(
+        (row) => normalizeId(row[0]).toUpperCase() === edition,
+    )
+
+    if (!ultimateRow) {
+        throw new Error(`[ULTIMATE] Could not find ${edition} in the Index sheet.`)
+    }
+
+    const year = edition.match(/\d{4}$/)![0]
 
     const getRow = (name: string) => dataRows.find(
         (row) => normalizeId(row[0]).toUpperCase() === name,
     )
 
-    const buildSeasonPool = (row: string[], season: string): SheetChart[] => {
+    const buildSeasonPool = (
+        row: string[] | undefined,
+        season: string,
+    ): SheetChart[] => {
+        if (!row) return []
+
         const charts: SheetChart[] = []
 
         for (const slot of [
@@ -643,63 +683,37 @@ export async function getUltimateEditionData(): Promise<UltimateEditionData> {
         ]) {
             const urlColumn = normalized.indexOf(slot)
             const levelColumn = normalized.indexOf(`${slot}PLAYLEVEL`)
+
             if (urlColumn < 0 || levelColumn < 0) continue
 
-                        const rawLevel = normalizeId(row[levelColumn])
+            const rawLevel = normalizeId(row[levelColumn])
             const rawUrl = normalizeId(row[urlColumn])
             const playLevel = parseEditionPlayLevel(rawLevel)
-
-            console.log('[ULTIMATE DEBUG]', {
-                season,
-                slot,
-                urlColumn,
-                levelColumn,
-                rawUrl,
-                rawLevel,
-                playLevel,
-            })
 
             if (playLevel === null || playLevel < 32) continue
 
             const chart = chartFromUrl(slot, rawUrl)
+            if (!chart) continue
 
-            console.log('[ULTIMATE DEBUG] Chart result:', {
-                season,
-                slot,
-                valid: !!chart,
-            })
-
-            if (chart) {
-                chart.id = `${season}-${slot}`
-                chart.playLevel = playLevel
-                charts.push(chart)
-            }
+            chart.id = `${season}-${slot}`
+            chart.playLevel = playLevel
+            charts.push(chart)
         }
 
         return charts
     }
 
     const seasons = {
-        winter: buildSeasonPool(getRow(`WINTER ${year}`) ?? [], 'WINTER'),
-        spring: buildSeasonPool(getRow(`SPRING ${year}`) ?? [], 'SPRING'),
-        summer: buildSeasonPool(getRow(`SUMMER ${year}`) ?? [], 'SUMMER'),
-        fall: buildSeasonPool(getRow(`FALL ${year}`) ?? [], 'FALL'),
+        winter: buildSeasonPool(getRow(`WINTER ${year}`), 'WINTER'),
+        spring: buildSeasonPool(getRow(`SPRING ${year}`), 'SPRING'),
+        summer: buildSeasonPool(getRow(`SUMMER ${year}`), 'SUMMER'),
+        fall: buildSeasonPool(getRow(`FALL ${year}`), 'FALL'),
     }
 
-    for (const season of Object.keys(seasons) as UltimateSeason[]) {
-        if (seasons[season].length === 0) {
-            throw new Error(`[ULTIMATE] No level 32+ charts found for ${season.toUpperCase()} ${year}.`)
-        }
-    }
-
-    const getFixedChart = (slot: 'F1' | 'F2'): SheetChart => {
+    const getFixedChart = (slot: 'F1' | 'F2'): SheetChart | null => {
         const column = normalized.indexOf(slot)
-        const chart = column >= 0
-            ? chartFromUrl(slot, normalizeId(ultimateRow[column]))
-            : null
-
-        if (!chart) throw new Error(`[ULTIMATE] Missing ${slot} in ${edition}.`)
-        return chart
+        if (column < 0) return null
+        return chartFromUrl(slot, normalizeId(ultimateRow[column]))
     }
 
     const uxColumn = normalized.indexOf('UX')
@@ -749,7 +763,7 @@ export async function saveUltimatePicks(
 }
 
 export async function getCurrentEdition(): Promise<string> {
-    return (await getEditionData()).edition
+    return getLiveEdition()
 }
 
 export function clearSheetCache(): void {
