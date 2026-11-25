@@ -150,9 +150,8 @@ export const closeRoomForm = {
 const isOpenType = (type: RoomType) =>
     type === 'casualRoom' || type === 'rankedRoom'
 
-export const roomForms = (isTournamentHost = false) =>
+export const roomForms = (_isTournamentHost = false) =>
     (Object.keys(ROOM_TYPES) as RoomType[])
-        .filter((type) => isTournamentHost || isOpenType(type))
         .map((type) => ({
             type,
             title: ROOM_TYPES[type],
