@@ -902,7 +902,7 @@ export class Room extends DurableObject<Env> {
                     ultimateData.contestWinner,
                     ultimateData.ultimate,
                 ]
-            } else {
+            } else if (!isOpenType(settings.type)) {
                 editionData = await getEditionData()
                 poolCharts = chartsForType(editionData, settings.type)
             }
