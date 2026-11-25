@@ -853,15 +853,21 @@ export class Room extends DurableObject<Env> {
 
         const reservation = this.st.reserved
 
-        if (
+                if (
             !reservation ||
             reservation.key !== key ||
             reservation.hostId !== host.id ||
             reservation.hostHandle !== host.handle
         ) {
+            console.error('[ROOM CONFIG] Reservation rejected:', {
+                hasReservation: !!reservation,
+                keyMatches: reservation?.key === key,
+                hostIdMatches: reservation?.hostId === host.id,
+                hostHandleMatches: reservation?.hostHandle === host.handle,
+                expired: this.isExpired(),
+            })
             return false
         }
-
         if (
             host.handle !== TOURNAMENT_HOST_HANDLE &&
             !isOpenType(settings.type)
