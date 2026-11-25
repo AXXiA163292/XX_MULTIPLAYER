@@ -518,25 +518,26 @@ function isGroupHeader(header: string): boolean {
 export async function getEditionData(): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
-    if (rows.length < 2) {
-        throw new Error(`The "${INDEX_SHEET_TAB}" tab must contain a header row and at least one edition row.`)
+    if (rows.length < 3) {
+        throw new Error(`The "${INDEX_SHEET_TAB}" tab must contain a title row, a header row and at least one edition row.`)
     }
 
-    const headers = rows[0]!.map((cell) => normalizeId(cell))
+    const headers = rows[1]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
+    const dataRows = rows.slice(2)
 
-        if (!['index', 'edition'].includes(normalizeId(headers[0]).toLowerCase())) {
-        throw new Error(`[INDEX] Expected cell A1 to be "edition", received "${headers[0] ?? ''}".`)
+    if (normalized[0] !== 'EDITION') {
+        throw new Error(`[INDEX] Expected cell A2 to be "edition", received "${headers[0] ?? ''}".`)
     }
 
     if (!normalized.includes('G1') || !normalized.includes('F1')) {
-        throw new Error(`[INDEX] Expected G1 and F1 columns in "${INDEX_SHEET_TAB}".`)
+        throw new Error(`[INDEX] Expected G1 and F1 columns in row 2 of "${INDEX_SHEET_TAB}".`)
     }
 
     let activeRow: string[] | null = null
-    for (let i = rows.length - 1; i >= 1; i--) {
-        if (normalizeId(rows[i]![0])) {
-            activeRow = rows[i]!
+    for (let i = dataRows.length - 1; i >= 0; i--) {
+        if (normalizeId(dataRows[i]![0])) {
+            activeRow = dataRows[i]!
             break
         }
     }
@@ -550,7 +551,7 @@ export async function getEditionData(): Promise<EditionData> {
         throw new Error(`Current edition name in column A of "${INDEX_SHEET_TAB}" is empty.`)
     }
 
-        const groupStage: SheetChart[] = []
+    const groupStage: SheetChart[] = []
     const final: SheetChart[] = []
     const divisions: Record<string, string> = {}
     const ultimateParticipants: string[] = []
@@ -563,7 +564,7 @@ export async function getEditionData(): Promise<EditionData> {
         const groupMatch = header.match(/^G(\d+)$/)
         const finalMatch = header.match(/^F(\d+)$/)
 
-                if (groupMatch || finalMatch) {
+        if (groupMatch || finalMatch) {
             const id = groupMatch ? `G${groupMatch[1]}` : `F${finalMatch![1]}`
             const chart = chartFromUrl(id, value)
             if (!chart) continue
@@ -590,7 +591,7 @@ export async function getEditionData(): Promise<EditionData> {
             continue
         }
 
-                if (header === 'UB' || header === 'LB') {
+        if (header === 'UB' || header === 'LB') {
             const division = header === 'UB' ? 'Upper Bracket' : 'Lower Bracket'
             for (const handle of splitHandles(value)) {
                 divisions[handle] = division
@@ -606,7 +607,7 @@ export async function getEditionData(): Promise<EditionData> {
     const sortByNumber = (a: SheetChart, b: SheetChart) =>
         Number(a.id.slice(1)) - Number(b.id.slice(1))
 
-        return {
+    return {
         edition,
         groupStage: groupStage.sort(sortByNumber),
         final: final.sort(sortByNumber),
@@ -628,16 +629,17 @@ function ultimatePicksKey(edition: string): string {
 
 export async function getUltimateEditionData(): Promise<UltimateEditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    if (rows.length < 2) throw new Error('[ULTIMATE] Edition sheet has no data rows.')
+    if (rows.length < 3) throw new Error('[ULTIMATE] Edition sheet must contain a title row, a header row and data rows.')
 
-    const headers = rows[0]!.map((cell) => normalizeId(cell))
+    const headers = rows[1]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
+    const dataRows = rows.slice(2)
 
-    if (!['INDEX', 'EDITION'].includes(normalized[0] ?? '')) {
-        throw new Error('[ULTIMATE] Column A must be named edition.')
+    if (normalized[0] !== 'EDITION') {
+        throw new Error(`[ULTIMATE] Expected cell A2 to be "edition", received "${headers[0] ?? ''}".`)
     }
 
-    const ultimateRow = rows.slice(1).find((row) =>
+    const ultimateRow = dataRows.find((row) =>
         /^ULTIMATE\s+\d{4}$/i.test(normalizeId(row[0])),
     )
     if (!ultimateRow) throw new Error('[ULTIMATE] Could not find an ULTIMATE year row.')
@@ -646,7 +648,7 @@ export async function getUltimateEditionData(): Promise<UltimateEditionData> {
     const year = edition.match(/\d{4}$/)?.[0]
     if (!year) throw new Error('[ULTIMATE] Invalid edition year.')
 
-    const getRow = (name: string) => rows.slice(1).find(
+    const getRow = (name: string) => dataRows.find(
         (row) => normalizeId(row[0]).toUpperCase() === name,
     )
 
