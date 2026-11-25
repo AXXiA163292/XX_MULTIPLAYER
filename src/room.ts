@@ -1135,7 +1135,16 @@ export class Room extends DurableObject<Env> {
         const isHost = uid === state.hostId
 
         switch (cmd.type) {
-                            if (
+                                        case 'updateLevel': {
+                if (
+                    !isHost ||
+                    state.status !== 'selecting' ||
+                    !isSil(cmd.level)
+                ) {
+                    return this.resync(uid)
+                }
+
+                if (
                     state.settings.type === 'rankedRoom' ||
                     (state.settings.type === 'casualRoom' && state.settings.random) ||
                     (state.settings.type === 'ultimateEdition' && state.hostHandle !== TOURNAMENT_HOST_HANDLE)
