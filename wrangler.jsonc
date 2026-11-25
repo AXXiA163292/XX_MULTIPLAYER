@@ -45,8 +45,7 @@
       "new_sqlite_classes": ["Chat"]
     },
     {
-      "tag": "v4",
-      "deleted_classes": ["Replays"]
+      "tag": "v4"
     }
   ],
   "r2_buckets": [
