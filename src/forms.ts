@@ -1,3 +1,4 @@
+
 import {
     DEFAULT_OPEN_SCORING,
     DEFAULT_SCORING,
@@ -288,17 +289,13 @@ export const roomForms = (
 /**
  * Inside an already-opened room:
  * - Only Room access can be edited for tournament / casualRoom
- * - On rankedRoom, no option forms are shown (only closeRoomForm for the host)
+ * - Ranked rooms keep their form declared but expose no editable options.
  */
 export const roomFormsForType = (
     type: RoomType,
     isTournamentHost = false,
     availableEditions: string[] = [],
 ) => {
-    if (type === 'rankedRoom') {
-        return []
-    }
-
     return roomForms(isTournamentHost, availableEditions)
         .filter((form) => form.type === type)
         .map((form) => ({
