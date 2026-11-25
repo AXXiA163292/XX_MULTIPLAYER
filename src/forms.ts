@@ -87,6 +87,22 @@ export function pickClosestEdition(
     })[0]!
 }
 
+export function resolvePreselectedEdition(
+    availableEditions: string[],
+    currentEdition?: string,
+    now = new Date(),
+): string {
+    const editions = normalizeEditionsList(availableEditions)
+    if (editions.length === 0) return ''
+
+    const cleanCurrent = String(currentEdition ?? '').trim().toUpperCase()
+    if (cleanCurrent && editions.includes(cleanCurrent)) {
+        return cleanCurrent
+    }
+
+    return pickClosestEdition(editions, now)
+}
+
 export function normalizeEditionsList(availableEditions: string[]): string[] {
     return [
         ...new Set(
@@ -119,7 +135,6 @@ const customScoringOption = {
 const editionOption = (editions: string[], defaultEdition?: string) => ({
     query: 'edition',
     name: 'Edition',
-    description: 'Choose the championship edition.',
     required: false,
     type: 'select' as const,
     def: defaultEdition && editions.includes(defaultEdition)
@@ -134,11 +149,10 @@ const editionOption = (editions: string[], defaultEdition?: string) => ({
 const groupOption = {
     query: 'group',
     name: 'Group',
-    description: 'Leave empty for Final / Ultimate, or enter a group (e.g. A) for Group Stage.',
     required: false,
     type: 'text' as const,
     def: '',
-    placeholder: 'Empty = Final / Ultimate',
+    placeholder: '',
     limit: 24,
     shortcuts: [],
 }
@@ -146,11 +160,10 @@ const groupOption = {
 const titleOption = {
     query: 'title',
     name: 'Room title',
-    description: 'Choose a name for your Custom Room.',
     required: false,
     type: 'text' as const,
     def: '',
-    placeholder: "Player's room",
+    placeholder: '',
     limit: 48,
     shortcuts: [],
 }
@@ -239,9 +252,10 @@ export const isOpenType = (type: RoomType) =>
 export const roomForms = (
     isTournamentHost = false,
     availableEditions: string[] = [],
+    currentEdition?: string,
 ) => {
     const editions = normalizeEditionsList(availableEditions)
-    const defaultEdition = pickClosestEdition(editions)
+    const defaultEdition = resolvePreselectedEdition(editions, currentEdition)
 
     return (Object.keys(ROOM_TYPES) as RoomType[])
         .filter((type) => isTournamentHost || isOpenType(type))
@@ -272,14 +286,20 @@ export const roomForms = (
 }
 
 /**
- * Inside an already-opened room, settings cannot be edited except Room access.
+ * Inside an already-opened room:
+ * - Only Room access can be edited for tournament / casualRoom
+ * - On rankedRoom, no option forms are shown (only closeRoomForm for the host)
  */
 export const roomFormsForType = (
     type: RoomType,
     isTournamentHost = false,
     availableEditions: string[] = [],
-) =>
-    roomForms(isTournamentHost, availableEditions)
+) => {
+    if (type === 'rankedRoom') {
+        return []
+    }
+
+    return roomForms(isTournamentHost, availableEditions)
         .filter((form) => form.type === type)
         .map((form) => ({
             ...form,
@@ -289,6 +309,7 @@ export const roomFormsForType = (
                     ? [customVisibilityOption]
                     : [],
         }))
+}
 
 export type RoomSettings = {
     type: RoomType
@@ -424,7 +445,6 @@ export function parseSettings(
         return null
     }
 
-    // Ultimate editions cannot have a group phase selected
     if (!open && isUltimateEdition(edition) && group.length > 0) {
         return null
     }
