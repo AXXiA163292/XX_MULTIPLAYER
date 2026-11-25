@@ -34,8 +34,9 @@ export interface Sil {
 
 export interface GameplayResult {
     grade: 'allPerfect' | 'fullCombo' | 'pass' | 'fail' | 'X'
-    score: number
-    accuracy: number
+    disqualified?: boolean
+    score?: number
+    accuracy?: number
     arcadeScore: number
     accuracyScore: number
     combo: number
@@ -44,6 +45,11 @@ export interface GameplayResult {
     good: number
     miss: number
     totalCount: number
+}
+
+export type RoomCover = {
+    url: string
+    hash?: string
 }
 
 export type LevelItem = {
@@ -107,6 +113,7 @@ export type RoomSummary = {
 export type Env = {
     ROOM: DurableObjectNamespace<import('./room.ts').Room>
     LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
+    CHAT: DurableObjectNamespace<import('./chat.ts').Chat>
     SONOLUS_ASSETS_BUCKET: R2Bucket
     COMMUNITY_BUCKET?: R2Bucket
     SESSION_SECRET: string
