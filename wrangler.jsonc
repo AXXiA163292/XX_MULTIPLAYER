@@ -17,7 +17,6 @@
     },
     "traces": {
       "enabled": true,
-      "head_sampling_rate": 1,
       "persist": true
     }
   },
@@ -52,6 +51,10 @@
     {
       "tag": "v3",
       "new_sqlite_classes": ["Replays"]
+    },
+    {
+      "tag": "v4",
+      "deleted_classes": ["Replays"]
     }
   ],
   "r2_buckets": [
