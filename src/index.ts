@@ -2099,7 +2099,7 @@ export default {
             }
 
             return json({
-                creates: session ? roomForms(isHost, availableEditions) : [],
+                creates: session ? roomForms(isHost, availableEditions, getLiveEdition()) : [],
                 searches: [],
                 sections: [
                     {
