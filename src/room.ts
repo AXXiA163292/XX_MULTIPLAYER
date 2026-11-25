@@ -377,7 +377,10 @@ function extractComboCount(description: string): number | null {
     return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
-async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
+async function fetchLevelInfo(
+    level: Sil,
+    sheetConstant?: number | null,
+): Promise<LevelInfo | null> {
     try {
         const base = new URL(level.address)
 
@@ -452,7 +455,7 @@ async function fetchLevelInfo(level: Sil): Promise<LevelInfo | null> {
                     : null
 
                 const descriptionConstant = extractDescriptionNumber(description, 'Constant')
-                const constant = descriptionConstant ?? rating
+                const constant = sheetConstant ?? descriptionConstant ?? rating
 
                 const rawCoverUrl = typeof item?.cover?.url === 'string' && item.cover.url
                     ? (item.cover.url.startsWith('/')
@@ -1001,7 +1004,7 @@ export class Room extends DurableObject<Env> {
             ? { address: firstPoolChart.address, name: firstPoolChart.name }
             : null
         this.st.levelInfo = this.st.level
-            ? await fetchLevelInfo(this.st.level)
+            ? await fetchLevelInfo(this.st.level, firstPoolChart?.constant)
             : null
         this.st.levelOptions = []
         this.st.round = null
@@ -1297,7 +1300,13 @@ export class Room extends DurableObject<Env> {
                 this.sendLevel()
                 this.pushScoreboard()
 
-                state.levelInfo = await fetchLevelInfo(state.level)
+                const selectedChart = state.poolCharts.find(
+    (chart) => sameLevel(cmd.level, chart),
+)
+state.levelInfo = await fetchLevelInfo(
+    state.level,
+    selectedChart?.constant,
+)
                 this.pushScoreboard()
                 return
             }
@@ -1382,7 +1391,7 @@ export class Room extends DurableObject<Env> {
                             }
                             : null
                         state.levelInfo = state.level
-                            ? await fetchLevelInfo(state.level)
+                            ? await fetchLevelInfo(state.level, nextPool[0]?.constant)
                             : null
                         state.levelOptions = []
                         state.results = {}
