@@ -54,12 +54,12 @@ export type SheetChart = {
     sekaiVocalVersion?: number
 }
 
-export type UltimateEditionData = {
+export type EditionData = {
     edition: string
-    seasons: Record<UltimateSeason, SheetChart[]>
-    contestWinner: SheetChart | null
-    ultimate: SheetChart | null
-    participants: string[]
+    groupStage: SheetChart[]
+    final: SheetChart[]
+    divisions: Record<string, string>
+    ultimateParticipants: string[]
 }
 
 export type UltimateSeason = 'winter' | 'spring' | 'summer' | 'fall'
@@ -69,8 +69,8 @@ export type UltimatePicks = Record<UltimateSeason, SheetChart>
 export type UltimateEditionData = {
     edition: string
     seasons: Record<UltimateSeason, SheetChart[]>
-    contestWinner: SheetChart
-    ultimate: SheetChart
+    contestWinner: SheetChart | null
+    ultimate: SheetChart | null
     participants: string[]
 }
 
@@ -533,6 +533,34 @@ export function getLiveEdition(date = new Date()): string {
     return `FALL ${year}`
 }
 
+export async function getAvailableEditions(): Promise<string[]> {
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
+
+    const headerIndex = rows.findIndex((row) =>
+        row.some((cell) => normalizeId(cell).toUpperCase() === 'EDITION'),
+    )
+
+    if (headerIndex < 0) {
+        throw new Error('[INDEX] Could not find the EDITION header.')
+    }
+
+    const editionColumn = rows[headerIndex]!.findIndex(
+        (cell) => normalizeId(cell).toUpperCase() === 'EDITION',
+    )
+
+    const editions = rows
+        .slice(headerIndex + 1)
+        .map((row) => normalizeId(row[editionColumn]).toUpperCase())
+        .filter((value) => /^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+\d{4}$/.test(value))
+
+    const unique = [...new Set(editions)].reverse()
+    const live = getLiveEdition()
+
+    if (!unique.includes(live)) unique.unshift(live)
+
+    return unique
+}
+
 export async function getEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<EditionData> {
@@ -649,8 +677,8 @@ export async function getUltimateEditionData(
     const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
     const dataRows = rows.slice(headerIndex + 1)
-
     const edition = normalizeId(requestedEdition).toUpperCase()
+
     if (!/^ULTIMATE\s+\d{4}$/.test(edition)) {
         throw new Error(`[ULTIMATE] Invalid edition: ${edition}`)
     }
@@ -658,10 +686,6 @@ export async function getUltimateEditionData(
     const ultimateRow = dataRows.find(
         (row) => normalizeId(row[0]).toUpperCase() === edition,
     )
-
-    if (!ultimateRow) {
-        throw new Error(`[ULTIMATE] Could not find ${edition} in the Index sheet.`)
-    }
 
     const year = edition.match(/\d{4}$/)![0]
 
@@ -686,9 +710,8 @@ export async function getUltimateEditionData(
 
             if (urlColumn < 0 || levelColumn < 0) continue
 
-            const rawLevel = normalizeId(row[levelColumn])
+            const playLevel = parseEditionPlayLevel(row[levelColumn])
             const rawUrl = normalizeId(row[urlColumn])
-            const playLevel = parseEditionPlayLevel(rawLevel)
 
             if (playLevel === null || playLevel < 32) continue
 
@@ -711,8 +734,11 @@ export async function getUltimateEditionData(
     }
 
     const getFixedChart = (slot: 'F1' | 'F2'): SheetChart | null => {
+        if (!ultimateRow) return null
+
         const column = normalized.indexOf(slot)
         if (column < 0) return null
+
         return chartFromUrl(slot, normalizeId(ultimateRow[column]))
     }
 
@@ -723,7 +749,7 @@ export async function getUltimateEditionData(
         seasons,
         contestWinner: getFixedChart('F1'),
         ultimate: getFixedChart('F2'),
-        participants: uxColumn >= 0
+        participants: ultimateRow && uxColumn >= 0
             ? splitHandles(normalizeId(ultimateRow[uxColumn]))
             : [],
     }
@@ -872,7 +898,7 @@ function officialRankedPoolFromSheet(
     })
     if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
 
-        const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
     const idCol = headers.indexOf('id')
     const musicVocalIdsCol = headers.indexOf('musicvocalids')
     const vocalTypeCols = Array.from(
@@ -885,7 +911,7 @@ function officialRankedPoolFromSheet(
 
     for (let rowIdx = headerIndex + 1; rowIdx < values.length; rowIdx++) {
         const cells = values[rowIdx]!
-                const musicVocalIds = musicVocalIdsCol >= 0
+        const musicVocalIds = musicVocalIdsCol >= 0
             ? parseMusicVocalIds(normalizeId(cells[musicVocalIdsCol]))
             : []
 
@@ -913,7 +939,7 @@ function officialRankedPoolFromSheet(
                 : inRange(level, rules.main)
             if (!fits) continue
 
-                        const chart = chartFromUrl(`${rowId}-${diff}`, link)
+            const chart = chartFromUrl(`${rowId}-${diff}`, link)
             if (chart) {
                 pool.push({
                     ...chart,
