@@ -518,17 +518,18 @@ function isGroupHeader(header: string): boolean {
 export async function getEditionData(): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
-    if (rows.length < 3) {
-        throw new Error(`The "${INDEX_SHEET_TAB}" tab must contain a title row, a header row and at least one edition row.`)
+        const headerIndex = rows.findIndex((row) => {
+        const values = row.map((cell) => normalizeId(cell).toUpperCase())
+        return values.includes('G1') && values.includes('F1')
+    })
+
+    if (headerIndex < 0 || headerIndex >= rows.length - 1) {
+        throw new Error(`[INDEX] Could not find the G1/F1 header row or edition data in "${INDEX_SHEET_TAB}".`)
     }
 
-    const headers = rows[1]!.map((cell) => normalizeId(cell))
+    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
-    const dataRows = rows.slice(2)
-
-    if (normalized[0] !== 'EDITION') {
-        throw new Error(`[INDEX] Expected cell A2 to be "edition", received "${headers[0] ?? ''}".`)
-    }
+    const dataRows = rows.slice(headerIndex + 1)
 
     const activeRow = dataRows[dataRows.length - 1]!
 
