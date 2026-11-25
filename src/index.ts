@@ -2789,28 +2789,41 @@ function renderStaffChatHtml(
 }
 
 async function roomItems(env: WorkerEnv, _session: AuthSession | null) {
-    const rooms = await lobby(env).list()
+    const rooms = await lobby(env).list().catch((error) => {
+        console.error('[ROOMS] Could not list lobby rooms:', error)
+        return []
+    })
 
     const items = await Promise.all(
         rooms.map(async (room) => {
-            const current = await roomStub(env, room.name).summary()
+            try {
+                const current = await roomStub(env, room.name).summary()
 
-            if (!current) {
-                await lobby(env).remove(room.name)
+                if (!current) {
+                    await lobby(env).remove(room.name).catch((error) => {
+                        console.error('[ROOMS] Could not remove stale room:', room.name, error)
+                    })
+                    return null
+                }
+
+                if (current.visibility === 'private') return null
+
+                const cover = await resolveRoomCover(env, current).catch((error) => {
+                    console.error('[ROOMS] Could not load room cover:', room.name, error)
+                    return undefined
+                })
+
+                return {
+                    name: current.name,
+                    title: current.title,
+                    subtitle: current.subtitle,
+                    master: current.master,
+                    ...(cover ? { cover } : {}),
+                    tags: [],
+                }
+            } catch (error) {
+                console.error('[ROOMS] Could not load room:', room.name, error)
                 return null
-            }
-
-            if (current.visibility === 'private') return null
-
-            const cover = await resolveRoomCover(env, current)
-
-            return {
-                name: current.name,
-                title: current.title,
-                subtitle: current.subtitle,
-                master: current.master,
-                ...(cover ? { cover } : {}),
-                tags: [],
             }
         }),
     )
@@ -3655,15 +3668,13 @@ self.addEventListener('fetch', (event) => {
                     }
                     : undefined
 
-                const sentMsg: ChatMessage = {
-                    id: randomId(12),
+                const sentMsg = await chatStub(env).addMessage({
                     handle: resolved.user.handle,
                     author: resolved.user.name || defaultDisplayName(resolved.user.handle),
                     text: text.slice(0, 500),
-                    time: Date.now(),
                     ...(replyTo ? { replyTo } : {}),
-                }
-                const messages = await chatStub(env).postMessage(sentMsg)
+                })
+                const messages = await chatStub(env).listMessages()
                 await sendChatEmailNotifications(env, sentMsg).catch((err) => {
                     console.error('[Email] Notification dispatch failed:', err)
                 })
@@ -4325,106 +4336,110 @@ self.addEventListener('fetch', (event) => {
             return json({ item })
         }
 
-        const postCommunityPath = path.match(/^\/sonolus\/posts\/([^/]+)\/community$/)
-        if (postCommunityPath && req.method === 'GET') {
-            const name = decodeURIComponent(postCommunityPath[1]!)
-            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+        const postCommunityInfo = path.match(/^\/sonolus\/posts\/([^/]+)\/community\/info$/)
+
+        if (postCommunityInfo && req.method === 'GET') {
+            const name = decodeURIComponent(postCommunityInfo[1]!)
             const session = await sessionOf(req, env, url)
 
             if (isChatItemName(name)) {
                 if (!session || !isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted to staff handles.')
+                    return json({ creates: [], actions: [], topComments: [] })
                 }
+
                 const messages = await chatStub(env).listMessages().catch(() => [])
-                const formatted = formatChatCommunityComments(messages, session, page)
+
                 return json({
+                    creates: [],
                     actions: [chatActionForm],
-                    pageCount: formatted.pageCount,
-                    comments: formatted.comments,
-                    reviews: [],
+                    topComments: formatChatCommunityComments(messages, session, 0).comments.slice(0, 3),
                 })
             }
 
-            const post = await lobby(env).getPost(name)
-            if (!post) return new Response(null, { status: 404 })
+            const post = await lobby(env).getPost(name).catch(() => null)
+            if (!post) {
+                return json({ creates: [], actions: [], topComments: [] })
+            }
 
-            const formatted = formatPostComments(post, session, page)
             return json({
+                creates: [],
                 actions: [postCommentForm],
-                pageCount: formatted.pageCount,
-                comments: formatted.comments,
-                reviews: [],
+                topComments: formatPostComments(post, session, 0).comments.slice(0, 3),
             })
         }
 
-        const postCommunitySubmitPath = path.match(/^\/sonolus\/posts\/([^/]+)\/community\/submit$/)
-        if (postCommunitySubmitPath && req.method === 'POST') {
+        const postCommunitySubmit = path.match(/^\/sonolus\/posts\/([^/]+)\/community\/submit$/)
+
+        if (postCommunitySubmit && req.method === 'POST') {
+            const name = decodeURIComponent(postCommunitySubmit[1]!)
             const session = await sessionOf(req, env, url)
             if (!session) return new Response(null, { status: 401 })
 
-            const name = decodeURIComponent(postCommunitySubmitPath[1]!)
             let body: any
             try {
                 body = await req.json()
             } catch {
-                return message(400, 'Invalid comment request.')
+                return message(400, 'Invalid community action.')
             }
 
-            const values = new URLSearchParams(String(body?.values ?? ''))
-            const actionType = values.get('type') || url.searchParams.get('type') || ''
+            const values = new URLSearchParams(String(body.values ?? ''))
+            const actionType = values.get('type')
 
-            if (actionType === 'deleteComment') {
-                const commentId = String(body?.commentName ?? body?.commentId ?? body?.target ?? values.get('commentName') ?? values.get('id') ?? url.searchParams.get('commentName') ?? '').trim()
-                if (!commentId) return message(400, 'Missing comment id.')
-
-                if (isChatItemName(name)) {
-                    if (!isStaffChatHandle(session.user.handle)) {
-                        return message(403, 'Staff chat is restricted to staff handles.')
-                    }
-                    const messages = await chatStub(env).listMessages().catch(() => [])
-                    const existing = messages.find((m) => m.id === commentId)
-                    if (!existing) return message(404, 'Comment not found.')
-                    if (!canDeleteComment(session, existing.handle)) {
-                        return message(403, 'Only 163292 can delete other users messages.')
-                    }
-                    await chatStub(env).deleteMessage(commentId)
-                    return json({})
+            if (isChatItemName(name)) {
+                if (!isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
                 }
 
-                const post = await lobby(env).getPost(name)
-                if (!post) return new Response(null, { status: 404 })
-                const comment = (post.comments ?? []).find((c) => c.id === commentId)
-                if (!comment) return message(404, 'Comment not found.')
-                if (!canDeleteComment(session, comment.handle)) {
-                    return message(403, 'Only 163292 can delete other users comments.')
+                const text = extractCommentText(values)
+                if (!text) return message(400, 'Message cannot be empty.')
+
+                const savedMessage = await chatStub(env).addMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
+
+                await sendChatEmailNotifications(env, savedMessage).catch((error) => {
+                    console.error('[Email] Notification dispatch failed:', error)
+                })
+
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            const post = await lobby(env).getPost(name).catch(() => null)
+            if (!post) return new Response(null, { status: 404 })
+
+            if (actionType === 'likePost') {
+                await lobby(env).togglePostLike(name, session.user.handle)
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            if (actionType === 'pinPost') {
+                if (!canManagePosts(session)) {
+                    return message(403, 'Only handle 163292 can pin posts.')
                 }
-                await lobby(env).deletePostComment(name, commentId)
-                return json({})
+
+                await lobby(env).togglePostPin(name)
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
             }
 
             const text = extractCommentText(values)
             if (!text) return message(400, 'Comment cannot be empty.')
-
-            if (isChatItemName(name)) {
-                if (!isStaffChatHandle(session.user.handle)) {
-                    return message(403, 'Staff chat is restricted to staff handles.')
-                }
-                const sentMsg: ChatMessage = {
-                    id: randomId(12),
-                    handle: session.user.handle,
-                    author: session.user.name || session.user.handle,
-                    text: text.slice(0, 500),
-                    time: Date.now(),
-                }
-                await chatStub(env).postMessage(sentMsg)
-                await sendChatEmailNotifications(env, sentMsg).catch((err) => {
-                    console.error('[Email] Notification dispatch failed:', err)
-                })
-                return json({})
-            }
-
-            const post = await lobby(env).getPost(name)
-            if (!post) return new Response(null, { status: 404 })
 
             await lobby(env).addPostComment(name, {
                 id: randomId(12),
@@ -4434,7 +4449,86 @@ self.addEventListener('fetch', (event) => {
                 time: Date.now(),
             })
 
-            return json({})
+            return json({
+                key: '',
+                hashes: [],
+                shouldUpdateCommunity: true,
+                shouldUpdateComments: true,
+            })
+        }
+
+        const postCommentsList = path.match(/^\/sonolus\/posts\/([^/]+)\/community\/comments\/list$/)
+
+        if (postCommentsList && req.method === 'GET') {
+            const name = decodeURIComponent(postCommentsList[1]!)
+            const session = await sessionOf(req, env, url)
+            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+
+            if (isChatItemName(name)) {
+                if (!session || !isStaffChatHandle(session.user.handle)) {
+                    return json({ pageCount: 1, comments: [] })
+                }
+
+                const messages = await chatStub(env).listMessages().catch(() => [])
+                return json(formatChatCommunityComments(messages, session, page))
+            }
+
+            const post = await lobby(env).getPost(name).catch(() => null)
+            if (!post) {
+                return json({ pageCount: 1, comments: [] })
+            }
+
+            return json(formatPostComments(post, session, page))
+        }
+
+        const postCommentSubmit = path.match(
+            /^\/sonolus\/posts\/([^/]+)\/community\/comments\/([^/]+)\/submit$/,
+        )
+
+        if (postCommentSubmit && req.method === 'POST') {
+            const name = decodeURIComponent(postCommentSubmit[1]!)
+            const commentName = decodeURIComponent(postCommentSubmit[2]!)
+            const session = await sessionOf(req, env, url)
+            if (!session) return new Response(null, { status: 401 })
+
+            if (isChatItemName(name)) {
+                if (!isStaffChatHandle(session.user.handle)) {
+                    return message(403, 'Chat is restricted.')
+                }
+
+                const messages = await chatStub(env).listMessages().catch(() => [])
+                const target = messages.find((m) => m.id === commentName)
+
+                if (!target || !canDeleteComment(session, target.handle)) {
+                    return message(403, 'You cannot delete this comment.')
+                }
+
+                await chatStub(env).deleteMessage(commentName)
+
+                return json({
+                    key: '',
+                    hashes: [],
+                    shouldUpdateCommunity: true,
+                    shouldUpdateComments: true,
+                })
+            }
+
+            const post = await lobby(env).getPost(name).catch(() => null)
+            if (!post) return new Response(null, { status: 404 })
+
+            const target = (post.comments ?? []).find((comment) => comment.id === commentName)
+            if (!target || !canDeleteComment(session, target.handle)) {
+                return message(403, 'You cannot delete this comment.')
+            }
+
+            await lobby(env).deletePostComment(name, commentName)
+
+            return json({
+                key: '',
+                hashes: [],
+                shouldUpdateCommunity: true,
+                shouldUpdateComments: true,
+            })
         }
 
         const postSubmitPath = path.match(/^\/sonolus\/posts\/([^/]+)\/submit$/)
@@ -4459,14 +4553,11 @@ self.addEventListener('fetch', (event) => {
                 }
                 const text = extractCommentText(values)
                 if (!text) return message(400, 'Message cannot be empty.')
-                const sentMsg: ChatMessage = {
-                    id: randomId(12),
+                const sentMsg = await chatStub(env).addMessage({
                     handle: session.user.handle,
                     author: session.user.name || session.user.handle,
                     text: text.slice(0, 500),
-                    time: Date.now(),
-                }
-                await chatStub(env).postMessage(sentMsg)
+                })
                 await sendChatEmailNotifications(env, sentMsg).catch((err) => {
                     console.error('[Email] Notification dispatch failed:', err)
                 })
@@ -4532,14 +4623,10 @@ self.addEventListener('fetch', (event) => {
                 }
                 const messages = await chatStub(env).listMessages().catch(() => [])
                 const pinnedId = await chatStub(env).getPinnedId().catch(() => null)
-                const chatItem = buildChatPostItem(messages, pinnedId)
-                const formattedText = messages.length
-                    ? messages.map((m) => `${formatAuthorTag(m.author, m.handle)}: ${m.text}`).join('\n\n')
-                    : 'No messages yet.'
                 return json({
-                    item: chatItem,
-                    description: formattedText,
-                    actions: [chatActionForm],
+                    item: buildChatPostItem(messages, pinnedId),
+                    description: `External chat:\n${externalChatUrl(req, env)}`,
+                    actions: [],
                     hasCommunity: true,
                     leaderboards: [],
                     sections: [],
@@ -4549,14 +4636,9 @@ self.addEventListener('fetch', (event) => {
             const post = await lobby(env).getPost(name)
             if (!post) return new Response(null, { status: 404 })
 
-            const likesCount = (post.likes ?? []).length
-            const descriptionWithLikes = likesCount > 0
-                ? `${post.description}\n\n♥ ${likesCount}`
-                : post.description
-
             return json({
                 item: buildPostItemWithBadges(post),
-                description: descriptionWithLikes,
+                description: post.description,
                 actions: postActionsFor(post, session),
                 hasCommunity: true,
                 leaderboards: [],
@@ -4620,74 +4702,17 @@ self.addEventListener('fetch', (event) => {
 
             await lobby(env).prune(session.user.id).catch(() => {})
 
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid room options.')
-            }
-
-            const settings = parseSettings(body?.values)
-            if (!settings) {
-                return message(400, 'Invalid room options or edition.')
-            }
-
-            const isTournamentHost = session.user.handle === TOURNAMENT_HOST_HANDLE
-
-            if (
-                settings.type !== 'casualRoom' &&
-                settings.type !== 'rankedRoom' &&
-                !isTournamentHost
-            ) {
-                return message(
-                    403,
-                    'Only the tournament host can create Championship rooms.',
-                )
-            }
-
-            if (settings.type === 'casualRoom') {
-                settings.scoring = 'pp'
-            }
-
             const name = randomId(12)
             const key = randomId(16)
-            const stub = roomStub(env, name)
 
-            await stub.reserve(name, {
+            await roomStub(env, name).reserve(name, {
                 key,
                 hostId: session.user.id,
                 hostName: session.user.name,
                 hostHandle: session.user.handle,
             })
 
-            const configured = await stub.configure(key, settings, session.user)
-            if (!configured) {
-                await stub.closeForOwner(session.user.id).catch(() => {})
-                return message(400, 'Could not configure room.')
-            }
-
-            const exp = Date.now() + 24 * 60 * 60 * 1000
-            const join: JoinSession = {
-                room: name,
-                user: session.user,
-                roomUser: {
-                    authentication: randomId(16),
-                    signature: randomId(24),
-                },
-                exp,
-            }
-
-            const ws = new URL(addressOf(req, env))
-            ws.protocol = ws.protocol === 'https:' ? 'wss:' : 'ws:'
-            ws.pathname = `/sonolus/rooms/${name}/connect`
-
-            return json({
-                name,
-                address: ws.toString(),
-                key: await signToken(env.SESSION_SECRET, join),
-                roomUser: join.roomUser,
-                expire: exp,
-            })
+            return json({ name, key })
         }
 
         const roomDetailsPath = path.match(/^\/sonolus\/rooms\/([^/]+)$/)
@@ -4728,48 +4753,90 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-        const roomJoinPath = path.match(/^\/sonolus\/rooms\/([^/]+)\/join$/)
-        if (roomJoinPath && req.method === 'POST') {
-            const name = roomJoinPath[1]!
+        const roomPostPath = path.match(/^\/sonolus\/rooms\/([^/]+)$/)
+        if (roomPostPath && req.method === 'POST') {
+            const name = roomPostPath[1]!
             const raw = new Uint8Array(await req.arrayBuffer())
-            const body = await verifySigned(req, env, raw, 'joinRoom')
-            if (!body) return new Response(null, { status: 401 })
+
+            const body = await verifySigned(
+                req,
+                env,
+                raw,
+                'authenticateMultiplayer',
+            )
+
+            if (!body || body.room !== name) {
+                return new Response(null, { status: 400 })
+            }
 
             const user = profileOf(body.userProfile)
             const stub = roomStub(env, name)
-            const reason = await stub.canJoin(user)
+            const roomKey = req.headers.get('Sonolus-Room-Key')
 
-            if (reason) {
-                return message(403, reason)
+            if (roomKey) {
+                const settings = parseSettings(
+                    url.searchParams,
+                    undefined,
+                    user.name || user.handle,
+                )
+
+                if (!settings) {
+                    return message(400, 'Invalid room options or edition.')
+                }
+
+                if (
+                    settings.type !== 'casualRoom' &&
+                    settings.type !== 'rankedRoom' &&
+                    user.handle !== TOURNAMENT_HOST_HANDLE
+                ) {
+                    return message(403, 'Only the tournament host can create Championship rooms.')
+                }
+
+                if (settings.type === 'casualRoom') {
+                    settings.scoring = 'pp'
+                }
+
+                const configured = await stub.configure(roomKey, settings, user)
+
+                if (!configured) {
+                    return message(400, 'Could not configure room.')
+                }
+            } else {
+                if (!(await stub.isOpen())) {
+                    return new Response(null, { status: 404 })
+                }
+
+                const denied = await stub.canJoin(user)
+                if (denied) return message(403, denied)
             }
 
-            const exp = Date.now() + 24 * 60 * 60 * 1000
-            const join: JoinSession = {
+            const sessionToken = await signToken(env.SESSION_SECRET, {
                 room: name,
                 user,
                 roomUser: {
-                    authentication: randomId(16),
-                    signature: randomId(24),
+                    authentication: b64encode(raw),
+                    signature: req.headers.get('Sonolus-Signature') ?? '',
                 },
-                exp,
-            }
+                exp: Date.now() + 2 * 60_000,
+            } satisfies JoinSession)
 
             const ws = new URL(addressOf(req, env))
             ws.protocol = ws.protocol === 'https:' ? 'wss:' : 'ws:'
             ws.pathname = `/sonolus/rooms/${name}/connect`
 
             return json({
-                address: ws.toString(),
-                key: await signToken(env.SESSION_SECRET, join),
-                roomUser: join.roomUser,
-                expire: exp,
+                url: ws.toString(),
+                type: 'round',
+                session: sessionToken,
             })
         }
 
         const roomConnectPath = path.match(/^\/sonolus\/rooms\/([^/]+)\/connect$/)
         if (roomConnectPath) {
             const name = roomConnectPath[1]!
-            const token = url.searchParams.get('key')
+            const token =
+                req.headers.get('Sonolus-Room-Session') ??
+                url.searchParams.get('key')
             const join = token ? await verifyToken<JoinSession>(env.SESSION_SECRET, token) : null
 
             if (!join || join.room !== name) {
