@@ -5,8 +5,6 @@ import {
     TOURNAMENT_HOST_HANDLE,
 } from './config.ts'
 import {
-    getAvailableEditions,
-    getLiveEdition,
     getCustomLevelPage,
     getCustomLevels,
     getPlaylists,
@@ -4710,17 +4708,12 @@ await sendChatEmailNotifications(env, newMessage)
             }
         }
 
-                if (path === '/sonolus/rooms/info' && req.method === 'GET') {
+        if (path === '/sonolus/rooms/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
             const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
-            const editionOptions = await getAvailableEditions().catch((error) => {
-                console.error('[ROOMS INFO] Could not load editions:', error)
-                return [getLiveEdition()]
-            })
-
             return json({
-                creates: session ? roomForms(isHost, editionOptions) : [],
+                creates: session ? roomForms(isHost) : [],
                 searches: [],
                 sections: [
                     {
