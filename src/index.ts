@@ -4827,15 +4827,8 @@ await sendChatEmailNotifications(env, newMessage)
                     }
                     : rawSettings
 
-                if (
-                    (
-                        user.handle !== TOURNAMENT_HOST_HANDLE &&
-                        settings.type !== 'casualRoom' &&
-                        settings.type !== 'rankedRoom'
-                    ) ||
-                    !(await stub.configure(key, settings, user))
-                ) {
-                    return message(403, 'You can only create Custom or Ranked Match rooms.')
+                                if (!(await stub.configure(key, settings, user))) {
+                    return new Response(null, { status: 400 })
                 }
             } else {
                 if (!(await stub.isOpen())) {
