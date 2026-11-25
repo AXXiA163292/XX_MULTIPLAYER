@@ -521,33 +521,19 @@ function isGroupHeader(header: string): boolean {
     return /^[A-Z]$/i.test(header)
 }
 
-function findIndexHeaderRow(rows: string[][]): {
-    headerIndex: number
+function parseIndexSheet(rows: string[][]): {
     headers: string[]
     normalized: string[]
     editionCol: number
+    dataRows: string[][]
 } {
-    let headerIndex = rows.findIndex((row) => {
-        const values = row.map((cell) => normalizeEditionLabel(cell))
-        return values.includes('EDITION') && (values.includes('G1') || values.includes('F1'))
-    })
-
-    if (headerIndex < 0) {
-        headerIndex = rows.findIndex((row) =>
-            row.some((cell) => normalizeEditionLabel(cell) === 'EDITION'),
-        )
-    }
-
-    if (headerIndex < 0) {
-        throw new Error(`[INDEX] Could not find the EDITION header row in "${INDEX_SHEET_TAB}".`)
-    }
-
-    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
+    const headerRow = rows[0] ?? []
+    const headers = headerRow.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => normalizeEditionLabel(cell))
-    const foundEditionCol = normalized.indexOf('EDITION')
-    const editionCol = foundEditionCol >= 0 ? foundEditionCol : 0
+    const editionCol = 0
+    const dataRows = rows.slice(1)
 
-    return { headerIndex, headers, normalized, editionCol }
+    return { headers, normalized, editionCol, dataRows }
 }
 
 export function getLiveEdition(date = new Date()): string {
@@ -570,10 +556,9 @@ export function getLiveEdition(date = new Date()): string {
 
 export async function getAvailableEditions(): Promise<string[]> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const { headerIndex, editionCol } = findIndexHeaderRow(rows)
+    const { editionCol, dataRows } = parseIndexSheet(rows)
 
-    const editions = rows
-        .slice(headerIndex + 1)
+    const editions = dataRows
         .map((row) => normalizeEditionLabel(row[editionCol]))
         .filter((value) => /^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+\d{4}$/.test(value))
 
@@ -589,8 +574,7 @@ export async function getEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const { headerIndex, headers, normalized, editionCol } = findIndexHeaderRow(rows)
-    const dataRows = rows.slice(headerIndex + 1)
+    const { headers, normalized, editionCol, dataRows } = parseIndexSheet(rows)
 
     const edition = normalizeEditionLabel(requestedEdition)
     const activeRow = dataRows.find((row) =>
@@ -677,12 +661,22 @@ export async function getUltimateEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<UltimateEditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const { headerIndex, normalized, editionCol } = findIndexHeaderRow(rows)
-    const dataRows = rows.slice(headerIndex + 1)
+    const { normalized, editionCol, dataRows } = parseIndexSheet(rows)
     const edition = normalizeEditionLabel(requestedEdition)
 
     if (!/^ULTIMATE\s+\d{4}$/.test(edition)) {
-        throw new Error(`[ULTIMATE] Invalid edition: ${edition}`)
+        return {
+            edition,
+            seasons: {
+                winter: [],
+                spring: [],
+                summer: [],
+                fall: [],
+            },
+            contestWinner: null,
+            ultimate: null,
+            participants: [],
+        }
     }
 
     const ultimateRow = dataRows.find(
