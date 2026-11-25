@@ -14,6 +14,7 @@ import {
     normalizeCustomSongsMode,
     normalizeRoundMode,
     parseSettings,
+    resolvePreselectedEdition,
     roomFormsForType,
     serializeSettings,
     type RoomSettings,
@@ -106,6 +107,7 @@ type RoomState = {
     statuses: Record<string, UserStatus>
     round: { state: string; seed: number; kind: RoundKind; label: string } | null
     results: Record<string, GameplayResult>
+    resultsByRound: Record<number, Record<string, GameplayResult>>
     history: RoundRecord[]
 }
 
@@ -146,6 +148,7 @@ const fresh = (): RoomState => ({
     statuses: {},
     round: null,
     results: {},
+    resultsByRound: {},
     history: [],
 })
 
@@ -644,6 +647,9 @@ export class Room extends DurableObject<Env> {
                         ),
                     )
                     : {},
+                resultsByRound: saved?.resultsByRound && typeof saved.resultsByRound === 'object'
+                    ? saved.resultsByRound
+                    : {},
                 history: Array.isArray(saved?.history) ? saved.history : [],
                 round: saved?.round &&
                     typeof saved.round.state === 'string' &&
@@ -929,11 +935,21 @@ export class Room extends DurableObject<Env> {
             settings.title = defaultCustomRoomTitle(host.name)
         }
 
+        const editionOptions = await getAvailableEditions().catch((error) => {
+            console.error('[ROOM CONFIG] Could not load edition options:', error)
+            return [] as string[]
+        })
+
+        this.st.editionOptions = editionOptions
+
         if (!isOpenType(settings.type)) {
-            settings.edition = (settings.edition || getLiveEdition()).trim().toUpperCase()
+            const chosenEdition = settings.edition
+                ? resolvePreselectedEdition(editionOptions, settings.edition)
+                : resolvePreselectedEdition(editionOptions, getLiveEdition())
+
+            settings.edition = chosenEdition || settings.edition || getLiveEdition()
             settings.group = (settings.group ?? '').trim()
 
-            // Ultimate editions cannot have a group phase selected; refuse to open
             if (isUltimateEdition(settings.edition) && settings.group.length > 0) {
                 console.error('[ROOM CONFIG] Ultimate edition cannot have a group phase:', {
                     edition: settings.edition,
@@ -942,13 +958,6 @@ export class Room extends DurableObject<Env> {
                 return false
             }
         }
-
-        const editionOptions = await getAvailableEditions().catch((error) => {
-            console.error('[ROOM CONFIG] Could not load edition options:', error)
-            return [settings.edition || getLiveEdition()]
-        })
-
-        this.st.editionOptions = editionOptions
 
         let editionData: EditionData | null = null
         let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
@@ -1038,6 +1047,7 @@ export class Room extends DurableObject<Env> {
         this.st.levelOptions = []
         this.st.round = null
         this.st.results = {}
+        this.st.resultsByRound = {}
         this.st.history = []
 
         await this.save()
@@ -1348,6 +1358,10 @@ export class Room extends DurableObject<Env> {
                     return this.closeRoom(uid)
                 }
 
+                if (state.settings.type === 'rankedRoom') {
+                    return this.resync(uid)
+                }
+
                 const parsed =
                     typeof cmd.optionValues === 'string'
                         ? parseSettings(cmd.optionValues, state.settings, state.hostName)
@@ -1366,13 +1380,10 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                // Inside an opened room, only Room access (visibility) can be edited
                 const nextVisibility =
-                    state.settings.type === 'rankedRoom'
-                        ? 'public'
-                        : state.settings.type === 'casualRoom'
-                            ? (parsed.visibility === 'private' ? 'private' : 'public')
-                            : (parsed.visibility === 'public' ? 'public' : 'locked')
+                    state.settings.type === 'casualRoom'
+                        ? (parsed.visibility === 'private' ? 'private' : 'public')
+                        : (parsed.visibility === 'public' ? 'public' : 'locked')
 
                 state.settings = {
                     ...state.settings,
@@ -1435,6 +1446,7 @@ export class Room extends DurableObject<Env> {
 
                 state.history = []
                 state.results = {}
+                state.resultsByRound = {}
                 this.pushScoreboard()
                 return
             }
@@ -1863,6 +1875,10 @@ export class Room extends DurableObject<Env> {
             let completedRound: RoundRecord | null = null
 
             if (Object.keys(state.results).length > 0) {
+                const roundIdx = state.history.length
+                state.resultsByRound[roundIdx] = Object.fromEntries(
+                    Object.entries(state.results).map(([k, v]) => [k, sanitizeWireResult(v)]),
+                )
                 completedRound = this.makeRoundRecord(state.history)
                 state.history.push(completedRound)
             }
