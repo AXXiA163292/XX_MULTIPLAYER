@@ -9,6 +9,8 @@ import {
 import {
     closeRoomForm,
     defaultCustomRoomTitle,
+    isOpenType,
+    isUltimateEdition,
     normalizeCustomSongsMode,
     normalizeRoundMode,
     parseSettings,
@@ -120,11 +122,11 @@ const fresh = (): RoomState => ({
     hostName: '',
     hostHandle: '',
     settings: {
-        type: 'groupStage',
+        type: 'tournament',
         edition: '',
         scoring: 'pp',
         roundMode: 'tournament',
-        group: 'A',
+        group: '',
         title: '',
         visibility: 'locked',
         random: false,
@@ -147,10 +149,16 @@ const fresh = (): RoomState => ({
     history: [],
 })
 
-const isOpenType = (type: RoomSettings['type']) =>
-    type === 'casualRoom' || type === 'rankedRoom'
-
 const ROUND_SLOT_ID_RE = /^(?:G[1-6]|F[1-4])$/i
+
+const isUltimateTournament = (settings: RoomSettings, edition = ''): boolean =>
+    settings.type === 'tournament' &&
+    isUltimateEdition(edition || settings.edition)
+
+const isGroupTournament = (settings: RoomSettings, edition = ''): boolean =>
+    settings.type === 'tournament' &&
+    !isUltimateTournament(settings, edition) &&
+    Boolean((settings.group ?? '').trim())
 
 const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
     const selectedEdition = (edition || settings.edition || getLiveEdition()).trim().toUpperCase()
@@ -160,16 +168,17 @@ const getRoomTitle = (settings: RoomSettings, edition = '', hostName = '') => {
         return String(settings.tier || 'master').toUpperCase()
     }
 
-    if (settings.type === 'groupStage') {
-        return `XX! Championship ${year} • Group ${settings.group || 'A'}`
-    }
+    if (settings.type === 'tournament') {
+        if (isUltimateEdition(selectedEdition)) {
+            return `XX! Ultimate Championship ${year}`
+        }
 
-    if (settings.type === 'final') {
+        const cleanGroup = (settings.group ?? '').trim()
+        if (cleanGroup) {
+            return `XX! Championship ${selectedEdition} • Group ${cleanGroup}`
+        }
+
         return `XX! Championship ${selectedEdition} • Final`
-    }
-
-    if (settings.type === 'ultimateEdition') {
-        return `XX! Ultimate Championship ${year}`
     }
 
     if (settings.type === 'casualRoom') {
@@ -280,10 +289,8 @@ function sanitizeWireResult(result: GameplayResult): GameplayResult {
     }
 }
 
-function chartsForType(edition: EditionData, type: RoomSettings['type']): SheetChart[] {
-    if (type === 'groupStage') return edition.groupStage
-    if (type === 'final') return edition.final
-    return []
+function chartsForTournament(edition: EditionData, group: string): SheetChart[] {
+    return group.trim() ? edition.groupStage : edition.final
 }
 
 function suggestionsFromCharts(
@@ -650,7 +657,21 @@ export class Room extends DurableObject<Env> {
                     : null,
             }
 
-            this.st.settings.group ||= 'A'
+            if (
+                this.st.settings.type === 'groupStage' ||
+                this.st.settings.type === 'final' ||
+                this.st.settings.type === 'ultimateEdition'
+            ) {
+                this.st.settings.type = 'tournament'
+            }
+
+            if (!['tournament', 'casualRoom', 'rankedRoom'].includes(this.st.settings.type)) {
+                this.st.settings.type = 'casualRoom'
+            }
+
+            this.st.settings.group = isOpenType(this.st.settings.type)
+                ? ''
+                : String(this.st.settings.group ?? '').trim()
             this.st.settings.edition ||= this.st.edition || getLiveEdition()
             this.st.settings.title ??= ''
             this.st.settings.random = this.st.settings.random === true
@@ -658,10 +679,6 @@ export class Room extends DurableObject<Env> {
             if (!['public', 'private', 'locked'].includes(this.st.settings.visibility)) {
                 this.st.settings.visibility =
                     this.st.settings.type === 'casualRoom' ? 'public' : 'locked'
-            }
-
-            if (!['groupStage', 'final', 'casualRoom', 'rankedRoom', 'ultimateEdition'].includes(this.st.settings.type)) {
-                this.st.settings.type = 'casualRoom'
             }
 
             if (!['master', 'diamond', 'platinum', 'gold', 'silver', 'bronze', 'beginner'].includes(this.st.settings.tier)) {
@@ -738,7 +755,7 @@ export class Room extends DurableObject<Env> {
             (record) => !record.edition || record.edition === this.st.edition,
         )
 
-        if (this.st.settings.type === 'ultimateEdition') {
+        if (isUltimateTournament(this.st.settings, this.st.edition)) {
             const index = pool.findIndex((chart) => sameLevel(level, chart))
             if (index < 0) return 'freeplay'
 
@@ -833,6 +850,8 @@ export class Room extends DurableObject<Env> {
 
         console.log(`[Room:${this.st.name || 'init'}] ${event}`, {
             type: this.st.settings.type,
+            edition: this.st.edition,
+            group: this.st.settings.group,
             scoring: this.st.settings.scoring,
             status: this.st.status,
             round: this.st.round?.state ?? null,
@@ -911,7 +930,17 @@ export class Room extends DurableObject<Env> {
         }
 
         if (!isOpenType(settings.type)) {
-            settings.edition = settings.edition || getLiveEdition()
+            settings.edition = (settings.edition || getLiveEdition()).trim().toUpperCase()
+            settings.group = (settings.group ?? '').trim()
+
+            // Ultimate editions cannot have a group phase selected; refuse to open
+            if (isUltimateEdition(settings.edition) && settings.group.length > 0) {
+                console.error('[ROOM CONFIG] Ultimate edition cannot have a group phase:', {
+                    edition: settings.edition,
+                    group: settings.group,
+                })
+                return false
+            }
         }
 
         const editionOptions = await getAvailableEditions().catch((error) => {
@@ -927,7 +956,7 @@ export class Room extends DurableObject<Env> {
         let poolCharts: SheetChart[] = []
 
         try {
-            if (settings.type === 'ultimateEdition') {
+            if (isUltimateTournament(settings, settings.edition)) {
                 ultimateData = await getUltimateEditionData(settings.edition)
 
                 const savedPicks = await getSavedUltimatePicks(
@@ -958,9 +987,9 @@ export class Room extends DurableObject<Env> {
                     ...(ultimateData.contestWinner ? [ultimateData.contestWinner] : []),
                     ...(ultimateData.ultimate ? [ultimateData.ultimate] : []),
                 ]
-            } else if (settings.type === 'groupStage' || settings.type === 'final') {
+            } else if (settings.type === 'tournament') {
                 editionData = await getEditionData(settings.edition)
-                poolCharts = chartsForType(editionData, settings.type)
+                poolCharts = chartsForTournament(editionData, settings.group)
             }
         } catch (error) {
             console.error(
@@ -1014,7 +1043,7 @@ export class Room extends DurableObject<Env> {
         await this.save()
         await this.syncLobby()
         await this.scheduleNextAlarm(EMPTY_ROOM_TTL_MS)
-        this.diag('configured')
+        this.diag('configured', { poolCount: poolCharts.length })
 
         return true
     }
@@ -1098,7 +1127,7 @@ export class Room extends DurableObject<Env> {
             typeof join.user.id !== 'string' ||
             !join.roomUser ||
             typeof join.roomUser.authentication !== 'string' ||
-            typeof join.roomUser.signature !== 'string'
+            typeof join.roomUser.signature === 'string' === false
         ) {
             return new Response('No such room', { status: 404 })
         }
@@ -1281,7 +1310,7 @@ export class Room extends DurableObject<Env> {
                 if (
                     state.settings.type === 'rankedRoom' ||
                     (state.settings.type === 'casualRoom' && state.settings.random) ||
-                    (state.settings.type === 'ultimateEdition' && state.hostHandle !== TOURNAMENT_HOST_HANDLE)
+                    (isUltimateTournament(state.settings, state.edition) && state.hostHandle !== TOURNAMENT_HOST_HANDLE)
                 ) {
                     return this.resync(uid)
                 }
@@ -1301,12 +1330,12 @@ export class Room extends DurableObject<Env> {
                 this.pushScoreboard()
 
                 const selectedChart = state.poolCharts.find(
-    (chart) => sameLevel(cmd.level, chart),
-)
-state.levelInfo = await fetchLevelInfo(
-    state.level,
-    selectedChart?.constant,
-)
+                    (chart) => sameLevel(cmd.level, chart),
+                )
+                state.levelInfo = await fetchLevelInfo(
+                    state.level,
+                    selectedChart?.constant,
+                )
                 this.pushScoreboard()
                 return
             }
@@ -1319,7 +1348,7 @@ state.levelInfo = await fetchLevelInfo(
                     return this.closeRoom(uid)
                 }
 
-                const next =
+                const parsed =
                     typeof cmd.optionValues === 'string'
                         ? parseSettings(cmd.optionValues, state.settings, state.hostName)
                         : null
@@ -1329,118 +1358,25 @@ state.levelInfo = await fetchLevelInfo(
 
                 if (
                     !isHost ||
-                    !next ||
-                    next.type !== state.settings.type ||
-                    (!tournamentHost && !isOpenType(next.type)) ||
+                    !parsed ||
+                    parsed.type !== state.settings.type ||
+                    (!tournamentHost && !isOpenType(parsed.type)) ||
                     state.status !== 'selecting'
                 ) {
                     return this.resync(uid)
                 }
 
-                const editionChanged =
-                    next.edition !== state.settings.edition &&
-                    !isOpenType(next.type)
-
-                if (editionChanged) {
-                    try {
-                        let nextPool: SheetChart[] = []
-                        let nextDivisions: Record<string, string> = {}
-                        let nextParticipants: string[] = []
-                        let nextPicksSaved = false
-
-                        if (next.type === 'ultimateEdition') {
-                            const data = await getUltimateEditionData(next.edition)
-                            const saved = await getSavedUltimatePicks(this.env, data.edition)
-
-                            nextPicksSaved = !!saved
-                            const picks: Partial<UltimatePicks> = {}
-
-                            for (const season of ['winter', 'spring', 'summer', 'fall'] as const) {
-                                if (saved?.[season]) {
-                                    picks[season] = saved[season]
-                                } else if (data.seasons[season].length > 0) {
-                                    picks[season] = randomChart(data.seasons[season])
-                                }
-                            }
-
-                            nextPool = [
-                                ...(['winter', 'spring', 'summer', 'fall'] as const)
-                                    .flatMap((season) => picks[season] ? [picks[season]!] : []),
-                                ...(data.contestWinner ? [data.contestWinner] : []),
-                                ...(data.ultimate ? [data.ultimate] : []),
-                            ]
-
-                            nextParticipants = data.participants
-                        } else {
-                            const data = await getEditionData(next.edition)
-                            nextPool = chartsForType(data, next.type)
-                            nextDivisions = cleanDivisions(data.divisions)
-                        }
-
-                        state.edition = next.edition
-                        state.poolCharts = nextPool
-                        state.divisions = nextDivisions
-                        state.ultimateParticipants = nextParticipants
-                        state.ultimateRoundIndex = 0
-                        state.ultimatePicksSaved = nextPicksSaved
-                        state.suggestions = suggestionsFromCharts(nextPool, state.hostId)
-                        state.level = nextPool[0]
-                            ? {
-                                address: nextPool[0].address,
-                                name: nextPool[0].name,
-                            }
-                            : null
-                        state.levelInfo = state.level
-                            ? await fetchLevelInfo(state.level, nextPool[0]?.constant)
-                            : null
-                        state.levelOptions = []
-                        state.results = {}
-                        state.round = null
-
-                        this.sendAll({
-                            type: 'updateLevel',
-                            level: state.level,
-                        })
-                    } catch (error) {
-                        console.error(
-                            '[ROOM] Could not load selected edition. Continuing without edition data:',
-                            error,
-                        )
-
-                        state.edition = next.edition
-                        state.poolCharts = []
-                        state.divisions = {}
-                        state.ultimateParticipants = []
-                        state.ultimateRoundIndex = 0
-                        state.ultimatePicksSaved = false
-                        state.suggestions = []
-                        state.level = null
-                        state.levelInfo = null
-                        state.levelOptions = []
-                        state.results = {}
-                        state.round = null
-
-                        this.sendAll({
-                            type: 'updateLevel',
-                            level: null,
-                        })
-                    }
-                }
-
-                if (next.type === 'rankedRoom') {
-                    next.tier = state.settings.tier
-                    next.customSongs = state.settings.customSongs
-                }
-
-                const randomChanged = next.random !== state.settings.random
-                const modeChanged = next.scoring !== state.settings.scoring
-
-                if (next.type === 'casualRoom' && !next.title) {
-                    next.title = defaultCustomRoomTitle(state.hostName)
-                }
+                // Inside an opened room, only Room access (visibility) can be edited
+                const nextVisibility =
+                    state.settings.type === 'rankedRoom'
+                        ? 'public'
+                        : state.settings.type === 'casualRoom'
+                            ? (parsed.visibility === 'private' ? 'private' : 'public')
+                            : (parsed.visibility === 'public' ? 'public' : 'locked')
 
                 state.settings = {
-                    ...next,
+                    ...state.settings,
+                    visibility: nextVisibility,
                     roundMode: 'tournament',
                 }
 
@@ -1453,17 +1389,6 @@ state.levelInfo = await fetchLevelInfo(
                     type: 'updateTitle',
                     title: getRoomTitle(state.settings, state.edition, state.hostName),
                 })
-
-                if (modeChanged || editionChanged) {
-                    this.sendAll({
-                        type: 'updateScoreboardDescription',
-                        scoreboardDescription: '',
-                    })
-
-                    this.pushScoreboard()
-                }
-
-                if (randomChanged) await this.applyRandomLevel(true)
 
                 await this.syncLobby()
                 return
@@ -1891,13 +1816,14 @@ state.levelInfo = await fetchLevelInfo(
                 (record) => !record.edition || record.edition === this.st.edition,
             )
 
+            const ultimate = isUltimateTournament(state.settings, state.edition)
             const kind = this.computeRoundKind(state.level, editionHistory)
             const label = buildRoundLabel(
                 state.level,
                 kind,
                 editionHistory,
                 isOpenType(state.settings.type),
-                state.settings.type === 'ultimateEdition' ? state.poolCharts : [],
+                ultimate ? state.poolCharts : [],
             )
 
             state.settings.roundMode = kind
@@ -1951,7 +1877,10 @@ state.levelInfo = await fetchLevelInfo(
                 this.sendAll({ type: 'updateLevel', level: null })
             }
 
-            if (state.settings.type === 'ultimateEdition' && completedRound?.roundKind === 'tournament') {
+            if (
+                isUltimateTournament(state.settings, state.edition) &&
+                completedRound?.roundKind === 'tournament'
+            ) {
                 const completedIndex = state.poolCharts.findIndex(
                     (chart) => sameLevel(completedRound!.level, chart),
                 )
@@ -1962,7 +1891,7 @@ state.levelInfo = await fetchLevelInfo(
                     if (state.ultimateRoundIndex < state.poolCharts.length) {
                         const nextChart = state.poolCharts[state.ultimateRoundIndex]!
                         state.level = { address: nextChart.address, name: nextChart.name }
-                        state.levelInfo = await fetchLevelInfo(state.level)
+                        state.levelInfo = await fetchLevelInfo(state.level, nextChart.constant)
                         state.levelOptions = []
                         this.sendLevel()
                     } else {
@@ -1988,6 +1917,7 @@ state.levelInfo = await fetchLevelInfo(
         const editionHistory = priorHistory.filter(
             (record) => !record.edition || record.edition === this.st.edition,
         )
+        const ultimate = isUltimateTournament(this.st.settings, this.st.edition)
         const kind: RoundKind =
             this.st.round?.kind ?? this.computeRoundKind(this.st.level, editionHistory)
         const label =
@@ -1997,7 +1927,7 @@ state.levelInfo = await fetchLevelInfo(
                 kind,
                 editionHistory,
                 isOpenType(this.st.settings.type),
-                this.st.settings.type === 'ultimateEdition' ? this.st.poolCharts : [],
+                ultimate ? this.st.poolCharts : [],
             )
         const rewindEligibleUserIds =
             kind === 'rewind'
@@ -2016,7 +1946,6 @@ state.levelInfo = await fetchLevelInfo(
             roundKind: kind,
             roundLabel: label,
             countsTowardScore: kind === 'tournament' || kind === 'rewind',
-            isReplay: kind === 'rewind' || kind === 'freeplay',
             rewindEligibleUserIds,
             results: { ...this.st.results },
         }
@@ -2030,7 +1959,7 @@ state.levelInfo = await fetchLevelInfo(
         const state = this.st
 
         if (
-            state.settings.type !== 'ultimateEdition' ||
+            !isUltimateTournament(state.settings, state.edition) ||
             state.ultimateRoundIndex < state.poolCharts.length ||
             state.ultimatePicksSaved
         ) return
@@ -2260,6 +2189,7 @@ state.levelInfo = await fetchLevelInfo(
             const state = this.st
             const mode = state.settings.scoring
             const open = isOpenType(state.settings.type)
+            const ultimate = isUltimateTournament(state.settings, state.edition)
 
             const presentMembers = state.members.filter(
                 (member) => this.socketsOf(member.id).length > 0,
@@ -2341,7 +2271,7 @@ state.levelInfo = await fetchLevelInfo(
                 const kind = round.roundKind ?? 'tournament'
                 const baseLabel =
                     round.roundLabel ||
-                    buildRoundLabel(round.level, kind, priorHistory, open, state.settings.type === 'ultimateEdition' ? state.poolCharts : [])
+                    buildRoundLabel(round.level, kind, priorHistory, open, ultimate ? state.poolCharts : [])
                 const label = isLive ? `${baseLabel} (live)` : baseLabel
                 const song = round.levelTitle || round.level?.name
                 const title = song
@@ -2381,7 +2311,7 @@ state.levelInfo = await fetchLevelInfo(
             return [{ title: '', members }]
         }
 
-        if (type === 'ultimateEdition') {
+        if (isUltimateTournament(this.st.settings, this.st.edition)) {
             const assigned = members.filter(
                 (member) => this.st.ultimateParticipants.includes(member.handle),
             )
@@ -2395,7 +2325,7 @@ state.levelInfo = await fetchLevelInfo(
             ]
         }
 
-        if (type === 'groupStage') {
+        if (isGroupTournament(this.st.settings, this.st.edition)) {
             const groupNames = [
                 ...new Set(
                     Object.values(this.st.divisions)
