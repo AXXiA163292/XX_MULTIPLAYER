@@ -50,6 +50,7 @@ export type SheetChart = {
     address: string
     name: string
     playLevel?: number
+    constant?: number
     musicVocalIds?: number[]
     sekaiVocalVersion?: number
 }
@@ -574,45 +575,72 @@ export async function getEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const { headers, normalized, editionCol, dataRows } = parseIndexSheet(rows)
+    const { normalized, editionCol, dataRows } = parseIndexSheet(rows)
 
     const edition = normalizeEditionLabel(requestedEdition)
-    const activeRow = dataRows.find((row) =>
-        normalizeEditionLabel(row[editionCol]) === edition,
-    ) ?? []
+    const activeRow = dataRows.find(
+        (row) => normalizeEditionLabel(row[editionCol]) === edition,
+    )
 
     const groupStage: SheetChart[] = []
     const final: SheetChart[] = []
     const divisions: Record<string, string> = {}
     const ultimateParticipants: string[] = []
 
-    for (let column = 0; column < headers.length; column++) {
-        const header = normalized[column] ?? ''
-        const value = normalizeId(activeRow[column])
-        if (!header || !value) continue
-
-        const groupMatch = header.match(/^G(\d+)$/)
-        const finalMatch = header.match(/^F(\d+)$/)
-
-        if (groupMatch || finalMatch) {
-            const id = groupMatch ? `G${groupMatch[1]}` : `F${finalMatch![1]}`
-            const chart = chartFromUrl(id, value)
-            if (!chart) continue
-
-            const playLevelColumn = normalized.indexOf(`${id}PLAYLEVEL`)
-            const rawPlayLevel = playLevelColumn >= 0
-                ? normalizeId(activeRow[playLevelColumn]).replace(',', '.')
-                : ''
-            const playLevel = Number(rawPlayLevel)
-
-            if (rawPlayLevel && Number.isFinite(playLevel)) {
-                chart.playLevel = playLevel
-            }
-
-            if (groupMatch) groupStage.push(chart)
-            else final.push(chart)
-            continue
+    if (!activeRow) {
+        console.error(`[INDEX] Edition not found: ${edition}`)
+        return {
+            edition,
+            groupStage,
+            final,
+            divisions,
+            ultimateParticipants,
         }
+    }
+
+    const column = (key: string) => normalized.indexOf(key.toUpperCase())
+
+    const slots = [
+        'G1', 'G2', 'G3', 'G4', 'G5', 'G6',
+        'F1', 'F2', 'F3', 'F4',
+    ]
+
+    for (const slot of slots) {
+        const urlColumn = column(slot)
+        const playLevelColumn = column(`${slot}playLevel`)
+        const constantColumn = column(`${slot}constant`)
+
+        if (urlColumn < 0) continue
+
+        const rawUrl = normalizeId(activeRow[urlColumn])
+        const chart = chartFromUrl(slot, rawUrl)
+
+        if (!chart) continue
+
+        if (playLevelColumn >= 0) {
+            const playLevel = parseEditionPlayLevel(activeRow[playLevelColumn])
+            if (playLevel !== null) chart.playLevel = playLevel
+        }
+
+        if (constantColumn >= 0) {
+            const constant = parseConstantValue(
+                normalizeId(activeRow[constantColumn]),
+            )
+            if (constant !== null) chart.constant = constant
+        }
+
+        if (slot.startsWith('G')) {
+            groupStage.push(chart)
+        } else {
+            final.push(chart)
+        }
+    }
+
+    for (let i = 0; i < normalized.length; i++) {
+        const header = normalized[i] ?? ''
+        const value = normalizeId(activeRow[i])
+
+        if (!header || !value) continue
 
         if (isGroupHeader(header)) {
             for (const handle of splitHandles(value)) {
@@ -636,6 +664,20 @@ export async function getEditionData(
 
     const sortByNumber = (a: SheetChart, b: SheetChart) =>
         Number(a.id.slice(1)) - Number(b.id.slice(1))
+
+    console.log('[INDEX] Loaded edition:', {
+        edition,
+        groupStage: groupStage.map((chart) => ({
+            id: chart.id,
+            playLevel: chart.playLevel,
+            constant: chart.constant,
+        })),
+        final: final.map((chart) => ({
+            id: chart.id,
+            playLevel: chart.playLevel,
+            constant: chart.constant,
+        })),
+    })
 
     return {
         edition,
