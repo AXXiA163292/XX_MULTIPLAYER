@@ -1528,6 +1528,16 @@ function renderStaffChatHtml(
     height:auto;
     display:block;
   }
+    .media-image-error{
+    width:100%;
+    min-height:140px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:var(--blush-soft);
+    color:var(--muted);
+    font-size:13px;
+  }
   .media-meta{
     padding:10px 14px;
     display:flex;
@@ -2113,22 +2123,21 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
-  function openMediaUploadModal() {
+    function openMediaUploadModal() {
     const active = getActiveUser()
+    mediaStatusEl.textContent = ''
 
-    if (!active || active.handle !== MEDIA_ADMIN) {
+    if (!active || String(active.handle).trim() !== MEDIA_ADMIN) {
         mediaStatusEl.textContent = 'Only #163292 can upload media.'
-        return
     }
 
-    mediaStatusEl.textContent = ''
     setActiveTab('media')
     mediaUploadModal.classList.add('open')
 
     requestAnimationFrame(() => {
         mediaFileInput.focus()
     })
-}
+  }
 
   function setActiveTab(tab) {
     activeTab = tab === 'media' ? 'media' : 'chat';
@@ -2147,11 +2156,11 @@ function renderStaffChatHtml(
   tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
   tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
 
-  addMediaBtn.onclick = (e) => {
+    addMediaBtn.addEventListener('click', (e) => {
     e.preventDefault()
     e.stopPropagation()
     openMediaUploadModal()
-};
+  })
 
   closeMediaModalBtn.addEventListener('click', () => {
     mediaUploadModal.classList.remove('open');
@@ -2182,8 +2191,8 @@ function renderStaffChatHtml(
         ? '<button type="button" class="del-btn" data-delete-media="' + escapeAttr(item.id) + '">Delete</button>'
         : '';
 
-      return '<article class="media-card">' +
-        '<img src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media') + '"/>' +
+            return '<article class="media-card">' +
+        '<img data-media-image loading="lazy" decoding="async" src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media')+'"/>' +
         '<div class="media-meta">' +
           '<div style="display:flex;flex-direction:column;gap:4px;min-width:0">' + captionHtml + linkHtml + '</div>' +
           delHtml +
@@ -2191,6 +2200,14 @@ function renderStaffChatHtml(
       '</article>';
     }).join('');
   }
+    mediaFeedEl.addEventListener('error', (e) => {
+    const img = e.target.closest('[data-media-image]')
+    if (!img) return
+    const fallback = document.createElement('div')
+    fallback.className = 'media-image-error'
+    fallback.textContent = 'Image unavailable'
+    img.replaceWith(fallback)
+  }, true)
 
   async function refreshMediaList() {
     const active = getActiveUser();
@@ -2252,8 +2269,10 @@ function renderStaffChatHtml(
       mediaUploadModal.classList.remove('open');
       setActiveTab('media');
       if (Array.isArray(data.items)) renderMedia(data.items);
+    }     } catch (error) {
+      mediaStatusEl.textContent = error instanceof Error ? error.message : 'Upload failed. Please try again.'
     } finally {
-      uploadMediaBtn.disabled = false;
+      uploadMediaBtn.disabled = false
     }
   });
 
