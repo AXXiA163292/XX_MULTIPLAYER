@@ -9,6 +9,8 @@ import {
     getCustomLevels,
     getPlaylists,
     refreshDailyAssets,
+    getAvailableEditions,
+    getCurrentEdition,
     type SheetChart,
 } from './sheets.ts'
 import { b64encode, randomId, signToken, verifySonolusSignature, verifyToken } from './crypto.ts'
@@ -4709,20 +4711,28 @@ await sendChatEmailNotifications(env, newMessage)
         }
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
-            const session = await sessionOf(req, env, url)
-            const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
+    const session = await sessionOf(req, env, url)
+    const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
-            return json({
-                creates: session ? roomForms(isHost) : [],
-                searches: [],
-                sections: [
-                    {
-                        title: 'Rooms',
-                        itemType: 'room',
-                        items: await roomItems(env, session),
-                    },
-                ],
-            })
+    let availableEditions: string[]
+    try {
+        availableEditions = await getAvailableEditions()
+    } catch (error) {
+        console.error('[ROOMS] Could not load editions:', error)
+        availableEditions = [await getCurrentEdition()]
+    }
+
+    return json({
+        creates: session ? roomForms(isHost, availableEditions) : [],
+        searches: [],
+        sections: [
+            {
+                title: 'Rooms',
+                itemType: 'room',
+                items: await roomItems(env, session),
+            },
+        ],
+    })
         }
 
         if (path === '/sonolus/rooms/list' && req.method === 'GET') {
