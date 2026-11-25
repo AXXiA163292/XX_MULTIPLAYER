@@ -49,6 +49,7 @@ export type SheetChart = {
     url: string
     address: string
     name: string
+    playLevel?: number
     musicVocalIds?: number[]
     sekaiVocalVersion?: number
 }
@@ -58,6 +59,19 @@ export type EditionData = {
     groupStage: SheetChart[]
     final: SheetChart[]
     divisions: Record<string, string>
+    ultimateParticipants: string[]
+}
+
+export type UltimateSeason = 'winter' | 'spring' | 'summer' | 'fall'
+
+export type UltimatePicks = Record<UltimateSeason, SheetChart>
+
+export type UltimateEditionData = {
+    edition: string
+    seasons: Record<UltimateSeason, SheetChart[]>
+    contestWinner: SheetChart
+    ultimate: SheetChart
+    participants: string[]
 }
 
 export type PlaylistData = {
@@ -511,8 +525,8 @@ export async function getEditionData(): Promise<EditionData> {
     const headers = rows[0]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
 
-    if (normalizeId(headers[0]).toLowerCase() !== 'index') {
-        throw new Error(`[INDEX] Expected cell A1 to be "Index", received "${headers[0] ?? ''}".`)
+        if (!['index', 'edition'].includes(normalizeId(headers[0]).toLowerCase())) {
+        throw new Error(`[INDEX] Expected cell A1 to be "edition", received "${headers[0] ?? ''}".`)
     }
 
     if (!normalized.includes('G1') || !normalized.includes('F1')) {
@@ -536,9 +550,10 @@ export async function getEditionData(): Promise<EditionData> {
         throw new Error(`Current edition name in column A of "${INDEX_SHEET_TAB}" is empty.`)
     }
 
-    const groupStage: SheetChart[] = []
+        const groupStage: SheetChart[] = []
     const final: SheetChart[] = []
     const divisions: Record<string, string> = {}
+    const ultimateParticipants: string[] = []
 
     for (let column = 0; column < headers.length; column++) {
         const header = normalized[column] ?? ''
@@ -548,10 +563,20 @@ export async function getEditionData(): Promise<EditionData> {
         const groupMatch = header.match(/^G(\d+)$/)
         const finalMatch = header.match(/^F(\d+)$/)
 
-        if (groupMatch || finalMatch) {
+                if (groupMatch || finalMatch) {
             const id = groupMatch ? `G${groupMatch[1]}` : `F${finalMatch![1]}`
             const chart = chartFromUrl(id, value)
             if (!chart) continue
+
+            const playLevelColumn = normalized.indexOf(`${id}PLAYLEVEL`)
+            const rawPlayLevel = playLevelColumn >= 0
+                ? normalizeId(activeRow[playLevelColumn]).replace(',', '.')
+                : ''
+            const playLevel = Number(rawPlayLevel)
+
+            if (rawPlayLevel && Number.isFinite(playLevel)) {
+                chart.playLevel = playLevel
+            }
 
             if (groupMatch) groupStage.push(chart)
             else final.push(chart)
@@ -565,23 +590,162 @@ export async function getEditionData(): Promise<EditionData> {
             continue
         }
 
-        if (header === 'UB' || header === 'LB') {
+                if (header === 'UB' || header === 'LB') {
             const division = header === 'UB' ? 'Upper Bracket' : 'Lower Bracket'
             for (const handle of splitHandles(value)) {
                 divisions[handle] = division
             }
+            continue
+        }
+
+        if (header === 'UX') {
+            ultimateParticipants.push(...splitHandles(value))
         }
     }
 
     const sortByNumber = (a: SheetChart, b: SheetChart) =>
         Number(a.id.slice(1)) - Number(b.id.slice(1))
 
-    return {
+        return {
         edition,
         groupStage: groupStage.sort(sortByNumber),
         final: final.sort(sortByNumber),
         divisions,
+        ultimateParticipants,
     }
+}
+
+function parseEditionPlayLevel(value: unknown): number | null {
+    const raw = normalizeId(value).replace(',', '.')
+    if (!raw) return null
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) ? parsed : null
+}
+
+function ultimatePicksKey(edition: string): string {
+    return `ultimate-editions/${edition.toLowerCase().replace(/\s+/g, '-')}/picks.json`
+}
+
+export async function getUltimateEditionData(): Promise<UltimateEditionData> {
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
+    if (rows.length < 2) throw new Error('[ULTIMATE] Edition sheet has no data rows.')
+
+    const headers = rows[0]!.map((cell) => normalizeId(cell))
+    const normalized = headers.map((cell) => cell.toUpperCase())
+
+    if (!['INDEX', 'EDITION'].includes(normalized[0] ?? '')) {
+        throw new Error('[ULTIMATE] Column A must be named edition.')
+    }
+
+    const ultimateRow = rows.slice(1).find((row) =>
+        /^ULTIMATE\s+\d{4}$/i.test(normalizeId(row[0])),
+    )
+    if (!ultimateRow) throw new Error('[ULTIMATE] Could not find an ULTIMATE year row.')
+
+    const edition = normalizeId(ultimateRow[0]).toUpperCase()
+    const year = edition.match(/\d{4}$/)?.[0]
+    if (!year) throw new Error('[ULTIMATE] Invalid edition year.')
+
+    const getRow = (name: string) => rows.slice(1).find(
+        (row) => normalizeId(row[0]).toUpperCase() === name,
+    )
+
+    const buildSeasonPool = (row: string[], season: string): SheetChart[] => {
+        const charts: SheetChart[] = []
+
+        for (const slot of [
+            'G1', 'G2', 'G3', 'G4', 'G5', 'G6',
+            'F1', 'F2', 'F3', 'F4',
+        ]) {
+            const urlColumn = normalized.indexOf(slot)
+            const levelColumn = normalized.indexOf(`${slot}PLAYLEVEL`)
+            if (urlColumn < 0 || levelColumn < 0) continue
+
+            const playLevel = parseEditionPlayLevel(row[levelColumn])
+            if (playLevel === null || playLevel < 32) continue
+
+            const chart = chartFromUrl(
+                slot,
+                normalizeId(row[urlColumn]),
+            )
+
+            if (chart) {
+                chart.id = `${season}-${slot}`
+                chart.playLevel = playLevel
+                charts.push(chart)
+            }
+        }
+
+        return charts
+    }
+
+    const seasons = {
+        winter: buildSeasonPool(getRow(`WINTER ${year}`) ?? [], 'WINTER'),
+        spring: buildSeasonPool(getRow(`SPRING ${year}`) ?? [], 'SPRING'),
+        summer: buildSeasonPool(getRow(`SUMMER ${year}`) ?? [], 'SUMMER'),
+        fall: buildSeasonPool(getRow(`FALL ${year}`) ?? [], 'FALL'),
+    }
+
+    for (const season of Object.keys(seasons) as UltimateSeason[]) {
+        if (seasons[season].length === 0) {
+            throw new Error(`[ULTIMATE] No level 32+ charts found for ${season.toUpperCase()} ${year}.`)
+        }
+    }
+
+    const getFixedChart = (slot: 'F1' | 'F2'): SheetChart => {
+        const column = normalized.indexOf(slot)
+        const chart = column >= 0
+            ? chartFromUrl(slot, normalizeId(ultimateRow[column]))
+            : null
+
+        if (!chart) throw new Error(`[ULTIMATE] Missing ${slot} in ${edition}.`)
+        return chart
+    }
+
+    const uxColumn = normalized.indexOf('UX')
+
+    return {
+        edition,
+        seasons,
+        contestWinner: getFixedChart('F1'),
+        ultimate: getFixedChart('F2'),
+        participants: uxColumn >= 0
+            ? splitHandles(normalizeId(ultimateRow[uxColumn]))
+            : [],
+    }
+}
+
+export async function getSavedUltimatePicks(
+    env: Env,
+    edition: string,
+): Promise<UltimatePicks | null> {
+    const saved = await readBucketJson<UltimatePicks>(
+        env,
+        ultimatePicksKey(edition),
+        Number.POSITIVE_INFINITY,
+    )
+
+    if (!saved) return null
+
+    const seasons: UltimateSeason[] = ['winter', 'spring', 'summer', 'fall']
+    if (seasons.some((season) => {
+        const chart = saved[season]
+        return !chart ||
+            typeof chart.address !== 'string' ||
+            typeof chart.name !== 'string'
+    })) {
+        return null
+    }
+
+    return saved
+}
+
+export async function saveUltimatePicks(
+    env: Env,
+    edition: string,
+    picks: UltimatePicks,
+): Promise<void> {
+    await writeBucketJson(env, ultimatePicksKey(edition), picks)
 }
 
 export async function getCurrentEdition(): Promise<string> {
