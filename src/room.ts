@@ -939,11 +939,15 @@ export class Room extends DurableObject<Env> {
             }
         } catch (error) {
             console.error(
-                '[ROOM CONFIG] Edition sheet failure:',
+                '[ROOM CONFIG] Edition sheet failure. Opening room without edition data:',
                 error instanceof Error ? error.message : String(error),
                 error instanceof Error ? error.stack : '',
             )
-            return false
+
+            editionData = null
+            ultimateData = null
+            hadSavedUltimatePicks = false
+            poolCharts = []
         }
 
         this.st.edition = isOpenType(settings.type) ? '' : settings.edition
@@ -1367,8 +1371,28 @@ export class Room extends DurableObject<Env> {
                             level: state.level,
                         })
                     } catch (error) {
-                        console.error('[ROOM] Could not change edition:', error)
-                        return this.resync(uid)
+                        console.error(
+                            '[ROOM] Could not load selected edition. Continuing without edition data:',
+                            error,
+                        )
+
+                        state.edition = next.edition
+                        state.poolCharts = []
+                        state.divisions = {}
+                        state.ultimateParticipants = []
+                        state.ultimateRoundIndex = 0
+                        state.ultimatePicksSaved = false
+                        state.suggestions = []
+                        state.level = null
+                        state.levelInfo = null
+                        state.levelOptions = []
+                        state.results = {}
+                        state.round = null
+
+                        this.sendAll({
+                            type: 'updateLevel',
+                            level: null,
+                        })
                     }
                 }
 
@@ -1833,7 +1857,7 @@ export class Room extends DurableObject<Env> {
             }
 
             const editionHistory = state.history.filter(
-                (record) => !record.edition || record.edition === state.edition,
+                (record) => !record.edition || record.edition === this.st.edition,
             )
 
             const kind = this.computeRoundKind(state.level, editionHistory)
