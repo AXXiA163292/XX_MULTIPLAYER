@@ -22,50 +22,9 @@ export { Room } from './room.ts'
 export { Lobby } from './lobby.ts'
 export { Chat } from './chat.ts'
 
-const CHAT_PFP_HANDLES = ['163292', '283420', '3227470'] as const
-const CHAT_PFP_HANDLE_SET = new Set<string>(CHAT_PFP_HANDLES)
-const CHAT_HANDLE_COOKIE = 'xx_chat_handle'
-const PROTECTED_CHAT_HANDLE = '163292'
-const MEDIA_ADMIN_HANDLE = '163292'
-
-const DEFAULT_CHAT_PROFILES: Record<string, { handle: string; name: string }> = {
-    '163292': { handle: '163292', name: 'AXX!A' },
-    '283420': { handle: '283420', name: 'Astra' },
-    '3227470': { handle: '3227470', name: 'Nocturne' },
-}
-
-const HANDLE_TIMEZONES: Record<string, string> = {
-    '163292': 'Europe/Paris',
-    '283420': 'Europe/Paris',
-    '3227470': 'Etc/GMT+6',
-}
-
-type EmailNotifyMode = 'mention' | 'all'
-
-type UserChatPrefs = {
-    handle: string
-    displayName: string
-    pfpKey?: string
-    notifyEmail?: string
-    emailNotifyMode?: EmailNotifyMode
-    updatedAt: number
-}
-
-type ChatMediaItem = {
-    id: string
-    imageKey: string
-    contentType: string
-    link?: string
-    caption?: string
-    createdAt: number
-    authorHandle: string
-}
-
 type WorkerEnv = Env & {
     COMMUNITY_BUCKET?: R2Bucket
     SONOLUS_ASSETS_BUCKET?: R2Bucket
-    RESEND_API_KEY?: string
-    RESEND_FROM_EMAIL?: string
 }
 
 const json = (data: unknown, status = 200) =>
@@ -74,15 +33,6 @@ const json = (data: unknown, status = 200) =>
         headers: {
             'Content-Type': 'application/json',
             'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'no-store',
-        },
-    })
-
-const html = (body: string, status = 200) =>
-    new Response(body, {
-        status,
-        headers: {
-            'Content-Type': 'text/html; charset=utf-8',
             'Cache-Control': 'no-store',
         },
     })
@@ -102,43 +52,11 @@ const isStaffChatHandle = (handle?: string | null): boolean =>
         (STAFF_CHAT_HANDLES as readonly string[]).includes(String(handle).trim()),
     )
 
-const isMediaAdminHandle = (handle?: string | null): boolean =>
-    String(handle ?? '').trim() === MEDIA_ADMIN_HANDLE
-
-function requiresProfilePassword(handle?: string | null): boolean {
-    return String(handle ?? '').trim() === PROTECTED_CHAT_HANDLE
-}
-
-function matchesSessionSecretPassword(env: WorkerEnv, password?: unknown): boolean {
-    const secret = String(env.SESSION_SECRET ?? '')
-    const candidate = typeof password === 'string' ? password : ''
-    return Boolean(secret) && candidate.length > 0 && candidate === secret
-}
-
-function defaultDisplayName(handle: string, fallbackName?: string): string {
-    const cleanHandle = String(handle ?? '').trim()
-    const cleanFallback = String(fallbackName ?? '').trim()
-    return cleanFallback || DEFAULT_CHAT_PROFILES[cleanHandle]?.name || cleanHandle
-}
-
 function formatAuthorTag(author: string | undefined, handle: string | undefined): string {
     const cleanHandle = String(handle ?? '').trim()
     const cleanAuthor = String(author ?? '').trim() || cleanHandle
     if (!cleanHandle) return cleanAuthor
     return `${cleanAuthor}#${cleanHandle}`
-}
-
-function parseCookie(req: Request, name: string): string | null {
-    const cookieHeader = req.headers.get('Cookie') ?? ''
-    for (const part of cookieHeader.split(';')) {
-        const idx = part.indexOf('=')
-        if (idx === -1) continue
-        const key = part.slice(0, idx).trim()
-        if (key === name) {
-            return decodeURIComponent(part.slice(idx + 1).trim())
-        }
-    }
-    return null
 }
 
 function communityBucket(env: WorkerEnv): R2Bucket | null {
@@ -153,20 +71,6 @@ function bucketsForRead(env: WorkerEnv): R2Bucket[] {
     return [env.SONOLUS_ASSETS_BUCKET, env.COMMUNITY_BUCKET].filter(
         (b): b is R2Bucket => Boolean(b),
     )
-}
-
-function sanitizeHttpLink(raw?: unknown): string {
-    const val = String(raw ?? '').trim()
-    if (!val) return ''
-    try {
-        const parsed = new URL(val)
-        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-            return parsed.toString()
-        }
-    } catch {
-        // invalid link
-    }
-    return ''
 }
 
 async function getBucketObject(
@@ -192,71 +96,6 @@ async function getCachedJsonFromAssets<T>(
     } catch {
         return null
     }
-}
-
-const MEDIA_INDEX_KEY = 'chat/media/index.json'
-
-async function listChatMedia(env: WorkerEnv): Promise<ChatMediaItem[]> {
-    const bucket = communityBucket(env)
-    if (!bucket) return []
-
-    const indexed: ChatMediaItem[] = []
-    for (const key of [MEDIA_INDEX_KEY, 'media/index.json']) {
-        try {
-            const obj = await bucket.get(key)
-            if (!obj) continue
-            const parsed = await obj.json() as { items?: ChatMediaItem[] } | ChatMediaItem[]
-            const rawList = Array.isArray(parsed)
-                ? parsed
-                : Array.isArray(parsed?.items)
-                    ? parsed.items
-                    : []
-            for (const item of rawList) {
-                if (item && typeof item.id === 'string' && typeof item.imageKey === 'string') {
-                    indexed.push(item)
-                }
-            }
-            if (indexed.length > 0) break
-        } catch {
-            // try next
-        }
-    }
-
-    if (indexed.length > 0) {
-        return indexed.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
-    }
-
-    try {
-        const listed = await bucket.list({ prefix: 'chat/media/' })
-        const derived: ChatMediaItem[] = []
-        for (const obj of listed.objects ?? []) {
-            if (!obj.key || obj.key.endsWith('/') || obj.key.endsWith('.json')) continue
-            const fileName = obj.key.slice('chat/media/'.length)
-            const id = fileName.replace(/\.[^.]+$/, '') || fileName
-            derived.push({
-                id,
-                imageKey: obj.key,
-                contentType: obj.httpMetadata?.contentType ?? 'image/png',
-                createdAt: obj.uploaded ? new Date(obj.uploaded).getTime() : Date.now(),
-                authorHandle: MEDIA_ADMIN_HANDLE,
-            })
-        }
-        return derived.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
-    } catch {
-        return []
-    }
-}
-
-async function saveChatMediaIndex(env: WorkerEnv, items: ChatMediaItem[]): Promise<void> {
-    const bucket = communityBucket(env)
-    if (!bucket) {
-        throw new Error('COMMUNITY_BUCKET is not configured.')
-    }
-    await bucket.put(
-        MEDIA_INDEX_KEY,
-        JSON.stringify({ items }),
-        { httpMetadata: { contentType: 'application/json' } },
-    )
 }
 
 async function verifySigned(
@@ -326,63 +165,6 @@ async function sessionOf(
 ): Promise<AuthSession | null> {
     const token = extractSessionToken(req, url)
     return token ? verifyToken<AuthSession>(env.SESSION_SECRET, token) : null
-}
-
-function pickedProfile(handle?: string | null): UserProfile | null {
-    const clean = String(handle ?? '').trim()
-    if (!clean || !isStaffChatHandle(clean)) return null
-    const known = DEFAULT_CHAT_PROFILES[clean]
-    return {
-        id: known ? known.handle : clean,
-        handle: clean,
-        name: known ? known.name : clean,
-    }
-}
-
-async function resolveChatUser(
-    req: Request,
-    env: WorkerEnv,
-    url: URL,
-    body?: any,
-): Promise<{ user: UserProfile; fromSonolus: boolean; token: string } | null> {
-    const token = extractSessionToken(req, url) ?? ''
-    const session = token
-        ? await verifyToken<AuthSession>(env.SESSION_SECRET, token)
-        : null
-
-    if (session && isStaffChatHandle(session.user.handle)) {
-        const prefs = await getUserChatPrefs(env, session.user.handle)
-        return {
-            user: {
-                ...session.user,
-                name: prefs.displayName || defaultDisplayName(session.user.handle, session.user.name),
-            },
-            fromSonolus: true,
-            token,
-        }
-    }
-
-    const pickedHandle =
-        url.searchParams.get('handle') ??
-        req.headers.get('X-Chat-Handle') ??
-        body?.handle ??
-        parseCookie(req, CHAT_HANDLE_COOKIE) ??
-        null
-
-    const picked = pickedProfile(pickedHandle)
-    if (picked) {
-        const prefs = await getUserChatPrefs(env, picked.handle)
-        return {
-            user: {
-                ...picked,
-                name: prefs.displayName || picked.name,
-            },
-            fromSonolus: false,
-            token: '',
-        }
-    }
-
-    return null
 }
 
 const roomStub = (env: WorkerEnv, name: string) =>
@@ -581,10 +363,6 @@ function canDeleteComment(session: AuthSession | null, authorHandle: string): bo
     return session.user.handle === authorHandle || session.user.handle === TOURNAMENT_HOST_HANDLE
 }
 
-function canDeleteChatMessage(actorHandle: string, authorHandle: string): boolean {
-    return actorHandle === authorHandle || actorHandle === TOURNAMENT_HOST_HANDLE
-}
-
 function buildChatPostItem(messages: ChatMessage[], pinnedId: string | null) {
     const latest = messages[messages.length - 1] ?? null
     const pinnedMsg = pinnedId ? messages.find((m) => m.id === pinnedId) ?? null : null
@@ -646,14 +424,6 @@ function extractCommentText(values: URLSearchParams): string {
         if (key !== 'type' && val.trim()) return val.trim()
     }
     return ''
-}
-
-function externalChatUrl(req: Request, env: WorkerEnv): string {
-    return `${addressOf(req, env)}/chat`
-}
-
-function sonolusChatLinkUrl(req: Request, env: WorkerEnv): string {
-    return externalChatUrl(req, env)
 }
 
 const VALID_POST_CATEGORIES = new Set([
@@ -768,14 +538,6 @@ function getImageDimensions(
     return null
 }
 
-function escapeAttr(str: string): string {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/"/g, '&quot;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-}
-
 const RANKED_TIERS_UPPER = new Set([
     'BEGINNER',
     'BRONZE',
@@ -788,7 +550,7 @@ const RANKED_TIERS_UPPER = new Set([
 
 async function resolveRoomCover(
     env: WorkerEnv,
-        summary: {
+    summary: {
         type?: string
         tier?: string
         hostHandle?: string
@@ -801,22 +563,6 @@ async function resolveRoomCover(
     if (type === 'casualRoom') {
         if (summary.coverUrl) {
             return { url: summary.coverUrl }
-        }        if (!summary.level) {
-            const handle = String(summary.hostHandle ?? '').trim()
-            if (handle) {
-                const prefs = await getUserChatPrefs(env, handle)
-                const keys = [
-                    prefs.pfpKey,
-                    `chat/pfp/${handle}.png`,
-                ].filter((key): key is string => Boolean(key))
-
-                const profileImage = await getBucketObject(communityBucket(env), keys)
-                if (profileImage) {
-                    return {
-                        url: `/sonolus/chat/pfp/${encodeURIComponent(handle)}`,
-                    }
-                }
-            }
         }
         if (summary.level?.address && summary.level?.name) {
             const base = summary.level.address.replace(/\/+$/, '')
@@ -857,7 +603,7 @@ async function resolveRoomCover(
         }
     }
 
-    if (type === 'groupStage' || type === 'final') {
+    if (type === 'tournament') {
         return {
             url: '/sonolus/rooms/cover/xx',
         }
@@ -866,6 +612,7 @@ async function resolveRoomCover(
     void env
     return undefined
 }
+
 async function roomItems(env: WorkerEnv, _session: AuthSession | null) {
     const rooms = await lobby(env).list()
 
@@ -1289,80 +1036,10 @@ export default {
             })
         }
 
-        if (path === '/manifest.webmanifest' && req.method === 'GET') {
-            return new Response(JSON.stringify({
-                name: 'XX!',
-                short_name: 'XX!',
-                start_url: '/chat',
-                scope: '/',
-                display: 'standalone',
-                background_color: '#FAF7F9',
-                theme_color: '#9E4B76',
-                icons: [
-                    {
-                        src: '/app-icon.png',
-                        sizes: '192x192',
-                        type: 'image/png',
-                        purpose: 'any maskable',
-                    },
-                    {
-                        src: '/app-icon.png',
-                        sizes: '512x512',
-                        type: 'image/png',
-                        purpose: 'any maskable',
-                    },
-                ],
-            }), {
-                headers: {
-                    'Content-Type': 'application/manifest+json; charset=utf-8',
-                    'Cache-Control': 'public, max-age=3600',
-                },
-            })
-        }
-
-        if (path === '/sw.js' && req.method === 'GET') {
-            const swCode = `
-self.addEventListener('install', (event) => {
-  self.skipWaiting();
-});
-self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim());
-});
-self.addEventListener('fetch', (event) => {
-  const req = event.request;
-  if (req.method !== 'GET') return;
-  const u = new URL(req.url);
-  if (u.pathname === '/app-icon.png' || u.pathname.startsWith('/api/chat/pfp/')) {
-    event.respondWith(
-      caches.open('xx-chat-media-v1').then(async (cache) => {
-        const cached = await cache.match(req);
-        if (cached) return cached;
-        const fresh = await fetch(req);
-        if (fresh.ok) cache.put(req, fresh.clone());
-        return fresh;
-      })
-    );
-  }
-});
-`
-            return new Response(swCode.trim(), {
-                headers: {
-                    'Content-Type': 'application/javascript; charset=utf-8',
-                    'Service-Worker-Allowed': '/',
-                    'Cache-Control': 'no-store',
-                },
-            })
-        }
-
-        if (path === '/app-icon.png' && req.method === 'GET') {
-            const obj =
-                (await getBucketObject(assetsBucket(env), [
-                    'server/banner.png',
-                    'chat/pfp/163292.png',
-                ])) ??
-                (await getBucketObject(communityBucket(env), [
-                    'chat/pfp/163292.png',
-                ]))
+        if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
+            const obj = await getBucketObject(communityBucket(env), [
+                'chat/XX!.png',
+            ])
             if (!obj) return new Response(null, { status: 404 })
             return new Response(obj.body, {
                 headers: {
@@ -1371,20 +1048,6 @@ self.addEventListener('fetch', (event) => {
                     'Cache-Control': 'public, max-age=3600',
                 },
             })
-        }
-
-        if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-    const obj = await getBucketObject(communityBucket(env), [
-        'chat/XX!.png',
-    ])
-    if (!obj) return new Response(null, { status: 404 })
-    return new Response(obj.body, {
-        headers: {
-            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'public, max-age=3600',
-        },
-    })
         }
 
         const rankedCoverMatch = path.match(/^\/sonolus\/rooms\/cover\/ranked\/([A-Z]+)$/)
@@ -1406,365 +1069,13 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-                                if (path === '/refresh' || path === '/admin/refresh') {
+        if (path === '/refresh' || path === '/admin/refresh') {
             const summary = await refreshDailyAssets(env)
             await lobby(env).syncAllToR2().catch(() => {})
             return json({
                 ok: summary.errors.length === 0,
                 ...summary,
             })
-        }
-
-                const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
-        if (pfpMatch && req.method === 'GET') {
-            const handle = decodeURIComponent(pfpMatch[1]!).trim()
-            const prefs = await getUserChatPrefs(env, handle)
-            const keys = [
-                prefs.pfpKey,
-                `chat/pfp/${handle}.png`,
-            ].filter((k): k is string => Boolean(k))
-
-            const obj = await getBucketObject(communityBucket(env), keys)
-            if (obj) {
-                return new Response(obj.body, {
-                    headers: {
-                        'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-                        'Access-Control-Allow-Origin': '*',
-                        'Cache-Control': 'no-cache',
-                    },
-                })
-            }
-
-            return new Response(null, { status: 404 })
-        }
-
-        const mediaAssetMatch = path.match(/^\/api\/chat\/media\/([^/]+)$/)
-        if (mediaAssetMatch && req.method === 'GET') {
-            const mediaId = decodeURIComponent(mediaAssetMatch[1]!).trim()
-            const items = await listChatMedia(env)
-            const target = items.find((m) => m.id === mediaId)
-            if (!target) return new Response(null, { status: 404 })
-
-            const obj = await getBucketObject(communityBucket(env), [
-                target.imageKey,
-                `chat/media/${mediaId}.png`,
-                `chat/media/${mediaId}.jpg`,
-                `chat/media/${mediaId}.webp`,
-            ])
-            if (!obj) return new Response(null, { status: 404 })
-
-            return new Response(obj.body, {
-                headers: {
-                    'Content-Type': obj.httpMetadata?.contentType ?? target.contentType ?? 'image/png',
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': 'public, max-age=3600',
-                },
-            })
-        }
-
-        if (path === '/api/chat/media') {
-            let body: any = null
-            if (req.method === 'POST') {
-                try {
-                    body = await req.json()
-                } catch {
-                    return message(400, 'Invalid JSON.')
-                }
-            }
-
-            const resolved = await resolveChatUser(req, env, url, body)
-            if (!resolved) {
-                return message(403, 'Choose a valid handle.')
-            }
-
-            if (req.method === 'GET') {
-                const items = await listChatMedia(env)
-                return json({ items })
-            }
-
-            if (req.method === 'POST') {
-                if (!isMediaAdminHandle(resolved.user.handle)) {
-                    return message(403, 'Only 163292 can add media.')
-                }
-
-                const dataUrl = typeof body?.imageDataUrl === 'string' ? body.imageDataUrl : ''
-                const match = dataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
-                if (!match) {
-                    return message(400, 'Invalid image data.')
-                }
-
-                const mime = match[1]!
-                const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
-                const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
-                if (rawBytes.byteLength > 8 * 1024 * 1024) {
-                    return message(400, 'Media image too large.')
-                }
-
-                const bucket = communityBucket(env)
-                if (!bucket) {
-                    return message(500, 'COMMUNITY_BUCKET is not configured.')
-                }
-
-                const id = randomId(12)
-                const imageKey = `chat/media/${id}.${ext}`
-                await bucket.put(imageKey, rawBytes, {
-                    httpMetadata: { contentType: mime },
-                })
-
-                const safeLink = sanitizeHttpLink(body?.link)
-                const safeCaption = typeof body?.caption === 'string'
-                    ? body.caption.trim().slice(0, 160)
-                    : ''
-
-                const existing = await listChatMedia(env)
-                const nextItem: ChatMediaItem = {
-                    id,
-                    imageKey,
-                    contentType: mime,
-                    ...(safeLink ? { link: safeLink } : {}),
-                    ...(safeCaption ? { caption: safeCaption } : {}),
-                    createdAt: Date.now(),
-                    authorHandle: resolved.user.handle,
-                }
-                const updated = [nextItem, ...existing]
-                await saveChatMediaIndex(env, updated)
-                return json({ ok: true, item: nextItem, items: updated })
-            }
-
-            if (req.method === 'DELETE') {
-                if (!isMediaAdminHandle(resolved.user.handle)) {
-                    return message(403, 'Only 163292 can delete media.')
-                }
-                const id = (url.searchParams.get('id') ?? '').trim()
-                if (!id) return message(400, 'Missing media id.')
-
-                const existing = await listChatMedia(env)
-                const target = existing.find((m) => m.id === id)
-                if (!target) return message(404, 'Media item not found.')
-
-                const bucket = communityBucket(env)
-                if (bucket) {
-                    await bucket.delete(target.imageKey).catch(() => {})
-                }
-                const updated = existing.filter((m) => m.id !== id)
-                await saveChatMediaIndex(env, updated)
-                return json({ ok: true, items: updated })
-            }
-        }
-
-        if (path === '/api/chat/auth' && req.method === 'POST') {
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid JSON.')
-            }
-            const handle = String(body?.handle ?? '').trim()
-            if (!requiresProfilePassword(handle)) {
-                return json({ ok: true })
-            }
-            if (!matchesSessionSecretPassword(env, body?.password)) {
-                return message(401, 'Invalid password.')
-            }
-            return json({ ok: true })
-        }
-
-        if (path === '/api/chat/settings' && req.method === 'POST') {
-            let body: any
-            try {
-                body = await req.json()
-            } catch {
-                return message(400, 'Invalid JSON.')
-            }
-
-            const resolved = await resolveChatUser(req, env, url, body)
-            if (!resolved) {
-                return message(403, 'Choose a valid handle to update settings.')
-            }
-
-            const bucket = communityBucket(env)
-            if (!bucket) {
-                return message(500, 'COMMUNITY_BUCKET is not configured.')
-            }
-
-            const handle = resolved.user.handle
-            let pfpKey: string | undefined
-
-            if (typeof body?.pfpDataUrl === 'string' && body.pfpDataUrl.startsWith('data:image/')) {
-                const match = body.pfpDataUrl.match(/^data:(image\/(?:png|jpeg|webp));base64,(.+)$/)
-                if (!match) {
-                    return message(400, 'Invalid image data.')
-                }
-                const mime = match[1]!
-                const rawBytes = Uint8Array.from(atob(match[2]!), (c) => c.charCodeAt(0))
-                if (rawBytes.byteLength > 2 * 1024 * 1024) {
-                    return message(400, 'Profile image too large.')
-                }
-                pfpKey = `chat/pfp/${handle}.png`
-                await bucket.put(pfpKey, rawBytes, {
-                    httpMetadata: { contentType: mime },
-                })
-            }
-
-            const nextDisplayName = typeof body?.displayName === 'string' && body.displayName.trim()
-                ? body.displayName.trim().slice(0, 40)
-                : resolved.user.name
-
-            const notifyEmail = typeof body?.notifyEmail === 'string'
-                ? body.notifyEmail.trim().slice(0, 120)
-                : undefined
-
-            const emailNotifyMode: EmailNotifyMode | undefined =
-                body?.emailNotifyMode === 'all' || body?.emailNotifyMode === 'mention'
-                    ? body.emailNotifyMode
-                    : undefined
-
-            const savedPrefs = await saveUserChatPrefs(
-                env,
-                handle,
-                nextDisplayName,
-                pfpKey,
-                notifyEmail,
-                emailNotifyMode,
-            )
-            return json({ ok: true, prefs: savedPrefs })
-        }
-
-        if (path === '/ws/chat' && req.headers.get('Upgrade') === 'websocket') {
-            const resolved = await resolveChatUser(req, env, url)
-            if (!resolved) {
-                return new Response('Unauthorized', { status: 401 })
-            }
-            return chatStub(env).fetch(req)
-        }
-
-        if (path === '/chat' && req.method === 'GET') {
-            const [prefsEntries, initialMessages, initialMedia] = await Promise.all([
-                Promise.all(
-                    CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
-                ),
-                chatStub(env).listMessages().catch(() => []),
-                listChatMedia(env).catch(() => []),
-            ])
-            const prefsMap = Object.fromEntries(prefsEntries)
-            const resolved = await resolveChatUser(req, env, url)
-            const sUrl = sonolusChatLinkUrl(req, env)
-            if (resolved) {
-                return html(
-                    renderStaffChatHtml(
-                        resolved.user,
-                        resolved.token,
-                        resolved.fromSonolus,
-                        prefsMap,
-                        sUrl,
-                        initialMessages,
-                        initialMedia,
-                    ),
-                )
-            }
-            return html(
-                renderStaffChatHtml(null, '', false, prefsMap, sUrl, initialMessages, initialMedia),
-            )
-        }
-
-        if (path === '/api/chat') {
-            let body: any = null
-            if (req.method === 'POST') {
-                try {
-                    body = await req.json()
-                } catch {
-                    return message(400, 'Invalid JSON.')
-                }
-            }
-
-            const resolved = await resolveChatUser(req, env, url, body)
-            if (!resolved) {
-                return message(403, 'Choose a valid handle to use chat.')
-            }
-
-            const prefsEntries = await Promise.all(
-                CHAT_PFP_HANDLES.map(async (h) => [h, await getUserChatPrefs(env, h)] as const),
-            )
-            const prefsMap = Object.fromEntries(prefsEntries)
-
-            if (req.method === 'GET') {
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                return json({ messages, prefs: prefsMap })
-            }
-
-            if (req.method === 'POST') {
-                if (body?.action === 'delete') {
-                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
-                    if (!targetId) {
-                        return message(400, 'Missing message id.')
-                    }
-                    const messages = await chatStub(env).listMessages().catch(() => [])
-                    const target = messages.find((m) => m.id === targetId)
-                    if (!target) {
-                        return message(404, 'Message not found.')
-                    }
-                    if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
-                        return message(403, 'Only 163292 can delete messages from other members.')
-                    }
-                    await chatStub(env).deleteMessage(targetId)
-                    const updated = await chatStub(env).listMessages().catch(() => [])
-                    return json({ ok: true, messages: updated, prefs: prefsMap })
-                }
-
-                if (body?.action === 'like') {
-                    const targetId = typeof body?.id === 'string' ? body.id.trim() : ''
-                    if (!targetId) return message(400, 'Missing message id.')
-                    await chatStub(env).toggleLike(targetId, resolved.user.handle)
-                    const updated = await chatStub(env).listMessages().catch(() => [])
-                    return json({ ok: true, messages: updated, prefs: prefsMap })
-                }
-
-                const text = typeof body?.text === 'string' ? body.text.trim() : ''
-                if (!text) return message(400, 'Message cannot be empty.')
-
-                const replyTo = body?.replyTo && typeof body.replyTo === 'object'
-                    ? {
-                        id: String(body.replyTo.id ?? ''),
-                        author: String(body.replyTo.author ?? ''),
-                        handle: String(body.replyTo.handle ?? ''),
-                        text: String(body.replyTo.text ?? '').slice(0, 120),
-                    }
-                    : undefined
-
-                const newMessage = {
-    handle: resolved.user.handle,
-    author: resolved.user.name || resolved.user.handle,
-    text: text.slice(0, 500),
-}
-
-await chatStub(env).addMessage({
-    ...newMessage,
-    ...(replyTo ? { replyTo } : {}),
-})
-
-await sendChatEmailNotifications(env, newMessage)
-
-const messages = await chatStub(env).listMessages().catch(() => [])
-return json({ ok: true, messages, prefs: prefsMap })
-            }
-
-            if (req.method === 'DELETE') {
-                const id = (url.searchParams.get('id') ?? '').trim()
-                if (!id) {
-                    return message(400, 'Missing message id.')
-                }
-                const messages = await chatStub(env).listMessages().catch(() => [])
-                const target = messages.find((m) => m.id === id)
-                if (!target) {
-                    return message(404, 'Message not found.')
-                }
-                if (!canDeleteChatMessage(resolved.user.handle, target.handle)) {
-                    return message(403, 'Only 163292 can delete messages from other members.')
-                }
-                await chatStub(env).deleteMessage(id)
-                const updated = await chatStub(env).listMessages().catch(() => [])
-                return json({ ok: true, messages: updated, prefs: prefsMap })
-            }
         }
 
         const ws = path.match(/^\/ws\/([\w-]+)$/)
@@ -2131,14 +1442,11 @@ return json({ ok: true, messages, prefs: prefsMap })
                     return message(400, 'Message cannot be empty.')
                 }
 
-                const newMessage = {
-    handle: session.user.handle,
-    author: session.user.name || session.user.handle,
-    text: text.slice(0, 500),
-}
-
-await chatStub(env).addMessage(newMessage)
-await sendChatEmailNotifications(env, newMessage)
+                await chatStub(env).addMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
 
                 return json({
                     key: '',
@@ -2293,14 +1601,11 @@ await sendChatEmailNotifications(env, newMessage)
                     return message(400, 'Message cannot be empty.')
                 }
 
-                const newMessage = {
-    handle: session.user.handle,
-    author: session.user.name || session.user.handle,
-    text: text.slice(0, 500),
-}
-
-await chatStub(env).addMessage(newMessage)
-await sendChatEmailNotifications(env, newMessage)
+                await chatStub(env).addMessage({
+                    handle: session.user.handle,
+                    author: session.user.name || session.user.handle,
+                    text: text.slice(0, 500),
+                })
 
                 return json({
                     key: '',
@@ -2530,11 +1835,10 @@ await sendChatEmailNotifications(env, newMessage)
                     chatStub(env).listMessages().catch(() => []),
                     chatStub(env).getPinnedId().catch(() => null),
                 ])
-                const extUrl = externalChatUrl(req, env)
 
                 return json({
                     item: buildChatPostItem(messages, pinnedId),
-                    description: extUrl ? `External chat:\n${extUrl}` : '',
+                    description: '',
                     actions: [],
                     hasCommunity: true,
                     leaderboards: [],
@@ -2783,28 +2087,28 @@ await sendChatEmailNotifications(env, newMessage)
         }
 
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
-    const session = await sessionOf(req, env, url)
-    const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
+            const session = await sessionOf(req, env, url)
+            const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
-    let availableEditions: string[]
-    try {
-        availableEditions = await getAvailableEditions()
-    } catch (error) {
-        console.error('[ROOMS] Could not load editions:', error)
-        availableEditions = [await getCurrentEdition()]
-    }
+            let availableEditions: string[]
+            try {
+                availableEditions = await getAvailableEditions()
+            } catch (error) {
+                console.error('[ROOMS] Could not load editions:', error)
+                availableEditions = [await getCurrentEdition()]
+            }
 
-    return json({
-        creates: session ? roomForms(isHost, availableEditions) : [],
-        searches: [],
-        sections: [
-            {
-                title: 'Rooms',
-                itemType: 'room',
-                items: await roomItems(env, session),
-            },
-        ],
-    })
+            return json({
+                creates: session ? roomForms(isHost, availableEditions) : [],
+                searches: [],
+                sections: [
+                    {
+                        title: 'Rooms',
+                        itemType: 'room',
+                        items: await roomItems(env, session),
+                    },
+                ],
+            })
         }
 
         if (path === '/sonolus/rooms/list' && req.method === 'GET') {
@@ -2824,14 +2128,14 @@ await sendChatEmailNotifications(env, newMessage)
             const name = randomId(8)
             const key = randomId(24)
 
-                        const reservation = {
+            const reservation = {
                 key,
                 hostId: session.user.id,
                 hostName: session.user.name,
                 hostHandle: session.user.handle,
             }
 
-                        await env.LOBBY
+            await env.LOBBY
                 .get(env.LOBBY.idFromName('main'))
                 .reserveHostRoom(session.user.id, name, reservation)
 
@@ -2880,7 +2184,7 @@ await sendChatEmailNotifications(env, newMessage)
             const user = profileOf(body.userProfile)
             const stub = roomStub(env, name)
             const key = req.headers.get('Sonolus-Room-Key')
-                        const authSession = await sessionOf(req, env, url)
+            const authSession = await sessionOf(req, env, url)
             console.log('[ROOM CONFIG AUTH]', {
                 signedHandle: user.handle,
                 sessionHandle: authSession?.user.handle ?? null,
@@ -2905,7 +2209,7 @@ await sendChatEmailNotifications(env, newMessage)
                     }
                     : rawSettings
 
-                                if (!(await stub.configure(key, settings, user))) {
+                if (!(await stub.configure(key, settings, user))) {
                     return new Response(null, { status: 400 })
                 }
             } else {
