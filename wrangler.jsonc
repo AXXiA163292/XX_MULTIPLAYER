@@ -1,4 +1,3 @@
-
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "xx-multiplayer",
@@ -19,9 +18,6 @@
       "enabled": true,
       "persist": true
     }
-  },
-  "vars": {
-    "RESEND_FROM_EMAIL": "XX! <onboarding@resend.dev>"
   },
   "durable_objects": {
     "bindings": [
@@ -47,14 +43,6 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["Chat"]
-    },
-    {
-      "tag": "v3",
-      "new_sqlite_classes": ["Replays"]
-    },
-    {
-      "tag": "v4",
-      "deleted_classes": ["Replays"]
     }
   ],
   "r2_buckets": [
