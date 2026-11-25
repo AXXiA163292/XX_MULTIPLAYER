@@ -893,74 +893,6 @@ const isChatCategory = (url: URL) => {
 const isChatItemName = (name: string) =>
     name === 'chat' || name === 'staff-chat'
 
-function getImageDimensions(
-    bytes: Uint8Array,
-    contentType: string,
-): { width: number; height: number } | null {
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-
-    if (contentType === 'image/png' && bytes.length >= 24) {
-        return {
-            width: view.getUint32(16, false),
-            height: view.getUint32(20, false),
-        }
-    }
-
-    if (contentType === 'image/jpeg') {
-        let offset = 2
-        while (offset + 9 < bytes.length) {
-            if (bytes[offset] !== 0xff) {
-                offset++
-                continue
-            }
-            const marker = bytes[offset + 1]!
-            if (marker === 0xd8 || marker === 0xd9) {
-                offset += 2
-                continue
-            }
-            const segLen = view.getUint16(offset + 2, false)
-            if (segLen < 2 || offset + 2 + segLen > bytes.length) break
-            if (
-                (marker >= 0xc0 && marker <= 0xc3) ||
-                (marker >= 0xc5 && marker <= 0xc7) ||
-                (marker >= 0xc9 && marker <= 0xcb) ||
-                (marker >= 0xcd && marker <= 0xcf)
-            ) {
-                return {
-                    height: view.getUint16(offset + 5, false),
-                    width: view.getUint16(offset + 7, false),
-                }
-            }
-            offset += 2 + segLen
-        }
-    }
-
-    if (contentType === 'image/webp' && bytes.length >= 30) {
-        const chunk = String.fromCharCode(...bytes.slice(12, 16))
-        if (chunk === 'VP8X' && bytes.length >= 30) {
-            const w = 1 + (bytes[24]! | (bytes[25]! << 8) | (bytes[26]! << 16))
-            const h = 1 + (bytes[27]! | (bytes[28]! << 8) | (bytes[29]! << 16))
-            return { width: w, height: h }
-        }
-        if (chunk === 'VP8 ' && bytes.length >= 30) {
-            const w = view.getUint16(26, true) & 0x3fff
-            const h = view.getUint16(28, true) & 0x3fff
-            return { width: w, height: h }
-        }
-        if (chunk === 'VP8L' && bytes.length >= 25) {
-            const b0 = bytes[21]!
-            const b1 = bytes[22]!
-            const b2 = bytes[23]!
-            const b3 = bytes[24]!
-            const w = 1 + (((b1 & 0x3f) << 8) | b0)
-            const h = 1 + (((b3 & 0x0f) << 10) | (b2 << 2) | ((b1 & 0xc0) >> 6))
-            return { width: w, height: h }
-        }
-    }
-
-    return null
-}
-
 function escapeAttr(str: string): string {
     return String(str)
         .replace(/&/g, '&amp;')
@@ -981,7 +913,7 @@ const RANKED_TIERS_UPPER = new Set([
 
 async function resolveRoomCover(
     env: WorkerEnv,
-        summary: {
+    summary: {
         type?: string
         tier?: string
         hostHandle?: string
@@ -994,7 +926,8 @@ async function resolveRoomCover(
     if (type === 'casualRoom') {
         if (summary.coverUrl) {
             return { url: summary.coverUrl }
-        }        if (!summary.level) {
+        }
+        if (!summary.level) {
             const handle = String(summary.hostHandle ?? '').trim()
             if (handle) {
                 const prefs = await getUserChatPrefs(env, handle)
@@ -1590,7 +1523,7 @@ function renderStaffChatHtml(
     height:auto;
     display:block;
   }
-    .media-image-error{
+  .media-image-error{
     width:100%;
     min-height:140px;
     display:flex;
@@ -2185,19 +2118,19 @@ function renderStaffChatHtml(
     return h ? a + '#' + h : a;
   }
 
-    function openMediaUploadModal() {
+  function openMediaUploadModal() {
     const active = getActiveUser()
     mediaStatusEl.textContent = ''
 
     if (!active || String(active.handle).trim() !== MEDIA_ADMIN) {
-        mediaStatusEl.textContent = 'Only #163292 can upload media.'
+      mediaStatusEl.textContent = 'Only #163292 can upload media.'
     }
 
     setActiveTab('media')
     mediaUploadModal.classList.add('open')
 
     requestAnimationFrame(() => {
-        mediaFileInput.focus()
+      mediaFileInput.focus()
     })
   }
 
@@ -2218,7 +2151,7 @@ function renderStaffChatHtml(
   tabChatBtn.addEventListener('click', () => setActiveTab('chat'));
   tabMediaBtn.addEventListener('click', () => setActiveTab('media'));
 
-    addMediaBtn.addEventListener('click', (e) => {
+  addMediaBtn.addEventListener('click', (e) => {
     e.preventDefault()
     e.stopPropagation()
     openMediaUploadModal()
@@ -2253,7 +2186,7 @@ function renderStaffChatHtml(
         ? '<button type="button" class="del-btn" data-delete-media="' + escapeAttr(item.id) + '">Delete</button>'
         : '';
 
-            return '<article class="media-card">' +
+      return '<article class="media-card">' +
         '<img data-media-image loading="lazy" decoding="async" src="' + escapeHtml(imgSrc) + '" alt="' + escapeAttr(item.caption || 'Media')+'"/>' +
         '<div class="media-meta">' +
           '<div style="display:flex;flex-direction:column;gap:4px;min-width:0">' + captionHtml + linkHtml + '</div>' +
@@ -2262,7 +2195,8 @@ function renderStaffChatHtml(
       '</article>';
     }).join('');
   }
-    mediaFeedEl.addEventListener('error', (e) => {
+
+  mediaFeedEl.addEventListener('error', (e) => {
     const img = e.target.closest('[data-media-image]')
     if (!img) return
     const fallback = document.createElement('div')
@@ -3362,17 +3296,17 @@ self.addEventListener('fetch', (event) => {
         }
 
         if (path === '/sonolus/rooms/cover/xx' && req.method === 'GET') {
-    const obj = await getBucketObject(communityBucket(env), [
-        'chat/XX!.png',
-    ])
-    if (!obj) return new Response(null, { status: 404 })
-    return new Response(obj.body, {
-        headers: {
-            'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'public, max-age=3600',
-        },
-    })
+            const obj = await getBucketObject(communityBucket(env), [
+                'chat/XX!.png',
+            ])
+            if (!obj) return new Response(null, { status: 404 })
+            return new Response(obj.body, {
+                headers: {
+                    'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': 'public, max-age=3600',
+                },
+            })
         }
 
         const rankedCoverMatch = path.match(/^\/sonolus\/rooms\/cover\/ranked\/([A-Z]+)$/)
@@ -3394,7 +3328,7 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-                                if (path === '/refresh' || path === '/admin/refresh') {
+        if (path === '/refresh' || path === '/admin/refresh') {
             const summary = await refreshDailyAssets(env)
             await lobby(env).syncAllToR2().catch(() => {})
             return json({
@@ -3403,7 +3337,7 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-                const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
+        const pfpMatch = path.match(/^\/(?:api\/chat\/pfp|sonolus\/chat\/pfp)\/([^/]+)$/)
         if (pfpMatch && req.method === 'GET') {
             const handle = decodeURIComponent(pfpMatch[1]!).trim()
             const prefs = await getUserChatPrefs(env, handle)
@@ -3756,6 +3690,7 @@ self.addEventListener('fetch', (event) => {
 
         if (path === '/sonolus/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
+            const canChat = Boolean(session && isStaffChatHandle(session.user.handle))
             const [editions, playlists] = await Promise.all([
                 getAvailableEditions(),
                 getPlaylists(env),
@@ -3765,17 +3700,53 @@ self.addEventListener('fetch', (event) => {
             const bannerObj = await getBucketObject(assetsBucket(env), [
                 'server/banner.png',
             ])
-            const banner = bannerObj
-                ? { url: '/sonolus/server/banner' }
-                : undefined
+            let banner: { hash: string; url: string } | undefined
+            if (bannerObj) {
+                const bytes = await bannerObj.arrayBuffer()
+                const digest = await crypto.subtle.digest('SHA-1', bytes)
+                const hash = Array.from(
+                    new Uint8Array(digest),
+                    (byte) => byte.toString(16).padStart(2, '0'),
+                ).join('')
+                banner = {
+                    hash,
+                    url: '/sonolus/server/banner',
+                }
+            }
 
             return json({
                 title: SERVER_TITLE,
                 description: SERVER_DESCRIPTION,
                 ...(banner ? { banner } : {}),
                 buttons: [
-                    { type: 'post' },
+                    { type: 'authentication' },
                     { type: 'room' },
+                    {
+                        type: 'post',
+                        title: 'Announcements',
+                        icon: 'announcement',
+                        infoType: 'announcements',
+                    },
+                    {
+                        type: 'post',
+                        title: 'Posts',
+                        icon: 'post',
+                        infoType: 'posts',
+                    },
+                    {
+                        type: 'post',
+                        title: 'Results',
+                        icon: 'medal',
+                        infoType: 'results',
+                    },
+                    ...(canChat
+                        ? [{
+                            type: 'post',
+                            title: 'Chat',
+                            icon: 'comment',
+                            infoType: 'chat',
+                        }]
+                        : []),
                     {
                         type: 'replay',
                         title: 'Replays',
@@ -3783,6 +3754,7 @@ self.addEventListener('fetch', (event) => {
                     },
                     { type: 'level' },
                     { type: 'playlist' },
+                    { type: 'configuration' },
                 ],
                 hasAuthentication: true,
                 hasMultiplayer: true,
@@ -4611,9 +4583,15 @@ self.addEventListener('fetch', (event) => {
         if (path === '/sonolus/rooms/info' && req.method === 'GET') {
             const session = await sessionOf(req, env, url)
             const isTournamentHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
+            const editionOptions = await getAvailableEditions().catch((error) => {
+                console.error('[ROOMS INFO] Could not load editions:', error)
+                return [] as string[]
+            })
 
             return json({
-                creates: roomForms(isTournamentHost),
+                creates: session
+                    ? roomForms(isTournamentHost, editionOptions)
+                    : [],
                 searches: [],
                 sections: [
                     {
@@ -4650,6 +4628,10 @@ self.addEventListener('fetch', (event) => {
             }
 
             const settings = parseSettings(body?.values)
+            if (!settings) {
+                return message(400, 'Invalid room options or edition.')
+            }
+
             const isTournamentHost = session.user.handle === TOURNAMENT_HOST_HANDLE
 
             if (
@@ -4857,96 +4839,110 @@ self.addEventListener('fetch', (event) => {
             })
         }
 
-        if (path === '/sonolus/playlists/info' && req.method === 'GET') {
+        const makePlaylistItems = async () => {
             const playlists = await getPlaylists(env)
 
-            return json({
-                title: 'Playlists',
-                creates: [],
-                searches: [],
-                sections: [
-                    {
-                        title: 'Playlists',
-                        itemType: 'playlist',
-                        items: playlists.map((p) => ({
-                            name: playlistSlug(p.name) || p.name,
-                            version: 1,
-                            title: p.name,
-                            subtitle: `${p.charts.length} charts`,
-                            author: SERVER_TITLE,
-                            tags: [],
-                        })),
-                    },
-                ],
-            })
+            return Promise.all(
+                playlists.map(async (playlist) => {
+                    const cached = await getCachedLevelItemsForCharts(
+                        env,
+                        playlist.charts,
+                    )
+                    const levels = cached ??
+                        (await loadLevelItems(playlist.charts)).map(
+                            (entry) => entry.item,
+                        )
+
+                    return {
+                        name: playlistSlug(playlist.name) || playlist.name,
+                        version: 1 as const,
+                        title: playlist.name,
+                        subtitle: `${levels.length} levels`,
+                        author: SERVER_TITLE,
+                        tags: [],
+                        levels,
+                    }
+                }),
+            )
+        }
+
+        if (path === '/sonolus/playlists/info' && req.method === 'GET') {
+            try {
+                const items = await makePlaylistItems()
+
+                return json({
+                    title: 'Playlists',
+                    creates: [],
+                    searches: [],
+                    sections: [
+                        {
+                            title: 'Playlists',
+                            itemType: 'playlist',
+                            items,
+                        },
+                    ],
+                })
+            } catch (error) {
+                console.error('[Playlists] Could not load playlists:', error)
+                return message(502, 'Could not load playlists.')
+            }
         }
 
         if (path === '/sonolus/playlists/list' && req.method === 'GET') {
-            const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
-            const keywords = resolveKeywords(url)
-            const pageSize = 20
-            const playlists = await getPlaylists(env)
+            try {
+                const page = Math.max(0, Number(url.searchParams.get('page') ?? '0') || 0)
+                const keywords = resolveKeywords(url)
+                const pageSize = 20
+                let items = await makePlaylistItems()
 
-            const filtered = keywords
-                ? playlists.filter((p) => p.name.toLowerCase().includes(keywords))
-                : playlists
+                if (keywords) {
+                    items = items.filter((item) =>
+                        String(item.title).toLowerCase().includes(keywords),
+                    )
+                }
 
-            const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize))
-            const slice = filtered.slice(page * pageSize, page * pageSize + pageSize)
+                const pageCount = Math.max(1, Math.ceil(items.length / pageSize))
+                const slice = items.slice(page * pageSize, page * pageSize + pageSize)
 
-            return json({
-                title: 'Playlists',
-                pageCount,
-                items: slice.map((p) => ({
-                    name: playlistSlug(p.name) || p.name,
-                    version: 1,
-                    title: p.name,
-                    subtitle: `${p.charts.length} charts`,
-                    author: SERVER_TITLE,
-                    tags: [],
-                })),
-                searches: [],
-            })
+                return json({
+                    title: 'Playlists',
+                    pageCount,
+                    items: slice,
+                    searches: [],
+                })
+            } catch (error) {
+                console.error('[Playlists] Could not list playlists:', error)
+                return message(502, 'Could not list playlists.')
+            }
         }
 
         const playlistDetailsPath = path.match(/^\/sonolus\/playlists\/([^/]+)$/)
         if (playlistDetailsPath && req.method === 'GET') {
-            const rawName = decodeURIComponent(playlistDetailsPath[1]!)
-            const playlists = await getPlaylists(env)
-            const playlist = playlists.find(
-                (p) =>
-                    samePlaylist(p.name, rawName) ||
-                    samePlaylist(playlistSlug(p.name), rawName),
-            )
+            try {
+                const rawName = decodeURIComponent(playlistDetailsPath[1]!)
+                const items = await makePlaylistItems()
+                const item = items.find(
+                    (entry) =>
+                        samePlaylist(entry.name, rawName) ||
+                        samePlaylist(playlistSlug(entry.name), rawName),
+                )
 
-            if (!playlist) {
-                return new Response(null, { status: 404 })
+                if (!item) {
+                    return new Response(null, { status: 404 })
+                }
+
+                return json({
+                    item,
+                    description: `${item.title} (${item.levels.length} levels)`,
+                    actions: [],
+                    hasCommunity: false,
+                    leaderboards: [],
+                    sections: [],
+                })
+            } catch (error) {
+                console.error('[Playlists] Could not load playlist details:', error)
+                return message(502, 'Could not load playlist details.')
             }
-
-            const cachedItems = await getCachedLevelItemsForCharts(env, playlist.charts)
-            const levelItems = cachedItems ?? (await loadLevelItems(playlist.charts)).map((entry) => entry.item)
-
-            return json({
-                item: {
-                    name: playlistSlug(playlist.name) || playlist.name,
-                    version: 1,
-                    title: playlist.name,
-                    subtitle: `${playlist.charts.length} charts`,
-                    author: SERVER_TITLE,
-                    tags: [],
-                },
-                description: `${playlist.name} (${playlist.charts.length} charts)`,
-                actions: [],
-                hasCommunity: false,
-                leaderboards: [],
-                sections: [
-                    {
-                        title: 'Charts',
-                        itemType: 'level',
-                        items: levelItems,
-                    },
-                ],
-            })
         }
 
         const levelSubPath = path.match(/^\/sonolus\/levels\/([^/]+)\/(.+)$/)
