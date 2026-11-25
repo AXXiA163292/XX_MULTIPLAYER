@@ -84,6 +84,7 @@ type RoomState = {
     hostId: string
     hostName: string
     settings: RoomSettings
+    hostHandle: string
     status: RoomStatus
     level: Sil | null
     levelInfo: LevelInfo | null
@@ -106,6 +107,7 @@ const fresh = (): RoomState => ({
     configured: false,
     hostId: '',
     hostName: '',
+    hostHandle: '',
     settings: {
         type: 'groupStage',
         scoring: 'pp',
@@ -532,6 +534,7 @@ export class Room extends DurableObject<Env> {
                 configured: saved?.configured === true,
                 hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
                 hostName: typeof saved?.hostName === 'string' ? saved.hostName : '',
+                hostHandle: typeof saved?.hostHandle === 'string' ? saved.hostHandle : '',
                 status: isRoomStatus(saved?.status) ? saved.status : 'selecting',
                 level: saved?.level && isSil(saved.level) ? saved.level : null,
                 levelInfo: saved?.levelInfo ?? null,
@@ -852,6 +855,7 @@ export class Room extends DurableObject<Env> {
         this.st.configured = true
         this.st.hostId = host.id
         this.st.hostName = host.name
+        this.st.hostHandle = host.handle
         this.st.settings = {
             ...settings,
             roundMode: 'tournament',
@@ -899,6 +903,7 @@ export class Room extends DurableObject<Env> {
             subtitle: this.subtitle(),
             master: this.st.hostName,
             hostId: this.st.hostId,
+            hostHandle: this.st.hostHandle || this.st.members.find((member) => member.id === this.st.hostId)?.handle || '',
             visibility: this.st.settings.visibility,
             type: this.st.settings.type,
             tier: this.st.settings.tier,
