@@ -24,7 +24,7 @@ export const PP_CONFIGURED = true
 
 export function isPlayerX(result: GameplayResult | undefined): boolean {
     if (!result) return false
-    return result.disqualified === true || (result.grade as string) === 'X'
+    return (result.grade as string) === 'X'
 }
 
 export function formatGradeShortcut(result: GameplayResult | undefined): string {
@@ -44,19 +44,11 @@ export function formatGradeShortcut(result: GameplayResult | undefined): string 
     }
 }
 
-export function roundPoints(
+export function rawPpPoints(
     result: GameplayResult | undefined,
-    mode: ScoringMode,
     round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
 ): number {
     if (!result || isPlayerX(result)) return 0
-
-    if (mode === 'rankedMatch') {
-        const p = Number(result.perfect) || 0
-        const g = Number(result.great) || 0
-        const gd = Number(result.good) || 0
-        return p * 3 + g * 2 + gd
-    }
 
     const baseConstant =
         typeof round?.levelConstant === 'number' &&
@@ -89,8 +81,24 @@ export function roundPoints(
         result.grade === 'fullCombo' ? 1.02 :
         1.0
 
-    const rawPp = baseConstant * Math.pow(accuracyRatio, 2) * gradeBonus * 10
-    return Math.ceil(rawPp)
+    return baseConstant * Math.pow(accuracyRatio, 2) * gradeBonus * 10
+}
+
+export function roundPoints(
+    result: GameplayResult | undefined,
+    mode: ScoringMode,
+    round?: Pick<RoundRecord, 'levelConstant' | 'levelRating' | 'noteCount'>,
+): number {
+    if (!result || isPlayerX(result)) return 0
+
+    if (mode === 'rankedMatch') {
+        const p = Number(result.perfect) || 0
+        const g = Number(result.great) || 0
+        const gd = Number(result.good) || 0
+        return p * 3 + g * 2 + gd
+    }
+
+    return Math.ceil(rawPpPoints(result, round))
 }
 
 export function fmtScore(score: number, mode: ScoringMode): string {
