@@ -1,393 +1,733 @@
-import type { Env } from './types.ts'
+import type { CustomSongsMode, RankedVocalType } from './forms.ts'
+import type { Env, LevelItem } from './types.ts'
+
+const CUSTOM_SHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
+const INDEX_SHEET_ID = '1mBDbWoTsZlg-tgdnX7DBCSX1bx6EdEFIaKW6Gb4SkC8'
+const INDEX_SHEET_TAB = 'index'
+const METADATA_TAB = 'METADATA_RAW'
+
+const R2_LEVEL_LIST_KEY = 'server/level-list/index.json'
+const R2_PLAYLISTS_KEY = 'server/playlists/index.json'
+const R2_CONSTANTS_KEY = 'server/constants/index.json'
+const rankedTierKey = (tier: RankedTier) => `ranked-match/${tier.toUpperCase()}/pool.json`
+const R2_RANKED_CUSTOM_KEY = 'ranked-match/CUSTOM/pool.json'
+const DAY_MS = 24 * 60 * 60 * 1000
+const SHEET_FETCH_TIMEOUT_MS = 90000
+
+export const DEFAULT_LEVEL: LevelItem = {
+    name: 'default',
+    version: 1,
+    title: 'Default Level',
+    artists: 'XX!',
+    author: 'XX!',
+    rating: 25,
+    engine: 'pjsekai',
+    cover: { hash: '', url: '' },
+    bgm: { hash: '', url: '' },
+    data: { hash: '', url: '' },
+    tags: [],
+}
+
+type Row = {
+    id: string
+    input: string
+    serverId: string
+    privacy: string
+    ranked: string
+    playLevel: string
+    difficulty: string
+    constant: string
+}
+
+export type RankedCustomChart = SheetChart & {
+    playLevel: number
+    isAppend: boolean
+}
 
 export type SheetChart = {
     id: string
     url: string
     address: string
     name: string
-    constant?: number
     playLevel?: number
     musicVocalIds?: number[]
     sekaiVocalVersion?: number
 }
 
-export type SheetPlaylist = {
+export type EditionData = {
+    edition: string
+    groupStage: SheetChart[]
+    final: SheetChart[]
+    divisions: Record<string, string>
+    ultimateParticipants: string[]
+}
+
+export type UltimateSeason = 'winter' | 'spring' | 'summer' | 'fall'
+
+export type UltimatePicks = Record<UltimateSeason, SheetChart>
+
+export type UltimateEditionData = {
+    edition: string
+    seasons: Record<UltimateSeason, SheetChart[]>
+    contestWinner: SheetChart | null
+    ultimate: SheetChart | null
+    participants: string[]
+}
+
+export type PlaylistData = {
     name: string
     charts: SheetChart[]
 }
 
-export type EditionData = {
-    edition: string
-    group1: SheetChart[]
-    group2: SheetChart[]
-    final: SheetChart[]
-}
-
-export type RankedTier =
-    | 'beginner'
-    | 'bronze'
-    | 'silver'
-    | 'gold'
-    | 'platinum'
-    | 'diamond'
-    | 'master'
-
-export type UltimateSeason = 'WINTER' | 'SPRING' | 'SUMMER' | 'FALL'
-
-export type UltimatePoolSong = {
-    season: UltimateSeason
-    slot: string
-    playLevel: number
-    chart: SheetChart
-}
-
-export type UltimateEditionData = {
-    edition: string
-    fixedCharts: SheetChart[]
-    pool: UltimatePoolSong[]
-}
-
-export type UltimatePicks = {
-    picks: UltimatePoolSong[]
+type StoredSnapshot<T> = {
     updatedAt: number
+    data: T
 }
 
-export type RefreshSummary = {
-    refreshedAt: number
-    editions: string[]
-    customLevelsCount: number
-    playlistsCount: number
-    constantsCount: number
-    errors: string[]
+export const stripTrailingSlash = (value: string) =>
+    value.trim().replace(/\/+$/, '')
+
+function parseCSV(input: string): string[][] {
+    const rows: string[][] = []
+    let row: string[] = []
+    let value = ''
+    let quoted = false
+
+    for (let i = 0; i < input.length; i++) {
+        const char = input[i]!
+
+        if (quoted) {
+            if (char === '"' && input[i + 1] === '"') {
+                value += '"'
+                i++
+            } else if (char === '"') {
+                quoted = false
+            } else {
+                value += char
+            }
+        } else if (char === '"') {
+            quoted = true
+        } else if (char === ',') {
+            row.push(value)
+            value = ''
+        } else if (char === '\n') {
+            row.push(value.replace(/\r$/, ''))
+            if (row.some((cell) => cell.trim())) rows.push(row)
+            row = []
+            value = ''
+        } else {
+            value += char
+        }
+    }
+
+    row.push(value.replace(/\r$/, ''))
+    if (row.some((cell) => cell.trim())) rows.push(row)
+
+    return rows
 }
 
-type Row = {
-    id: string
-    input: string
-    constant: string
-}
+async function fetchSheet(id: string, tab: string): Promise<string[][]> {
+    const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}&t=${Date.now()}`
 
-const SHEET_ID = '18e5uQ5eY7e0o31V76k7d9j7G02gX_L5o6_8P3v60X6o'
-const INDEX_GID = '0'
-const CUSTOM_GID = '1065787429'
-const LIVE_EDITION_FALLBACK = 'FALL 2026'
-const CUSTOM_LEVEL_PAGE_SIZE = 20
+    try {
+        console.log(`[Sheets] Requesting spreadsheet ${id}, tab "${tab}".`)
+        const response = await fetch(url, {
+            headers: {
+                Accept: 'text/csv,text/plain,*/*',
+                'Cache-Control': 'no-cache',
+            },
+            signal: AbortSignal.timeout(SHEET_FETCH_TIMEOUT_MS),
+            cache: 'no-store',
+        })
 
-const R2_INDEX_ROWS_KEY = 'server/sheets/index.json'
-const R2_CUSTOM_ROWS_KEY = 'server/sheets/custom.json'
-const R2_CONSTANTS_KEY = 'server/constants/v2/index.json'
-const R2_LEVEL_LIST_KEY = 'server/level-list/index.json'
-const R2_RANKED_POOLS_KEY = 'server/ranked/pools.json'
+        if (!response.ok) {
+            throw new Error(`Google Sheets HTTP ${response.status} for tab "${tab}".`)
+        }
 
-const ULTIMATE_SEASONS: UltimateSeason[] = ['WINTER', 'SPRING', 'SUMMER', 'FALL']
+        const content = (await response.text()).replace(/^\uFEFF/, '')
+        const trimmed = content.trimStart()
 
-function stripTrailingSlash(value: string): string {
-    return value.trim().replace(/\/+$/, '')
+        if (
+            !trimmed ||
+            trimmed.startsWith('<!DOCTYPE') ||
+            trimmed.startsWith('<html') ||
+            trimmed.startsWith('google.visualization')
+        ) {
+            throw new Error(`Google Sheets did not return CSV for tab "${tab}".`)
+        }
+
+        const parsed = parseCSV(content)
+        if (!parsed.length) {
+            throw new Error(`The "${tab}" tab is empty.`)
+        }
+
+        return parsed
+    } catch (error) {
+        console.error(`[Sheets] Failed to read spreadsheet ${id}, tab "${tab}".`, error)
+        throw error instanceof Error
+            ? error
+            : new Error(`Could not read Google Sheet tab "${tab}".`)
+    }
 }
 
 function normalizeId(value: unknown): string {
-    return String(value ?? '').trim()
+    return String(value ?? '')
+        .replace(/^\uFEFF/, '')
+        .replace(/[\u200B-\u200D\u2060]/g, '')
+        .trim()
+        .replace(/^'/, '')
+        .trim()
 }
 
-function parseConstantValue(raw: unknown): number | null {
-    if (typeof raw === 'number') {
-        return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 100) / 100 : null
-    }
-    const clean = String(raw ?? '').trim().replace(',', '.')
-    if (!clean) return null
-    const parsed = Number(clean)
-    return Number.isFinite(parsed) && parsed > 0 ? Math.round(parsed * 100) / 100 : null
+function normalizeEditionLabel(value: unknown): string {
+    return normalizeId(value)
+        .replace(/\s+/g, ' ')
+        .toUpperCase()
 }
 
-function chartFromUrl(id: string, rawUrl: string): SheetChart | null {
-    const cleanUrl = rawUrl.trim()
-    if (!cleanUrl) return null
+function chartFromUrl(id: string, rawInput: string): SheetChart | null {
+    const raw = stripTrailingSlash(rawInput)
+    if (!raw) return null
 
     try {
-        const parsed = new URL(cleanUrl)
-        const parts = parsed.pathname.split('/').filter(Boolean)
-        const levelIndex = parts.findIndex((p) => p === 'levels')
-        const name = levelIndex >= 0 && parts[levelIndex + 1]
-            ? decodeURIComponent(parts[levelIndex + 1]!)
-            : parts[parts.length - 1] ?? ''
+        let candidate = raw
 
+        if (candidate.startsWith('sonolus://')) {
+            candidate = candidate.replace(/^sonolus:\/\//i, 'https://')
+        } else if (!/^https?:\/\//i.test(candidate)) {
+            candidate = `https://${candidate}`
+        }
+
+        const url = new URL(candidate)
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+
+        const match = url.pathname.match(/\/levels\/([^/]+)\/?$/i)
+        if (!match) return null
+
+        const name = decodeURIComponent(match[1]!)
         if (!name) return null
 
-        const sonolusIdx = parts.indexOf('sonolus')
-        const basePath = sonolusIdx >= 0
-            ? `/${parts.slice(0, sonolusIdx).join('/')}`
-            : ''
-        const address = `${parsed.origin}${basePath}`.replace(/\/+$/, '')
-
         return {
-            id: id.trim() || name,
-            url: cleanUrl,
-            address,
+            id,
+            url: raw,
+            address: stripTrailingSlash(url.origin),
             name,
         }
-    } catch {
+    } catch (error) {
+        console.warn('[Sheets] Invalid level URL:', id, raw, error)
         return null
     }
 }
 
-async function readBucketJson<T>(env: Env | undefined, key: string): Promise<T | null> {
-    const bucket = env?.SONOLUS_ASSETS_BUCKET ?? env?.COMMUNITY_BUCKET
+function compareIdDescending(a: SheetChart, b: SheetChart): number {
+    return b.id.localeCompare(a.id, undefined, {
+        numeric: true,
+        sensitivity: 'base',
+    })
+}
+
+function findConstantColumn(headers: string[]): number {
+    const exact = headers.indexOf('constant')
+    if (exact >= 0) return exact
+
+    return headers.findIndex((h) =>
+        ['constant', 'const', 'song constant', 'chart constant', 'cc'].includes(h),
+    )
+}
+
+function parseConstantValue(raw: string): number | null {
+    const cleaned = normalizeId(raw).replace(',', '.')
+    if (!cleaned) return null
+    const num = Number(cleaned)
+    if (!Number.isFinite(num) || num <= 0) return null
+    return Math.round(num * 10) / 10
+}
+
+function parseCustomRows(values: string[][]): Row[] {
+    const headerIndex = values.findIndex((row) => {
+        const headers = row.map((cell) => normalizeId(cell).toLowerCase())
+        return (
+            headers.includes('id') &&
+            headers.includes('input') &&
+            headers.includes('serverid') &&
+            headers.includes('privacy')
+        )
+    })
+
+    if (headerIndex < 0) {
+        throw new Error('The custom tab must contain id, input, serverId and privacy headers.')
+    }
+
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+    const col = (name: string) => headers.indexOf(name)
+
+    const idIndex = col('id')
+    const inputIndex = col('input')
+    const serverIdIndex = col('serverid')
+    const privacyIndex = col('privacy')
+    const rankedIndex = col('ranked')
+    const playLevelIndex = col('playlevel')
+    const difficultyIndex = col('difficulty')
+    const constantIndex = findConstantColumn(headers)
+
+    return values
+        .slice(headerIndex + 1)
+        .map((cells) => ({
+            id: normalizeId(cells[idIndex]),
+            input: stripTrailingSlash(normalizeId(cells[inputIndex])),
+            serverId: normalizeId(cells[serverIdIndex]),
+            privacy: normalizeId(cells[privacyIndex]),
+            ranked: rankedIndex >= 0 ? normalizeId(cells[rankedIndex]) : '',
+            playLevel: playLevelIndex >= 0 ? normalizeId(cells[playLevelIndex]) : '',
+            difficulty: difficultyIndex >= 0 ? normalizeId(cells[difficultyIndex]) : '',
+            constant: constantIndex >= 0 ? normalizeId(cells[constantIndex]) : '',
+        }))
+        .filter((row) => row.id && row.input)
+}
+
+async function customRows(): Promise<Row[]> {
+    return parseCustomRows(await fetchSheet(CUSTOM_SHEET_ID, 'custom'))
+}
+
+function isCustomLevelId(id: string): boolean {
+    const normalized = normalizeId(id).toUpperCase()
+    return normalized.startsWith('60') || normalized.startsWith('X')
+}
+
+function isPublicLevel(row: Pick<Row, 'privacy' | 'serverId'>): boolean {
+    const privacy = normalizeId(row.privacy).toLowerCase()
+    const serverId = normalizeId(row.serverId)
+    return privacy !== 'unlisted' && serverId !== '-'
+}
+
+export const CUSTOM_LEVEL_PAGE_SIZE = 10
+
+async function readBucketJson<T>(
+    env: Env | undefined,
+    key: string,
+    maxAgeMs = DAY_MS,
+): Promise<T | null> {
+    const bucket = env?.SONOLUS_ASSETS_BUCKET
     if (!bucket) return null
 
     try {
         const obj = await bucket.get(key)
         if (!obj) return null
-        return await obj.json() as T
-    } catch {
+
+        const parsed = (await obj.json()) as StoredSnapshot<T>
+        if (!parsed || typeof parsed.updatedAt !== 'number' || !('data' in parsed)) {
+            return null
+        }
+
+        if (Date.now() - parsed.updatedAt > maxAgeMs) {
+            return null
+        }
+
+        return parsed.data
+    } catch (error) {
+        console.warn(`[R2] Failed reading ${key}:`, error)
         return null
     }
 }
 
-async function writeBucketJson(env: Env | undefined, key: string, data: unknown): Promise<void> {
-    const bucket = env?.SONOLUS_ASSETS_BUCKET ?? env?.COMMUNITY_BUCKET
-    if (!bucket) return
+async function writeBucketJson<T>(
+    env: Env | undefined,
+    key: string,
+    data: T,
+): Promise<void> {
+    const bucket = env?.SONOLUS_ASSETS_BUCKET
+    if (!bucket) throw new Error('SONOLUS_ASSETS_BUCKET R2 binding is missing.')
 
-    await bucket.put(key, JSON.stringify(data), {
+    const payload: StoredSnapshot<T> = {
+        updatedAt: Date.now(),
+        data,
+    }
+
+    await bucket.put(key, JSON.stringify(payload), {
         httpMetadata: { contentType: 'application/json' },
     })
 }
 
-async function fetchCsvRows(gid: string): Promise<string[][]> {
-    const url = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${gid}`
-    const res = await fetch(url, {
-        headers: { 'Cache-Control': 'no-cache' },
-        cache: 'no-store',
-        signal: AbortSignal.timeout(12000),
-    })
-
-    if (!res.ok) {
-        throw new Error(`Sheet export ${gid} returned ${res.status}`)
-    }
-
-    const csv = await res.text()
-    const rows: string[][] = []
-    let row: string[] = []
-    let cell = ''
-    let inQuotes = false
-
-    for (let i = 0; i < csv.length; i++) {
-        const ch = csv[i]!
-        const next = csv[i + 1]
-
-        if (inQuotes) {
-            if (ch === '"' && next === '"') {
-                cell += '"'
-                i++
-            } else if (ch === '"') {
-                inQuotes = false
-            } else {
-                cell += ch
-            }
-            continue
-        }
-
-        if (ch === '"') {
-            inQuotes = true
-        } else if (ch === ',') {
-            row.push(cell)
-            cell = ''
-        } else if (ch === '\n' || (ch === '\r' && next === '\n')) {
-            row.push(cell)
-            rows.push(row)
-            row = []
-            cell = ''
-            if (ch === '\r') i++
-        } else if (ch !== '\r') {
-            cell += ch
-        }
-    }
-
-    if (cell.length > 0 || row.length > 0) {
-        row.push(cell)
-        rows.push(row)
-    }
-
+function buildCustomLevels(rows: Row[]): SheetChart[] {
     return rows
-}
-
-function tableToRows(table: string[][]): Row[] {
-    if (table.length < 2) return []
-    const headers = table[0]!.map((h) => h.trim().toLowerCase())
-
-    const idIdx = headers.findIndex((h) => h === 'id' || h === 'name' || h === 'key')
-    const urlIdx = headers.findIndex((h) => h === 'url' || h === 'link' || h === 'level')
-    const constIdx = headers.findIndex((h) => h === 'constant' || h === 'const')
-
-    const rows: Row[] = []
-    for (let i = 1; i < table.length; i++) {
-        const r = table[i]!
-        const id = normalizeId(idIdx >= 0 ? r[idIdx] : r[0])
-        const input = normalizeId(urlIdx >= 0 ? r[urlIdx] : r[1])
-        const constant = normalizeId(constIdx >= 0 ? r[constIdx] : '')
-        if (!id && !input) continue
-        rows.push({ id, input, constant })
-    }
-    return rows
-}
-
-async function indexTable(env?: Env): Promise<string[][]> {
-    const cached = await readBucketJson<string[][]>(env, R2_INDEX_ROWS_KEY)
-    if (Array.isArray(cached) && cached.length > 0) return cached
-
-    const rows = await fetchCsvRows(INDEX_GID)
-    await writeBucketJson(env, R2_INDEX_ROWS_KEY, rows).catch(() => {})
-    return rows
-}
-
-async function customRows(env?: Env): Promise<Row[]> {
-    const cached = await readBucketJson<Row[]>(env, R2_CUSTOM_ROWS_KEY)
-    if (Array.isArray(cached) && cached.length > 0) return cached
-
-    const table = await fetchCsvRows(CUSTOM_GID)
-    const rows = tableToRows(table)
-    await writeBucketJson(env, R2_CUSTOM_ROWS_KEY, rows).catch(() => {})
-    return rows
+        .filter((row) => isCustomLevelId(row.id) && isPublicLevel(row))
+        .map((row) => chartFromUrl(row.id, row.input))
+        .filter((chart): chart is SheetChart => chart !== null)
+        .sort(compareIdDescending)
 }
 
 function buildConstantsMap(rows: Row[]): Record<string, number> {
     const map: Record<string, number> = {}
-
     for (const row of rows) {
-        const chart = chartFromUrl(row.id, row.input)
-        const value = parseConstantValue(row.constant)
-
-        if (chart && value !== null) {
-            map[`${chart.address}::${chart.name}`] = value
+        const cleanInput = stripTrailingSlash(row.input)
+        const val = parseConstantValue(row.constant)
+        if (cleanInput && val !== null) {
+            map[cleanInput] = val
         }
     }
-
     return map
 }
 
 export async function getConstantForAddress(
     address: string,
     env?: Env,
-    name?: string,
 ): Promise<number | null> {
     const cleanAddr = stripTrailingSlash(address)
     if (!cleanAddr) return null
 
-    const key = name
-        ? `${cleanAddr}::${name.trim()}`
-        : cleanAddr
-
-    const cached = await readBucketJson<Record<string, number>>(
-        env,
-        R2_CONSTANTS_KEY,
-    )
-
-    if (cached && typeof cached[key] === 'number') {
-        return cached[key]!
+    const cached = await readBucketJson<Record<string, number>>(env, R2_CONSTANTS_KEY)
+    if (cached && typeof cached[cleanAddr] === 'number') {
+        return cached[cleanAddr]!
     }
 
-    const rows = await customRows(env)
+    const rows = await customRows()
     const map = buildConstantsMap(rows)
-
     await writeBucketJson(env, R2_CONSTANTS_KEY, map).catch(() => {})
-
-    return map[key] ?? null
+    return map[cleanAddr] ?? null
 }
 
-export function getLiveEdition(): string {
-    return LIVE_EDITION_FALLBACK
+export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
+    const cached = await readBucketJson<SheetChart[]>(env, R2_LEVEL_LIST_KEY)
+    if (cached) return [...cached].sort(compareIdDescending)
+
+    const charts = buildCustomLevels(await customRows())
+    await writeBucketJson(env, R2_LEVEL_LIST_KEY, charts).catch((e) =>
+        console.warn('[R2] Could not cache level list:', e),
+    )
+    return charts
 }
 
-export async function getAvailableEditions(env?: Env): Promise<string[]> {
-    const table = await indexTable(env).catch(() => [])
-    const editions = new Set<string>([LIVE_EDITION_FALLBACK])
+export async function loadLevelsByNames(
+    names: string[],
+    env?: Env,
+): Promise<LevelItem[]> {
+    if (!names.length) return []
+    const charts = await getCustomLevels(env)
+    const byName = new Map(charts.map((c) => [c.name, c]))
+    const loaded: LevelItem[] = []
 
-    for (let i = 1; i < table.length; i++) {
-        const first = normalizeId(table[i]?.[0]).toUpperCase()
-        if (/^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+\d{4}$/.test(first)) {
-            editions.add(first)
+    for (const name of names) {
+        const chart = byName.get(name)
+        if (!chart) continue
+        try {
+            const endpoint = `${stripTrailingSlash(chart.address)}/sonolus/levels/${encodeURIComponent(chart.name)}`
+            const res = await fetch(endpoint, {
+                headers: { Accept: 'application/json', 'Cache-Control': 'no-cache' },
+                signal: AbortSignal.timeout(10000),
+            })
+            if (!res.ok) continue
+            const data: any = await res.json()
+            const item = data?.item ?? data
+            if (item && typeof item.name === 'string') {
+                loaded.push({
+                    ...DEFAULT_LEVEL,
+                    ...item,
+                    source: chart.address,
+                })
+            }
+        } catch {
+            // skip unreachable level
         }
     }
 
-    return [...editions]
+    return loaded
+}
+
+export async function getCustomLevelPage(
+    page: number,
+    env?: Env,
+): Promise<{ charts: SheetChart[]; pageCount: number }> {
+    const all = await getCustomLevels(env)
+    const safePage = Number.isInteger(page) && page >= 0 ? page : 0
+    const pageCount = Math.max(1, Math.ceil(all.length / CUSTOM_LEVEL_PAGE_SIZE))
+    const start = safePage * CUSTOM_LEVEL_PAGE_SIZE
+
+    return {
+        charts: all.slice(start, start + CUSTOM_LEVEL_PAGE_SIZE),
+        pageCount,
+    }
+}
+
+function suduPlaylistName(id: string): string | null {
+    const match = normalizeId(id).toUpperCase().match(/^D(\d{2})/)
+    if (!match) return null
+    return `SUDU-${match[1]!.padStart(3, '0')}`
+}
+
+function buildPlaylists(rows: Row[]): PlaylistData[] {
+    const charts = rows
+        .filter((row) => {
+            const id = normalizeId(row.id).toUpperCase()
+            return id.startsWith('X') || id.startsWith('D')
+        })
+        .map((row) => chartFromUrl(row.id, row.input))
+        .filter((chart): chart is SheetChart => chart !== null)
+
+    const groups = new Map<string, SheetChart[]>()
+
+    for (const chart of charts) {
+        const id = normalizeId(chart.id).toUpperCase()
+        let title: string | null = null
+
+        if (id.startsWith('D')) {
+            title = suduPlaylistName(id)
+        } else {
+            const xMatch = id.match(/^X(\d+)/)
+            if (xMatch) title = `XX! Championship 20${xMatch[1]}`
+        }
+
+        if (!title) continue
+        const list = groups.get(title) ?? []
+        list.push(chart)
+        groups.set(title, list)
+    }
+
+    return [...groups.entries()]
+        .map(([name, items]) => ({
+            name,
+            charts: items.sort(compareIdDescending),
+        }))
+        .sort((a, b) => {
+            const aSudu = a.name.match(/^SUDU-(\d+)$/)
+            const bSudu = b.name.match(/^SUDU-(\d+)$/)
+
+            if (aSudu && bSudu) return Number(aSudu[1]) - Number(bSudu[1])
+            if (aSudu) return -1
+            if (bSudu) return 1
+
+            return a.name.localeCompare(b.name, undefined, { numeric: true })
+        })
+}
+
+export async function getPlaylists(env?: Env): Promise<PlaylistData[]> {
+    const cached = await readBucketJson<PlaylistData[]>(env, R2_PLAYLISTS_KEY)
+    if (cached) return cached
+
+    const playlists = buildPlaylists(await customRows())
+    await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists).catch((e) =>
+        console.warn('[R2] Could not cache playlists:', e),
+    )
+    return playlists
+}
+
+function splitHandles(value: string): string[] {
+    return value
+        .split(',')
+        .map((handle) => handle.trim())
+        .filter(Boolean)
+}
+
+function isGroupHeader(header: string): boolean {
+    return /^[A-Z]$/i.test(header)
+}
+
+function parseIndexSheet(rows: string[][]): {
+    headers: string[]
+    normalized: string[]
+    editionCol: number
+    dataRows: string[][]
+} {
+    const headerRow = rows[0] ?? []
+    const headers = headerRow.map((cell) => normalizeId(cell))
+    const normalized = headers.map((cell) => normalizeEditionLabel(cell))
+    const editionCol = 0
+    const dataRows = rows.slice(1)
+
+    return { headers, normalized, editionCol, dataRows }
+}
+
+export function getLiveEdition(date = new Date()): string {
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Europe/Paris',
+        year: 'numeric',
+        month: 'numeric',
+    }).formatToParts(date)
+
+    const year = Number(parts.find((part) => part.type === 'year')?.value)
+    const month = Number(parts.find((part) => part.type === 'month')?.value)
+
+    if (month === 11) return `ULTIMATE ${year}`
+    if (month === 12) return `WINTER ${year + 1}`
+    if (month <= 2) return `WINTER ${year}`
+    if (month <= 5) return `SPRING ${year}`
+    if (month <= 8) return `SUMMER ${year}`
+    return `FALL ${year}`
+}
+
+export async function getAvailableEditions(): Promise<string[]> {
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
+    const { editionCol, dataRows } = parseIndexSheet(rows)
+
+    const editions = dataRows
+        .map((row) => normalizeEditionLabel(row[editionCol]))
+        .filter((value) => /^(WINTER|SPRING|SUMMER|FALL|ULTIMATE)\s+\d{4}$/.test(value))
+
+    const unique = [...new Set(editions)].reverse()
+    const live = getLiveEdition()
+
+    if (!unique.includes(live)) unique.unshift(live)
+
+    return unique
 }
 
 export async function getEditionData(
-    edition: string,
-    env?: Env,
+    requestedEdition = getLiveEdition(),
 ): Promise<EditionData> {
-    const target = normalizeId(edition).toUpperCase()
-    const table = await indexTable(env)
-    const result: EditionData = {
-        edition: target,
-        group1: [],
-        group2: [],
-        final: [],
-    }
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
+    const { headers, normalized, editionCol, dataRows } = parseIndexSheet(rows)
 
-    if (table.length < 2) return result
+    const edition = normalizeEditionLabel(requestedEdition)
+    const activeRow = dataRows.find((row) =>
+        normalizeEditionLabel(row[editionCol]) === edition,
+    ) ?? []
 
-    const headers = table[0]!
-    const normalized = headers.map((h) => h.trim().toUpperCase())
-    const editionCol = normalized.findIndex((h) => h === 'EDITION' || h === 'SEASON' || h === 'NAME' || h === 'ID')
+    const groupStage: SheetChart[] = []
+    const final: SheetChart[] = []
+    const divisions: Record<string, string> = {}
+    const ultimateParticipants: string[] = []
 
-    for (let i = 1; i < table.length; i++) {
-        const row = table[i]!
-        const rowEdition = normalizeId(editionCol >= 0 ? row[editionCol] : row[0]).toUpperCase()
-        if (rowEdition !== target) continue
+    for (let column = 0; column < headers.length; column++) {
+        const header = normalized[column] ?? ''
+        const value = normalizeId(activeRow[column])
+        if (!header || !value) continue
 
-        for (let c = 0; c < normalized.length; c++) {
-            const colName = normalized[c]!
-            const val = normalizeId(row[c])
-            if (!val) continue
+        const groupMatch = header.match(/^G(\d+)$/)
+        const finalMatch = header.match(/^F(\d+)$/)
 
-            const groupMatch = colName.match(/^G([12])_?(\d+)$/)
-            const finalMatch = colName.match(/^F_?(\d+)$/)
-            const match = groupMatch ?? finalMatch
-            if (!match) continue
-
-            const chart = chartFromUrl(colName, val)
+        if (groupMatch || finalMatch) {
+            const id = groupMatch ? `G${groupMatch[1]}` : `F${finalMatch![1]}`
+            const chart = chartFromUrl(id, value)
             if (!chart) continue
 
-            const constantColumn = normalized.indexOf(`${colName}CONSTANT`)
-            const constant = constantColumn >= 0
-                ? parseConstantValue(normalizeId(row[constantColumn]))
-                : null
+            const playLevelColumn = normalized.indexOf(`${id}PLAYLEVEL`)
+            const rawPlayLevel = playLevelColumn >= 0
+                ? normalizeId(activeRow[playLevelColumn]).replace(',', '.')
+                : ''
+            const playLevel = Number(rawPlayLevel)
 
-            if (constant !== null) {
-                chart.constant = constant
+            if (rawPlayLevel && Number.isFinite(playLevel)) {
+                chart.playLevel = playLevel
             }
 
-            if (groupMatch) {
-                if (groupMatch[1] === '1') result.group1.push(chart)
-                else result.group2.push(chart)
-            } else {
-                result.final.push(chart)
+            if (groupMatch) groupStage.push(chart)
+            else final.push(chart)
+            continue
+        }
+
+        if (isGroupHeader(header)) {
+            for (const handle of splitHandles(value)) {
+                divisions[handle] = `Group ${header}`
             }
+            continue
+        }
+
+        if (header === 'UB' || header === 'LB') {
+            const division = header === 'UB' ? 'Upper Bracket' : 'Lower Bracket'
+            for (const handle of splitHandles(value)) {
+                divisions[handle] = division
+            }
+            continue
+        }
+
+        if (header === 'UX') {
+            ultimateParticipants.push(...splitHandles(value))
         }
     }
 
-    return result
+    const sortByNumber = (a: SheetChart, b: SheetChart) =>
+        Number(a.id.slice(1)) - Number(b.id.slice(1))
+
+    return {
+        edition,
+        groupStage: groupStage.sort(sortByNumber),
+        final: final.sort(sortByNumber),
+        divisions,
+        ultimateParticipants,
+    }
+}
+
+function parseEditionPlayLevel(value: unknown): number | null {
+    const raw = normalizeId(value).replace(',', '.')
+    if (!raw) return null
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) ? parsed : null
+}
+
+function ultimatePicksKey(edition: string): string {
+    return `ultimate-editions/${edition.toLowerCase().replace(/\s+/g, '-')}/picks.json`
 }
 
 export async function getUltimateEditionData(
-    edition: string,
-    env?: Env,
+    requestedEdition = getLiveEdition(),
 ): Promise<UltimateEditionData> {
-    const target = normalizeId(edition).toUpperCase()
-    const table = await indexTable(env)
-    const pool: UltimatePoolSong[] = []
-    const fixedCharts: SheetChart[] = []
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
+    const { normalized, editionCol, dataRows } = parseIndexSheet(rows)
+    const edition = normalizeEditionLabel(requestedEdition)
 
-    if (table.length < 2) {
-        return { edition: target, fixedCharts, pool }
+    if (!/^ULTIMATE\s+\d{4}$/.test(edition)) {
+        return {
+            edition,
+            seasons: {
+                winter: [],
+                spring: [],
+                summer: [],
+                fall: [],
+            },
+            contestWinner: null,
+            ultimate: null,
+            participants: [],
+        }
     }
 
-    const headers = table[0]!
-    const normalized = headers.map((h) => h.trim().toUpperCase())
-
-    const ultimateRow = table.slice(1).find((row) =>
-        normalizeId(row[0]).toUpperCase() === target,
+    const ultimateRow = dataRows.find(
+        (row) => normalizeEditionLabel(row[editionCol]) === edition,
     )
+
+    const year = edition.match(/\d{4}$/)![0]
+
+    const getRow = (name: string) => dataRows.find(
+        (row) => normalizeEditionLabel(row[editionCol]) === name,
+    )
+
+    const buildSeasonPool = (
+        row: string[] | undefined,
+        season: string,
+    ): SheetChart[] => {
+        if (!row) return []
+
+        const charts: SheetChart[] = []
+
+        for (const slot of [
+            'G1', 'G2', 'G3', 'G4', 'G5', 'G6',
+            'F1', 'F2', 'F3', 'F4',
+        ]) {
+            const urlColumn = normalized.indexOf(slot)
+            const levelColumn = normalized.indexOf(`${slot}PLAYLEVEL`)
+
+            if (urlColumn < 0 || levelColumn < 0) continue
+
+            const playLevel = parseEditionPlayLevel(row[levelColumn])
+            const rawUrl = normalizeId(row[urlColumn])
+
+            if (playLevel === null || playLevel < 32) continue
+
+            const chart = chartFromUrl(slot, rawUrl)
+            if (!chart) continue
+
+            chart.id = `${season}-${slot}`
+            chart.playLevel = playLevel
+            charts.push(chart)
+        }
+
+        return charts
+    }
+
+    const seasons = {
+        winter: buildSeasonPool(getRow(`WINTER ${year}`), 'WINTER'),
+        spring: buildSeasonPool(getRow(`SPRING ${year}`), 'SPRING'),
+        summer: buildSeasonPool(getRow(`SUMMER ${year}`), 'SUMMER'),
+        fall: buildSeasonPool(getRow(`FALL ${year}`), 'FALL'),
+    }
 
     const getFixedChart = (slot: 'F1' | 'F2'): SheetChart | null => {
         if (!ultimateRow) return null
@@ -395,225 +735,352 @@ export async function getUltimateEditionData(
         const column = normalized.indexOf(slot)
         if (column < 0) return null
 
-        const chart = chartFromUrl(slot, normalizeId(ultimateRow[column]))
-        if (!chart) return null
-
-        const constantColumn = normalized.indexOf(`${slot}CONSTANT`)
-        const constant = constantColumn >= 0
-            ? parseConstantValue(normalizeId(ultimateRow[constantColumn]))
-            : null
-
-        if (constant !== null) {
-            chart.constant = constant
-        }
-
-        return chart
+        return chartFromUrl(slot, normalizeId(ultimateRow[column]))
     }
 
-    const f1 = getFixedChart('F1')
-    const f2 = getFixedChart('F2')
-    if (f1) fixedCharts.push(f1)
-    if (f2) fixedCharts.push(f2)
+    const uxColumn = normalized.indexOf('UX')
 
-    const buildSeasonPool = (season: UltimateSeason) => {
-        const seasonRow = table.slice(1).find((row) => {
-            const first = normalizeId(row[0]).toUpperCase()
-            return first.startsWith(season)
-        })
-        if (!seasonRow) return
-
-        for (let c = 0; c < normalized.length; c++) {
-            const slot = normalized[c]!
-            const rawUrl = normalizeId(seasonRow[c])
-            if (!rawUrl || !/^(G\d+|F\d+)$/.test(slot)) continue
-
-            const chart = chartFromUrl(slot, rawUrl)
-            if (!chart) continue
-
-            const constantColumn = normalized.indexOf(`${slot}CONSTANT`)
-            const constant = constantColumn >= 0
-                ? parseConstantValue(normalizeId(seasonRow[constantColumn]))
-                : null
-
-            const levelCol = normalized.indexOf(`${slot}LEVEL`)
-            const playLevel = levelCol >= 0
-                ? (parseConstantValue(normalizeId(seasonRow[levelCol])) ?? undefined)
-                : undefined
-
-            chart.id = `${season}-${slot}`
-            if (playLevel !== undefined) {
-                chart.playLevel = playLevel
-            }
-            if (constant !== null) {
-                chart.constant = constant
-            }
-
-            pool.push({
-                season,
-                slot,
-                playLevel: playLevel ?? 30,
-                chart,
-            })
-        }
+    return {
+        edition,
+        seasons,
+        contestWinner: getFixedChart('F1'),
+        ultimate: getFixedChart('F2'),
+        participants: ultimateRow && uxColumn >= 0
+            ? splitHandles(normalizeId(ultimateRow[uxColumn]))
+            : [],
     }
-
-    for (const s of ULTIMATE_SEASONS) {
-        buildSeasonPool(s)
-    }
-
-    return { edition: target, fixedCharts, pool }
 }
 
 export async function getSavedUltimatePicks(
     env: Env,
     edition: string,
 ): Promise<UltimatePicks | null> {
-    return readBucketJson<UltimatePicks>(
+    const saved = await readBucketJson<UltimatePicks>(
         env,
-        `server/ultimate/${encodeURIComponent(edition.toUpperCase())}/picks.json`,
+        ultimatePicksKey(edition),
+        Number.POSITIVE_INFINITY,
     )
+
+    if (!saved) return null
+
+    const seasons: UltimateSeason[] = ['winter', 'spring', 'summer', 'fall']
+    if (seasons.some((season) => {
+        const chart = saved[season]
+        return !chart ||
+            typeof chart.address !== 'string' ||
+            typeof chart.name !== 'string'
+    })) {
+        return null
+    }
+
+    return saved
 }
 
 export async function saveUltimatePicks(
     env: Env,
     edition: string,
-    picks: UltimatePoolSong[],
-): Promise<UltimatePicks> {
-    const payload: UltimatePicks = {
-        picks,
-        updatedAt: Date.now(),
-    }
-    await writeBucketJson(
-        env,
-        `server/ultimate/${encodeURIComponent(edition.toUpperCase())}/picks.json`,
-        payload,
-    )
-    return payload
+    picks: UltimatePicks,
+): Promise<void> {
+    await writeBucketJson(env, ultimatePicksKey(edition), picks)
 }
 
-export async function getCustomLevels(env?: Env): Promise<SheetChart[]> {
-    const rows = await customRows(env)
-    const charts: SheetChart[] = []
+export async function getCurrentEdition(): Promise<string> {
+    return getLiveEdition()
+}
+
+export function clearSheetCache(): void {
+    // R2 acts as the persistent daily cache.
+}
+
+export const RANKED_TIERS = {
+    master:   { main: [30, 37] as const, append: [28, 39] as const },
+    diamond:  { main: [29, 32] as const, append: [27, 30] as const },
+    platinum: { main: [28, 31] as const, append: null },
+    gold:     { main: [26, 30] as const, append: null },
+    silver:   { main: [25, 28] as const, append: null },
+    bronze:   { main: [23, 27] as const, append: null },
+    beginner: { main: [18, 25] as const, append: null },
+} as const
+
+export type RankedTier = keyof typeof RANKED_TIERS
+
+/** Only inspect HR, EX, MS, and AP columns — never EZ or NM. */
+const OFFICIAL_DIFFS = ['hr', 'ex', 'ms', 'ap'] as const
+type OfficialDiff = typeof OFFICIAL_DIFFS[number]
+
+const OFFICIAL_DIFF_ALIASES: Record<OfficialDiff, readonly string[]> = {
+    hr: ['hr', 'hard'],
+    ex: ['ex', 'expert'],
+    ms: ['ms', 'master'],
+    ap: ['ap', 'append'],
+}
+
+function inRange(level: number, range: readonly [number, number] | null): boolean {
+    return !!range && level >= Math.max(18, range[0]) && level <= Math.min(39, range[1])
+}
+
+function resolveOfficialColumns(headers: string[]): Record<OfficialDiff, { levelCol: number; linkCol: number }> {
+    const resolved = {} as Record<OfficialDiff, { levelCol: number; linkCol: number }>
+
+    for (const diff of OFFICIAL_DIFFS) {
+        const aliases = OFFICIAL_DIFF_ALIASES[diff]
+
+        const levelCol = headers.findIndex((h) =>
+            aliases.some((alias) =>
+                h === `${alias}playlevel` ||
+                h === `${alias}_playlevel` ||
+                h === `${alias}level` ||
+                h === `${alias}_level` ||
+                h === `${alias}lvl` ||
+                h === `${alias}_lvl`,
+            ),
+        )
+
+        const linkCol = headers.findIndex((h) =>
+            aliases.some((alias) =>
+                h === alias ||
+                h === `${alias}levellinksbuga` ||
+                h === `${alias}_levellinksbuga` ||
+                h === `${alias}link` ||
+                h === `${alias}_link` ||
+                h === `${alias}url` ||
+                h === `${alias}_url`,
+            ),
+        )
+
+        resolved[diff] = { levelCol, linkCol }
+    }
+
+    return resolved
+}
+
+function parseMusicVocalIds(raw: string): number[] {
+    return (raw.match(/\d+/g) ?? [])
+        .map(Number)
+        .filter((value) => Number.isSafeInteger(value) && value > 0)
+}
+
+function applyRankedVocalType(
+    chart: SheetChart,
+    vocalType: RankedVocalType,
+): SheetChart {
+    if (vocalType !== 'sekai' || !chart.sekaiVocalVersion || !chart.musicVocalIds) {
+        return chart
+    }
+
+    const vocalId = chart.musicVocalIds[chart.sekaiVocalVersion - 1]
+    if (!vocalId) return chart
+
+    const match = chart.name.match(/^(.*-\d+)-\d+-(hard|expert|master|append)$/i)
+    if (!match) return chart
+
+    return {
+        ...chart,
+        name: `${match[1]}-${vocalId}-${match[2]}`,
+    }
+}
+
+function officialRankedPoolFromSheet(
+    values: string[][],
+    tier: RankedTier,
+): SheetChart[] {
+    const headerIndex = values.findIndex((row) => {
+        const lower = row.map((cell) => normalizeId(cell).toLowerCase())
+        return (
+            lower.includes('hrlevellinksbuga') ||
+            lower.includes('hr') ||
+            lower.includes('hrplaylevel')
+        )
+    })
+    if (headerIndex < 0) throw new Error('METADATA_RAW header row not found.')
+
+    const headers = values[headerIndex]!.map((cell) => normalizeId(cell).toLowerCase())
+    const idCol = headers.indexOf('id')
+    const musicVocalIdsCol = headers.indexOf('musicvocalids')
+    const vocalTypeCols = Array.from(
+        { length: 12 },
+        (_, index) => headers.indexOf(`v${index + 2}musicvocaltype`),
+    )
+    const cols = resolveOfficialColumns(headers)
+    const rules = RANKED_TIERS[tier]
+    const pool: SheetChart[] = []
+
+    for (let rowIdx = headerIndex + 1; rowIdx < values.length; rowIdx++) {
+        const cells = values[rowIdx]!
+        const musicVocalIds = musicVocalIdsCol >= 0
+            ? parseMusicVocalIds(normalizeId(cells[musicVocalIdsCol]))
+            : []
+
+        const sekaiVocalVersionIndex = vocalTypeCols.findIndex((col) =>
+            col >= 0 && normalizeId(cells[col]).toLowerCase().includes('sekai'),
+        )
+
+        const sekaiVocalVersion = sekaiVocalVersionIndex >= 0
+            ? sekaiVocalVersionIndex + 2
+            : undefined
+        const rowId = idCol >= 0 && normalizeId(cells[idCol])
+            ? normalizeId(cells[idCol])
+            : String(rowIdx)
+
+        for (const diff of OFFICIAL_DIFFS) {
+            const { levelCol, linkCol } = cols[diff]
+            if (levelCol < 0 || linkCol < 0) continue
+
+            const level = Number(normalizeId(cells[levelCol]))
+            const link = stripTrailingSlash(normalizeId(cells[linkCol]))
+            if (!Number.isFinite(level) || !link || link === '-') continue
+
+            const fits = diff === 'ap'
+                ? inRange(level, rules.append)
+                : inRange(level, rules.main)
+            if (!fits) continue
+
+            const chart = chartFromUrl(`${rowId}-${diff}`, link)
+            if (chart) {
+                pool.push({
+                    ...chart,
+                    musicVocalIds,
+                    ...(sekaiVocalVersion ? { sekaiVocalVersion } : {}),
+                })
+            }
+        }
+    }
+
+    return pool
+}
+
+function buildAllCustomRanked(rows: Row[]): RankedCustomChart[] {
+    const ALLOWED_CUSTOM_DIFFS = new Set(['hr', 'hard', 'ex', 'expert', 'ms', 'master', 'ap', 'append'])
+    const pool: RankedCustomChart[] = []
+
     for (const row of rows) {
+        if (!isCustomLevelId(row.id)) continue
+        if (row.ranked.toLowerCase() !== 'true') continue
+        if (!isPublicLevel(row)) continue
+
+        const diffLower = row.difficulty.trim().toLowerCase()
+        if (diffLower && !ALLOWED_CUSTOM_DIFFS.has(diffLower)) continue
+
+        const playLevel = Number(row.playLevel)
+        if (!Number.isFinite(playLevel) || playLevel < 18 || playLevel > 39) continue
+
         const chart = chartFromUrl(row.id, row.input)
         if (!chart) continue
-        const constant = parseConstantValue(row.constant)
-        if (constant !== null) {
-            chart.constant = constant
-        }
-        charts.push(chart)
+
+        pool.push({
+            ...chart,
+            playLevel,
+            isAppend: diffLower === 'append' || diffLower === 'ap',
+        })
     }
+
+    return pool
+}
+
+function filterCustomRankedForTier(
+    allCustom: RankedCustomChart[],
+    tier: RankedTier,
+): SheetChart[] {
+    const rules = RANKED_TIERS[tier]
+    return allCustom.filter((item) =>
+        inRange(item.playLevel, item.isAppend ? rules.append : rules.main),
+    )
+}
+
+async function getRankedTierOfficialPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
+    const cached = await readBucketJson<SheetChart[]>(env, rankedTierKey(tier))
+    if (cached) return cached
+
+    const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+    const charts = officialRankedPoolFromSheet(metaRows, tier)
+    await writeBucketJson(env, rankedTierKey(tier), charts).catch((e) =>
+        console.warn(`[R2] Could not cache ranked tier ${tier}:`, e),
+    )
     return charts
 }
 
-export async function getCustomLevelPage(
-    page: number,
-    env?: Env,
-    pageSize = CUSTOM_LEVEL_PAGE_SIZE,
-    keywords = '',
-): Promise<{ charts: SheetChart[]; pageCount: number }> {
-    const all = await getCustomLevels(env)
-    const safePage = Number.isInteger(page) && page >= 0 ? page : 0
-    const safePageSize = Number.isInteger(pageSize)
-        ? Math.max(1, Math.min(50, pageSize))
-        : CUSTOM_LEVEL_PAGE_SIZE
-
-    const query = keywords.trim().toLowerCase()
-    const filtered = query
-        ? all.filter((chart) =>
-            `${chart.name} ${chart.id} ${chart.url}`
-                .toLowerCase()
-                .includes(query),
-        )
-        : all
-
-    const pageCount = Math.max(
-        1,
-        Math.ceil(filtered.length / safePageSize),
-    )
-
-    const start = safePage * safePageSize
-
-    return {
-        charts: filtered.slice(start, start + safePageSize),
-        pageCount,
-    }
-}
-
-export async function getPlaylists(env?: Env): Promise<SheetPlaylist[]> {
-    const customCharts = await getCustomLevels(env).catch(() => [])
-    if (customCharts.length === 0) return []
-    return [
-        {
-            name: 'Custom Levels',
-            charts: customCharts,
-        },
-    ]
+async function getRankedCustomPool(tier: RankedTier, env?: Env): Promise<SheetChart[]> {
+    const cached = await readBucketJson<RankedCustomChart[]>(env, R2_RANKED_CUSTOM_KEY, Number.POSITIVE_INFINITY)
+    if (cached === null) throw new Error(`R2 ranked custom pool missing: ${R2_RANKED_CUSTOM_KEY}`)
+    return filterCustomRankedForTier(cached, tier)
 }
 
 export async function pickRankedLevel(
-    env: Env,
     tier: RankedTier,
-    customSongs: 'off' | 'on' | 'customOnly' = 'off',
+    customSongs: CustomSongsMode,
+    vocalType: RankedVocalType,
+    env?: Env,
 ): Promise<SheetChart | null> {
-    const pools = await readBucketJson<Record<string, SheetChart[]>>(env, R2_RANKED_POOLS_KEY)
-    const customCharts = await getCustomLevels(env).catch(() => [])
+    const official = customSongs === 'customOnly'
+        ? []
+        : await getRankedTierOfficialPool(tier, env)
+    const custom = customSongs === 'off'
+        ? []
+        : await getRankedCustomPool(tier, env)
 
-    const tierPool = Array.isArray(pools?.[tier]) ? pools[tier]! : []
-    const candidates = customSongs === 'customOnly'
-        ? customCharts
-        : customSongs === 'on'
-            ? [...tierPool, ...customCharts]
-            : tierPool.length > 0
-                ? tierPool
-                : customCharts
+    const pool = [...official, ...custom]
+    if (pool.length === 0) return null
 
-    if (candidates.length === 0) return null
-    const idx = Math.floor(Math.random() * candidates.length)
-    return candidates[idx] ?? null
+    const selected = pool[Math.floor(Math.random() * pool.length)]!
+    return applyRankedVocalType(selected, vocalType)
+}
+
+export type RefreshSummary = {
+    levels: number | null
+    playlists: number | null
+    constants: number | null
+    rankedCustom: number | null
+    rankedTiers: Partial<Record<RankedTier, number>>
+    errors: string[]
 }
 
 export async function refreshDailyAssets(env: Env): Promise<RefreshSummary> {
-    const errors: string[] = []
-    let editions: string[] = []
-    let customCharts: SheetChart[] = []
-    let playlists: SheetPlaylist[] = []
-    let constantsCount = 0
-
-    try {
-        const indexCsv = await fetchCsvRows(INDEX_GID)
-        await writeBucketJson(env, R2_INDEX_ROWS_KEY, indexCsv)
-        editions = await getAvailableEditions(env)
-    } catch (error) {
-        errors.push(`Index refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+    console.log('[Refresh] Starting R2 refresh on SONOLUS_ASSETS_BUCKET...')
+    const summary: RefreshSummary = {
+        levels: null,
+        playlists: null,
+        constants: null,
+        rankedCustom: null,
+        rankedTiers: {},
+        errors: [],
     }
 
     try {
-        const customCsv = await fetchCsvRows(CUSTOM_GID)
-        const parsedRows = tableToRows(customCsv)
-        await writeBucketJson(env, R2_CUSTOM_ROWS_KEY, parsedRows)
+        const rows = await customRows()
 
-        const constantsMap = buildConstantsMap(parsedRows)
-        constantsCount = Object.keys(constantsMap).length
+        const customCharts = buildCustomLevels(rows)
+        await writeBucketJson(env, R2_LEVEL_LIST_KEY, customCharts)
+        summary.levels = customCharts.length
+
+        const playlists = buildPlaylists(rows)
+        await writeBucketJson(env, R2_PLAYLISTS_KEY, playlists)
+        summary.playlists = playlists.length
+
+        const constantsMap = buildConstantsMap(rows)
         await writeBucketJson(env, R2_CONSTANTS_KEY, constantsMap)
+        summary.constants = Object.keys(constantsMap).length
 
-        customCharts = await getCustomLevels(env)
-        playlists = await getPlaylists(env)
+        const allCustomRanked = buildAllCustomRanked(rows)
+        await writeBucketJson(env, R2_RANKED_CUSTOM_KEY, allCustomRanked)
+        summary.rankedCustom = allCustomRanked.length
+    } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        console.error('[Refresh] Failed custom tab step:', msg)
+        summary.errors.push(`custom: ${msg}`)
+    }
 
-        const existingList = await readBucketJson<any>(env, R2_LEVEL_LIST_KEY)
-        if (!existingList) {
-            await writeBucketJson(env, R2_LEVEL_LIST_KEY, { items: [] })
+    try {
+        const metaRows = await fetchSheet(CUSTOM_SHEET_ID, METADATA_TAB)
+        for (const tier of Object.keys(RANKED_TIERS) as RankedTier[]) {
+            const charts = officialRankedPoolFromSheet(metaRows, tier)
+            await writeBucketJson(env, rankedTierKey(tier), charts)
+            summary.rankedTiers[tier] = charts.length
         }
     } catch (error) {
-        errors.push(`Custom refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+        const msg = error instanceof Error ? error.message : String(error)
+        console.error('[Refresh] Failed METADATA_RAW step:', msg)
+        summary.errors.push(`metadata: ${msg}`)
     }
 
-    return {
-        refreshedAt: Date.now(),
-        editions,
-        customLevelsCount: customCharts.length,
-        playlistsCount: playlists.length,
-        constantsCount,
-        errors,
-    }
+    return summary
 }
