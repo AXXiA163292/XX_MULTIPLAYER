@@ -188,7 +188,7 @@ function normalizeEditionLabel(value: unknown): string {
 
 function chartFromUrl(id: string, rawInput: string): SheetChart | null {
     const raw = stripTrailingSlash(rawInput)
-    if (!raw) return null
+    if (!raw || raw === '-') return null
 
     try {
         let candidate = raw
@@ -522,19 +522,45 @@ function isGroupHeader(header: string): boolean {
     return /^[A-Z]$/i.test(header)
 }
 
+function compactHeaderKey(value: string): string {
+    return normalizeEditionLabel(value).replace(/[^A-Z0-9]/g, '')
+}
+
 function parseIndexSheet(rows: string[][]): {
     headers: string[]
     normalized: string[]
+    compact: string[]
     editionCol: number
     dataRows: string[][]
 } {
-    const headerRow = rows[0] ?? []
+    const headerRowIndex = rows.findIndex((row) =>
+        row.some((cell) => {
+            const c = compactHeaderKey(cell)
+            return c === 'G1' || c === 'F1' || c === 'EDITION'
+        }),
+    )
+    const idx = headerRowIndex >= 0 ? headerRowIndex : 0
+    const headerRow = rows[idx] ?? []
     const headers = headerRow.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => normalizeEditionLabel(cell))
-    const editionCol = 0
-    const dataRows = rows.slice(1)
+    const compact = headers.map((cell) => compactHeaderKey(cell))
+    const editionColFound = compact.indexOf('EDITION')
+    const editionCol = editionColFound >= 0 ? editionColFound : 0
+    const dataRows = rows.slice(idx + 1)
 
-    return { headers, normalized, editionCol, dataRows }
+    return { headers, normalized, compact, editionCol, dataRows }
+}
+
+function findIndexColumn(
+    normalized: string[],
+    compact: string[],
+    key: string,
+): number {
+    const upper = key.toUpperCase()
+    const exact = normalized.indexOf(upper)
+    if (exact >= 0) return exact
+    const targetCompact = compactHeaderKey(upper)
+    return compact.indexOf(targetCompact)
 }
 
 export function getLiveEdition(date = new Date()): string {
@@ -575,7 +601,7 @@ export async function getEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const { normalized, editionCol, dataRows } = parseIndexSheet(rows)
+    const { normalized, compact, editionCol, dataRows } = parseIndexSheet(rows)
 
     const edition = normalizeEditionLabel(requestedEdition)
     const activeRow = dataRows.find(
@@ -598,7 +624,7 @@ export async function getEditionData(
         }
     }
 
-    const column = (key: string) => normalized.indexOf(key.toUpperCase())
+    const column = (key: string) => findIndexColumn(normalized, compact, key)
 
     const slots = [
         'G1', 'G2', 'G3', 'G4', 'G5', 'G6',
@@ -607,8 +633,8 @@ export async function getEditionData(
 
     for (const slot of slots) {
         const urlColumn = column(slot)
-        const playLevelColumn = column(`${slot}playLevel`)
-        const constantColumn = column(`${slot}constant`)
+        const playLevelColumn = column(`${slot}PLAYLEVEL`)
+        const constantColumn = column(`${slot}CONSTANT`)
 
         if (urlColumn < 0) continue
 
@@ -703,7 +729,7 @@ export async function getUltimateEditionData(
     requestedEdition = getLiveEdition(),
 ): Promise<UltimateEditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const { normalized, editionCol, dataRows } = parseIndexSheet(rows)
+    const { normalized, compact, editionCol, dataRows } = parseIndexSheet(rows)
     const edition = normalizeEditionLabel(requestedEdition)
 
     if (!/^ULTIMATE\s+\d{4}$/.test(edition)) {
@@ -743,8 +769,9 @@ export async function getUltimateEditionData(
             'G1', 'G2', 'G3', 'G4', 'G5', 'G6',
             'F1', 'F2', 'F3', 'F4',
         ]) {
-            const urlColumn = normalized.indexOf(slot)
-            const levelColumn = normalized.indexOf(`${slot}PLAYLEVEL`)
+            const urlColumn = findIndexColumn(normalized, compact, slot)
+            const levelColumn = findIndexColumn(normalized, compact, `${slot}PLAYLEVEL`)
+            const constantColumn = findIndexColumn(normalized, compact, `${slot}CONSTANT`)
 
             if (urlColumn < 0 || levelColumn < 0) continue
 
@@ -758,6 +785,10 @@ export async function getUltimateEditionData(
 
             chart.id = `${season}-${slot}`
             chart.playLevel = playLevel
+            if (constantColumn >= 0) {
+                const constant = parseConstantValue(normalizeId(row[constantColumn]))
+                if (constant !== null) chart.constant = constant
+            }
             charts.push(chart)
         }
 
@@ -774,13 +805,27 @@ export async function getUltimateEditionData(
     const getFixedChart = (slot: 'F1' | 'F2'): SheetChart | null => {
         if (!ultimateRow) return null
 
-        const column = normalized.indexOf(slot)
+        const column = findIndexColumn(normalized, compact, slot)
         if (column < 0) return null
 
-        return chartFromUrl(slot, normalizeId(ultimateRow[column]))
+        const chart = chartFromUrl(slot, normalizeId(ultimateRow[column]))
+        if (!chart) return null
+
+        const levelColumn = findIndexColumn(normalized, compact, `${slot}PLAYLEVEL`)
+        const constantColumn = findIndexColumn(normalized, compact, `${slot}CONSTANT`)
+        if (levelColumn >= 0) {
+            const playLevel = parseEditionPlayLevel(ultimateRow[levelColumn])
+            if (playLevel !== null) chart.playLevel = playLevel
+        }
+        if (constantColumn >= 0) {
+            const constant = parseConstantValue(normalizeId(ultimateRow[constantColumn]))
+            if (constant !== null) chart.constant = constant
+        }
+
+        return chart
     }
 
-    const uxColumn = normalized.indexOf('UX')
+    const uxColumn = findIndexColumn(normalized, compact, 'UX')
 
     return {
         edition,
