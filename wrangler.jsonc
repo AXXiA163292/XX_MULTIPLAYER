@@ -39,10 +39,6 @@
       {
         "name": "CHAT",
         "class_name": "Chat"
-      },
-      {
-        "name": "REPLAYS",
-        "class_name": "Replays"
       }
     ]
   },
@@ -54,10 +50,6 @@
     {
       "tag": "v2",
       "new_sqlite_classes": ["Chat"]
-    },
-    {
-      "tag": "v3",
-      "new_sqlite_classes": ["Replays"]
     }
   ],
   "r2_buckets": [
