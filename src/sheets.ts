@@ -611,18 +611,15 @@ function ultimatePicksKey(edition: string): string {
 }
 
 export async function getUltimateEditionData(): Promise<UltimateEditionData> {
-        const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
-    const headerIndex = rows.findIndex((row) =>
-        normalizeId(row[0]).toUpperCase() === 'EDITION',
-    )
-    if (headerIndex < 0 || headerIndex >= rows.length - 1) {
-        throw new Error('[ULTIMATE] Could not find the edition header row or its data rows.')
+    const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
+
+    if (rows.length < 3) {
+        throw new Error('[ULTIMATE] Edition sheet must contain a title row, a header row and data rows.')
     }
 
-    const headers = rows[headerIndex]!.map((cell) => normalizeId(cell))
+    const headers = rows[1]!.map((cell) => normalizeId(cell))
     const normalized = headers.map((cell) => cell.toUpperCase())
-    const dataRows = rows.slice(headerIndex + 1)
-
+    const dataRows = rows.slice(2)
     const ultimateRow = dataRows.find((row) =>
         /^ULTIMATE\s+\d{4}$/i.test(normalizeId(row[0])),
     )
