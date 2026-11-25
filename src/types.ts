@@ -71,8 +71,8 @@ export type ReplayItem = {
     name: string
     source?: string
     version: 1
-    title: string
-    subtitle: string
+    title: string | Record<string, string>
+    subtitle: string | Record<string, string>
     author: string
     authorUser?: Record<string, unknown>
     tags: Record<string, unknown>[]
@@ -86,11 +86,7 @@ export type ReplayCompetition =
     | 'final'
     | 'ultimateEdition'
 
-export type ReplayRoundKind =
-    | 'tournament'
-    | 'rewind'
-    | 'warmup'
-    | 'freeplay'
+export type ReplayRoundKind = 'tournament' | 'rewind'
 
 export type ReplaySubmission = {
     edition: string
@@ -103,6 +99,7 @@ export type ReplaySubmission = {
     songTitle: string
     difficulty: string
     levelName: string
+    levelAddress: string
     levelRating?: number
     levelConstant?: number
     playerName: string
