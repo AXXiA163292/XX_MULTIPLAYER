@@ -43,9 +43,9 @@ export const RANKED_POINTS = {
 export const ROOM_TYPES = {
     groupStage: 'Group Stage',
     final: 'Final',
+    ultimateEdition: 'Ultimate Edition',
     casualRoom: 'Custom Room',
     rankedRoom: 'Ranked Match',
-    ultimateEdition: 'Ultimate Edition',
 } as const
 
 export const RANKED_TIER_NAMES = [
