@@ -868,12 +868,6 @@ export class Room extends DurableObject<Env> {
             })
             return false
         }
-        if (
-            host.handle !== TOURNAMENT_HOST_HANDLE &&
-            !isOpenType(settings.type)
-        ) {
-            return false
-        }
 
         if (settings.type === 'casualRoom' && !settings.title) {
             settings.title = defaultCustomRoomTitle(host.name)
