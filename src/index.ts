@@ -4802,6 +4802,14 @@ await sendChatEmailNotifications(env, newMessage)
             const user = profileOf(body.userProfile)
             const stub = roomStub(env, name)
             const key = req.headers.get('Sonolus-Room-Key')
+                        const authSession = await sessionOf(req, env, url)
+            console.error('[ROOM CONFIG AUTH]', {
+                signedHandle: user.handle,
+                sessionHandle: authSession?.user.handle ?? null,
+                sessionIdMatches: authSession?.user.id === user.id,
+                type: url.searchParams.get('type'),
+                hasRoomKey: !!key,
+            })
 
             if (key) {
                 const params = new URLSearchParams(url.searchParams)
