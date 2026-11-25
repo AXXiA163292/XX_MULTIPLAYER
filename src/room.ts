@@ -906,8 +906,12 @@ export class Room extends DurableObject<Env> {
                 editionData = await getEditionData()
                 poolCharts = chartsForType(editionData, settings.type)
             }
-        } catch (error) {
-            console.error('Could not load edition sheet while configuring room:', error)
+                } catch (error) {
+            console.error(
+                '[ROOM CONFIG] Edition sheet failure:',
+                error instanceof Error ? error.message : String(error),
+                error instanceof Error ? error.stack : '',
+            )
             return false
         }
 
