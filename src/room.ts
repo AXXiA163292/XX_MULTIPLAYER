@@ -188,6 +188,21 @@ function buildRoundLabel(
         return `Freeplay ${freeplayCount}`
     }
 
+        const ultimateIndex = ultimateRounds.findIndex((chart) => sameLevel(level, chart))
+
+    if (ultimateIndex >= 0) {
+        const names = ['Winter', 'Spring', 'Summer', 'Fall', 'Contest Winner', 'XX! Ultimate']
+        const base = `Round ${ultimateIndex + 1} · ${names[ultimateIndex]}`
+
+        if (kind === 'tournament') return base
+
+        const rewindCount = priorHistory.filter(
+            (record) => (record.roundKind ?? 'tournament') === 'rewind' && sameLevel(record.level, level),
+        ).length + 1
+
+        return rewindCount === 1 ? `${base} • Rewind` : `${base} • Rewind ${rewindCount}`
+    }
+
     const targetKey = songKeyOf(level)
     const tournamentRounds = priorHistory.filter((r) => (r.roundKind ?? 'tournament') === 'tournament')
 
