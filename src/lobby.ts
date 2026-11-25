@@ -49,6 +49,7 @@ export type RoomDirectoryEntry = {
 type LobbyState = {
     rooms: string[]
     roomEntries?: Record<string, RoomDirectoryEntry>
+    hostRooms?: Record<string, string>
     posts: StoredPost[]
 }
 
@@ -112,6 +113,7 @@ export class Lobby extends DurableObject<Env> {
         posts: [],
     }
     private loaded = false
+        private roomClaimQueue: Promise<void> = Promise.resolve()
     private r2Queue: Promise<void> = Promise.resolve()
     private r2Dirty = false
     private lastR2WriteAt = 0
@@ -289,6 +291,59 @@ export class Lobby extends DurableObject<Env> {
         await this.save(false)
     }
 
+        async reserveHostRoom(
+        hostId: string,
+        name: string,
+        reservation: {
+            key: string
+            hostId: string
+            hostName: string
+            hostHandle: string
+        },
+    ): Promise<void> {
+        let release!: () => void
+        const previousQueue = this.roomClaimQueue
+
+        this.roomClaimQueue = new Promise<void>((resolve) => {
+            release = resolve
+        })
+
+        await previousQueue
+
+        try {
+            await this.ensureLoaded()
+
+            this.st.hostRooms ??= {}
+
+            const previousName =
+                this.st.hostRooms[hostId] ??
+                Object.values(this.st.roomEntries ?? {})
+                    .filter((entry) => entry.hostId === hostId)
+                    .sort((a, b) => b.updatedAt - a.updatedAt)[0]?.name
+
+            if (previousName && previousName !== name) {
+                await this.env.ROOM
+                    .get(this.env.ROOM.idFromName(previousName))
+                    .closeForOwner(hostId)
+            }
+
+            this.st.hostRooms[hostId] = name
+            await this.save(false)
+
+            await this.env.ROOM
+                .get(this.env.ROOM.idFromName(name))
+                .reserve(name, reservation)
+        } catch (error) {
+            if (this.st.hostRooms?.[hostId] === name) {
+                delete this.st.hostRooms[hostId]
+                await this.save(false)
+            }
+            throw error
+        } finally {
+            release()
+        }
+        }
+
     async register(name: string): Promise<void> {
         await this.ensureLoaded()
         if (!name) return
@@ -296,15 +351,26 @@ export class Lobby extends DurableObject<Env> {
         await this.save(false)
     }
 
-    async remove(name: string): Promise<void> {
+        async remove(name: string): Promise<void> {
         await this.ensureLoaded()
         if (!name) return
+
         this.rooms.delete(name)
+
         if (this.st.roomEntries) {
             delete this.st.roomEntries[name]
         }
+
+        if (this.st.hostRooms) {
+            for (const [hostId, roomName] of Object.entries(this.st.hostRooms)) {
+                if (roomName === name) {
+                    delete this.st.hostRooms[hostId]
+                }
+            }
+        }
+
         await this.save(false)
-    }
+        }
 
     async listPosts(category?: PostCategory): Promise<StoredPost[]> {
         await this.ensureLoaded()
