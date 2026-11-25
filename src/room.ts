@@ -1176,6 +1176,11 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
+                                if (next.type === 'rankedRoom') {
+                    next.tier = state.settings.tier
+                    next.customSongs = state.settings.customSongs
+                                }
+
                 const randomChanged = next.random !== state.settings.random
                 const modeChanged = next.scoring !== state.settings.scoring
                 const titleChanged =
