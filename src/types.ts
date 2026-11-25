@@ -61,6 +61,71 @@ export type LevelItem = {
     tags?: { title: string; icon?: string }[]
 }
 
+export type ReplayResource = {
+    hash: string
+    url?: string
+    [key: string]: unknown
+}
+
+export type ReplayItem = {
+    name: string
+    source?: string
+    version: 1
+    title: string
+    subtitle: string
+    author: string
+    authorUser?: Record<string, unknown>
+    tags: Record<string, unknown>[]
+    level: Record<string, unknown>
+    data: ReplayResource
+    configuration: ReplayResource
+}
+
+export type ReplayCompetition =
+    | 'groupStage'
+    | 'final'
+    | 'ultimateEdition'
+
+export type ReplayRoundKind =
+    | 'tournament'
+    | 'rewind'
+    | 'warmup'
+    | 'freeplay'
+
+export type ReplaySubmission = {
+    edition: string
+    competition: ReplayCompetition
+    group?: string
+    roundId: string
+    roundNumber: number
+    roundLabel: string
+    roundKind: ReplayRoundKind
+    songTitle: string
+    difficulty: string
+    levelName: string
+    levelRating?: number
+    levelConstant?: number
+    playerName: string
+    playerHandle: string
+    scoreLabel: string
+    scoreValue: number
+    grade: string
+    combo: number
+    perfect: number
+    great: number
+    good: number
+    miss: number
+    rewindIndex: number
+}
+
+export type ReplayRecord = {
+    id: string
+    handle: string
+    replay: ReplayItem
+    metadata: ReplaySubmission
+    createdAt: number
+}
+
 export type RoomMember = {
     index: number
     user: UserProfile
@@ -90,7 +155,6 @@ export type RoomSummary = {
     name: string
     title: string
     subtitle: string
-    /** Host display name. Must be text for the Sonolus RoomItem. */
     master: string
     visibility: RoomVisibility
     matchMode?: MatchMode
@@ -107,6 +171,7 @@ export type RoomSummary = {
 export type Env = {
     ROOM: DurableObjectNamespace<import('./room.ts').Room>
     LOBBY: DurableObjectNamespace<import('./lobby.ts').Lobby>
+    REPLAYS: DurableObjectNamespace<import('./replays.ts').Replays>
     SONOLUS_ASSETS_BUCKET: R2Bucket
     COMMUNITY_BUCKET?: R2Bucket
     SESSION_SECRET: string
