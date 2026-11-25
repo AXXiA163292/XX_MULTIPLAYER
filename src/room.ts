@@ -20,7 +20,9 @@ import {
     compareResults,
     fmtDetail,
     fmtScore,
+    formatGradeShortcut,
     isPlayerX,
+    rawPpPoints,
     roundPoints,
     songKeyOf,
     totals,
@@ -45,6 +47,7 @@ import type {
     Env,
     GameplayResult,
     JoinSession,
+    ReplaySubmission,
     RoomStatus,
     Sil,
     UserStatus,
@@ -268,7 +271,8 @@ function sanitizeWireResult(result: GameplayResult): GameplayResult {
 
     return {
         grade: wireGrade,
-        ...(result.disqualified ? { disqualified: true } : {}),
+        score: Number(result.score) || 0,
+        accuracy: Number(result.accuracy) || 0,
         arcadeScore: Number(result.arcadeScore) || 0,
         accuracyScore: Number(result.accuracyScore) || 0,
         combo: Number(result.combo) || 0,
@@ -1700,23 +1704,9 @@ export class Room extends DurableObject<Env> {
                     return this.resync(uid)
                 }
 
-                const expectedCount = state.levelInfo?.noteCount ?? null
-                const judgedCount =
-                    (Number(cmd.result.perfect) || 0) +
-                    (Number(cmd.result.great) || 0) +
-                    (Number(cmd.result.good) || 0) +
-                    (Number(cmd.result.miss) || 0)
-
-                const incomplete =
-                    expectedCount !== null && judgedCount < expectedCount
-
                 const result: GameplayResult = {
                     ...cmd.result,
                     grade: cmd.result.grade === 'X' ? 'fail' : cmd.result.grade,
-                    disqualified:
-                        incomplete ||
-                        cmd.result.disqualified === true ||
-                        cmd.result.grade === 'X',
                 }
 
                 state.results[uid] = result
@@ -1735,8 +1725,9 @@ export class Room extends DurableObject<Env> {
                 this.diag('finishGameplay-accepted', {
                     userId: uid,
                     grade: result.grade,
-                    disqualified: result.disqualified === true,
                 })
+
+                await this.stageReplayMetadata(uid, result)
 
                 await this.maybeFinishRound(true)
                 return
@@ -1971,6 +1962,155 @@ export class Room extends DurableObject<Env> {
             }
 
             this.diag('status-selecting-from-playing')
+        }
+    }
+
+    private async stageReplayMetadata(
+        uid: string,
+        result: GameplayResult,
+    ): Promise<void> {
+        const state = this.st
+        const competition = state.settings.type
+
+        if (
+            competition !== 'groupStage' &&
+            competition !== 'final' &&
+            competition !== 'ultimateEdition'
+        ) {
+            return
+        }
+
+        if (
+            !state.round ||
+            !state.level ||
+            (state.round.kind !== 'tournament' && state.round.kind !== 'rewind')
+        ) {
+            return
+        }
+
+        const member = state.members.find((entry) => entry.id === uid)
+        if (!member?.handle) return
+
+        const edition = String(
+            state.edition || state.settings.edition || getLiveEdition(),
+        ).trim().toUpperCase()
+
+        const originalRoundLabel = state.round.label.trim()
+
+        const rewindMatch = originalRoundLabel.match(
+            /Rewind(?:\s+(\d+))?$/i,
+        )
+
+        const rewindIndex =
+            state.round.kind === 'rewind'
+                ? Number(rewindMatch?.[1] ?? 1)
+                : 0
+
+        const roundLabel = originalRoundLabel
+            .replace(/\s*[•·]\s*Rewind(?:\s+\d+)?$/i, '')
+            .trim()
+
+        const roundNumber = Number(
+            roundLabel.match(/^Round\s+(\d+)/i)?.[1] ?? 1,
+        )
+
+        const group =
+            competition === 'groupStage'
+                ? String(state.settings.group || 'A').trim()
+                : undefined
+
+        const roundId = [
+            edition,
+            competition,
+            group ?? '',
+            roundLabel,
+            state.level.address.replace(/\/+$/, ''),
+            state.level.name,
+        ].join('::')
+
+        const roundData = {
+            levelConstant: state.levelInfo?.constant ?? undefined,
+            levelRating: state.levelInfo?.rating ?? undefined,
+            noteCount: state.levelInfo?.noteCount ?? undefined,
+        }
+
+        const scoreValue =
+            state.settings.scoring === 'pp'
+                ? rawPpPoints(result, roundData)
+                : roundPoints(result, state.settings.scoring, roundData)
+
+        const scoreText =
+            state.settings.scoring === 'pp'
+                ? `${scoreValue.toFixed(1)}pp`
+                : `${Math.round(scoreValue)}`
+
+        const grade = formatGradeShortcut(result)
+        const combo = Number(result.combo) || 0
+        const great = Number(result.great) || 0
+        const good = Number(result.good) || 0
+        const miss = Number(result.miss) || 0
+
+        const metadata: ReplaySubmission = {
+            edition,
+            competition,
+            ...(group ? { group } : {}),
+            roundId,
+            roundNumber,
+            roundLabel,
+            roundKind: state.round.kind,
+            songTitle: state.levelInfo?.title || state.level.name,
+            difficulty:
+                state.levelInfo?.difficulty ||
+                state.levelInfo?.firstTag ||
+                'UNKNOWN',
+            levelName: state.level.name,
+            levelAddress: state.level.address,
+            ...(state.levelInfo?.rating != null
+                ? { levelRating: state.levelInfo.rating }
+                : {}),
+            ...(state.levelInfo?.constant != null
+                ? { levelConstant: state.levelInfo.constant }
+                : {}),
+            playerName: member.name || member.handle,
+            playerHandle: member.handle,
+            scoreLabel: `${scoreText} ${grade} ${combo}x (${great}-${good}-${miss})`,
+            scoreValue,
+            grade,
+            combo,
+            perfect: Number(result.perfect) || 0,
+            great,
+            good,
+            miss,
+            rewindIndex,
+        }
+
+        try {
+            const stub = this.env.REPLAYS.get(
+                this.env.REPLAYS.idFromName('xx-replays'),
+            )
+
+            const response = await stub.fetch(
+                new Request('https://replays/pending', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        handle: member.handle,
+                        metadata,
+                    }),
+                }),
+            )
+
+            if (!response.ok) {
+                console.error(
+                    '[Replays] Could not stage replay metadata:',
+                    response.status,
+                    await response.text(),
+                )
+            }
+        } catch (error) {
+            console.error('[Replays] Metadata staging failed:', error)
         }
     }
 
@@ -2474,7 +2614,8 @@ export class Room extends DurableObject<Env> {
             ) {
                 const result: GameplayResult = {
                     grade: 'fail',
-                    disqualified: true,
+                    score: 0,
+                    accuracy: 0,
                     arcadeScore: 0,
                     accuracyScore: 0,
                     combo: 0,
