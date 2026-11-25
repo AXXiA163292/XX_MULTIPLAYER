@@ -645,13 +645,29 @@ export async function getUltimateEditionData(): Promise<UltimateEditionData> {
             const levelColumn = normalized.indexOf(`${slot}PLAYLEVEL`)
             if (urlColumn < 0 || levelColumn < 0) continue
 
-            const playLevel = parseEditionPlayLevel(row[levelColumn])
+                        const rawLevel = normalizeId(row[levelColumn])
+            const rawUrl = normalizeId(row[urlColumn])
+            const playLevel = parseEditionPlayLevel(rawLevel)
+
+            console.log('[ULTIMATE DEBUG]', {
+                season,
+                slot,
+                urlColumn,
+                levelColumn,
+                rawUrl,
+                rawLevel,
+                playLevel,
+            })
+
             if (playLevel === null || playLevel < 32) continue
 
-            const chart = chartFromUrl(
+            const chart = chartFromUrl(slot, rawUrl)
+
+            console.log('[ULTIMATE DEBUG] Chart result:', {
+                season,
                 slot,
-                normalizeId(row[urlColumn]),
-            )
+                valid: !!chart,
+            })
 
             if (chart) {
                 chart.id = `${season}-${slot}`
