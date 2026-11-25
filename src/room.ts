@@ -30,10 +30,14 @@ import {
 } from './scoring.ts'
 import {
     getEditionData,
+    getUltimateEditionData,
+    getSavedUltimatePicks,
+    saveUltimatePicks,
     pickRankedLevel,
     type EditionData,
     type RankedTier,
     type SheetChart,
+    type UltimatePicks,
 } from './sheets.ts'
 import type {
     Env,
@@ -91,6 +95,9 @@ type RoomState = {
     levelOptions: { name: string; value: number }[]
     suggestions: { userId: string; level: Sil }[]
     members: Member[]
+    ultimateParticipants: string[]
+    ultimateRoundIndex: number
+    ultimatePicksSaved: boolean
     statuses: Record<string, UserStatus>
     round: { state: string; seed: number; kind: RoundKind; label: string } | null
     results: Record<string, GameplayResult>
@@ -532,6 +539,13 @@ export class Room extends DurableObject<Env> {
                 edition: typeof saved?.edition === 'string' ? saved.edition : '',
                 divisions: cleanDivisions(saved?.divisions),
                 poolCharts: cleanPoolCharts(saved?.poolCharts),
+                                ultimateParticipants: Array.isArray(saved?.ultimateParticipants)
+                    ? saved.ultimateParticipants.filter((x): x is string => typeof x === 'string')
+                    : [],
+                ultimateRoundIndex: Number.isInteger(saved?.ultimateRoundIndex)
+                    ? Math.max(0, Math.min(6, saved!.ultimateRoundIndex as number))
+                    : 0,
+                ultimatePicksSaved: saved?.ultimatePicksSaved === true,
                 reserved: saved?.reserved ?? null,
                 configured: saved?.configured === true,
                 hostId: typeof saved?.hostId === 'string' ? saved.hostId : '',
@@ -679,9 +693,17 @@ export class Room extends DurableObject<Env> {
         priorHistory: RoundRecord[],
         pool: SheetChart[] = this.st.poolCharts,
     ): RoundKind {
-                if (this.st.settings.type === 'ultimateEdition') {
-            return 'tournament'
-                }
+                        if (this.st.settings.type === 'ultimateEdition') {
+            const index = pool.findIndex((chart) => sameLevel(level, chart))
+            if (index < 0) return 'freeplay'
+
+            const alreadyPlayed = priorHistory.some(
+                (record) => sameLevel(record.level, level),
+            )
+
+            if (alreadyPlayed) return 'rewind'
+            return index === this.st.ultimateRoundIndex ? 'tournament' : 'freeplay'
+        }
         if (isOpenType(this.st.settings.type)) {
             return 'tournament'
         }
@@ -1662,6 +1684,7 @@ export class Room extends DurableObject<Env> {
                 kind,
                 state.history,
                 isOpenType(state.settings.type),
+                state.settings.type === 'ultimateEdition' ? state.poolCharts : [],
             )
 
             state.settings.roundMode = kind
@@ -1697,9 +1720,12 @@ export class Room extends DurableObject<Env> {
 
             this.pushScoreboard()
             this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
-        } else if (current === 'playing' && next === 'selecting') {
+        }         } else if (current === 'playing' && next === 'selecting') {
+            let completedRound: RoundRecord | null = null
+
             if (Object.keys(state.results).length > 0) {
-                state.history.push(this.makeRoundRecord(state.history))
+                completedRound = this.makeRoundRecord(state.history)
+                state.history.push(completedRound)
             }
 
             state.round = null
@@ -1712,6 +1738,32 @@ export class Room extends DurableObject<Env> {
                 this.sendAll({ type: 'updateLevel', level: null })
             }
 
+            if (
+                state.settings.type === 'ultimateEdition' &&
+                completedRound?.roundKind === 'tournament'
+            ) {
+                const completedIndex = state.poolCharts.findIndex(
+                    (chart) => sameLevel(completedRound!.level, chart),
+                )
+
+                if (completedIndex === state.ultimateRoundIndex) {
+                    state.ultimateRoundIndex++
+
+                    if (state.ultimateRoundIndex < 6) {
+                        const nextChart = state.poolCharts[state.ultimateRoundIndex]!
+                        state.level = {
+                            address: nextChart.address,
+                            name: nextChart.name,
+                        }
+                        state.levelInfo = await fetchLevelInfo(state.level)
+                        state.levelOptions = []
+                        this.sendLevel()
+                    } else {
+                        await this.maybeSaveUltimatePicks()
+                    }
+                }
+            }
+
             this.sendAll({
                 type: 'updateStatus',
                 status: 'selecting',
@@ -1719,6 +1771,14 @@ export class Room extends DurableObject<Env> {
 
             this.pushScoreboard()
             await this.applyRandomLevel(true)
+
+            for (const member of state.members) {
+                if (this.socketsOf(member.id).length > 0) {
+                    this.resync(member.id)
+                }
+            }
+
+            this.diag('status-selecting-from-playing')
 
             for (const member of state.members) {
                 if (this.socketsOf(member.id).length > 0) {
@@ -1743,6 +1803,7 @@ export class Room extends DurableObject<Env> {
                 kind,
                 priorHistory,
                 isOpenType(this.st.settings.type),
+                this.st.settings.type === 'ultimateEdition' ? this.st.poolCharts : [],
             )
         const rewindEligibleUserIds =
             kind === 'rewind'
@@ -1836,6 +1897,40 @@ export class Room extends DurableObject<Env> {
         s.levelInfo = await fetchLevelInfo(s.level)
         this.pushScoreboard()
     }
+
+        private async maybeSaveUltimatePicks(): Promise<void> {
+        const state = this.st
+
+        if (
+            state.settings.type !== 'ultimateEdition' ||
+            state.ultimateRoundIndex < 6 ||
+            state.ultimatePicksSaved ||
+            state.poolCharts.length < 6
+        ) return
+
+        const assignedPresent = state.members.some(
+            (member) =>
+                state.ultimateParticipants.includes(member.handle) &&
+                this.socketsOf(member.id).length > 0,
+        )
+
+        if (!assignedPresent) return
+
+        const picks: UltimatePicks = {
+            winter: state.poolCharts[0]!,
+            spring: state.poolCharts[1]!,
+            summer: state.poolCharts[2]!,
+            fall: state.poolCharts[3]!,
+        }
+
+        try {
+            await saveUltimatePicks(this.env, state.edition, picks)
+            state.ultimatePicksSaved = true
+            await this.save()
+        } catch (error) {
+            console.error('[Ultimate] Could not save completed picks:', error)
+        }
+        }
 
     private hostIsTournament(): boolean {
         const host = this.st.members.find((m) => m.id === this.st.hostId)
@@ -2072,10 +2167,24 @@ export class Room extends DurableObject<Env> {
     private getDivisions(members: Member[]) {
         const type = this.st.settings.type
 
-                if (isOpenType(type) || type === 'ultimateEdition') {
+                        if (isOpenType(type)) {
             return [{ title: '', members }]
         }
 
+        if (type === 'ultimateEdition') {
+            const assigned = members.filter(
+                (member) => this.st.ultimateParticipants.includes(member.handle),
+            )
+            const unassigned = members.filter(
+                (member) => !this.st.ultimateParticipants.includes(member.handle),
+            )
+
+            return [
+                ...(assigned.length ? [{ title: '', members: assigned }] : []),
+                ...(unassigned.length ? [{ title: 'Unassigned', members: unassigned }] : []),
+            ]
+        }
+        
         if (type === 'groupStage') {
             const groupNames = [
                 ...new Set(
