@@ -5,6 +5,7 @@ export type RoundKind = 'tournament' | 'warmup' | 'rewind' | 'freeplay'
 
 export type RoundRecord = {
     level: Sil | null
+    edition?: string
     levelTitle?: string
     levelTag?: string
     levelRating?: number
@@ -14,7 +15,6 @@ export type RoundRecord = {
     roundKind?: RoundKind
     roundLabel?: string
     countsTowardScore?: boolean
-    isReplay?: boolean
     rewindEligibleUserIds?: string[]
     results: Record<string, GameplayResult>
 }
