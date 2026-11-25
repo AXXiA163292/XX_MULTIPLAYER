@@ -41,9 +41,7 @@ export const RANKED_POINTS = {
 } as const
 
 export const ROOM_TYPES = {
-    groupStage: 'Group Stage',
-    final: 'Final',
-    ultimateEdition: 'Ultimate Edition',
+    tournament: 'Tournament Room',
     casualRoom: 'Custom Room',
     rankedRoom: 'Ranked Match',
 } as const
@@ -76,14 +74,6 @@ export const STAFF_CHAT_HANDLES = [
     '3227470',
 ] as const
 
-export const STAFF_CHAT_SHORTCUTS = [
-    '@Bell',
-    '@Noct',
-    '@Ʌstra',
-] as const
-
-export const STAFF_CHAT_ALERT_EMAIL = 'axxia163292@gmail.com'
-
 export const SCOREBOARD_PUBLIC = true
 
 export type RoomType = keyof typeof ROOM_TYPES
@@ -95,7 +85,7 @@ export const SCORING_MODES = {
 
 export type ScoringMode = keyof typeof SCORING_MODES
 
-export const DEFAULT_TYPE: RoomType = 'groupStage'
+export const DEFAULT_TYPE: RoomType = 'tournament'
 export const DEFAULT_SCORING: ScoringMode = 'pp'
 export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 
