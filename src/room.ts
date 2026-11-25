@@ -188,8 +188,7 @@ function buildRoundLabel(
         return `Freeplay ${freeplayCount}`
     }
 
-        const ultimateIndex = ultimateRounds.findIndex((chart) => sameLevel(level, chart))
-
+            const ultimateIndex = ultimateRounds.findIndex((chart) => sameLevel(level, chart))
     if (ultimateIndex >= 0) {
         const names = ['Winter', 'Spring', 'Summer', 'Fall', 'Contest Winner', 'XX! Ultimate']
         const base = `Round ${ultimateIndex + 1} · ${names[ultimateIndex]}`
@@ -1783,7 +1782,7 @@ export class Room extends DurableObject<Env> {
 
             this.pushScoreboard()
             this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
-        }         }         } else if (current === 'playing' && next === 'selecting') {
+                } else if (current === 'playing' && next === 'selecting') {
             let completedRound: RoundRecord | null = null
 
             if (Object.keys(state.results).length > 0) {
@@ -1830,6 +1829,8 @@ export class Room extends DurableObject<Env> {
             }
 
             this.diag('status-selecting-from-playing')
+                    }
+    }
 
     private makeRoundRecord(priorHistory: RoundRecord[] = this.st.history): RoundRecord {
         const info = this.st.levelInfo
