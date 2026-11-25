@@ -518,10 +518,18 @@ function isGroupHeader(header: string): boolean {
 export async function getEditionData(): Promise<EditionData> {
     const rows = await fetchSheet(INDEX_SHEET_ID, INDEX_SHEET_TAB)
 
-        const headerIndex = rows.findIndex((row) =>
+            const headerIndex = rows.findIndex((row) =>
         normalizeId(row[0]).toUpperCase() === 'EDITION',
     )
+
     if (headerIndex < 0 || headerIndex >= rows.length - 1) {
+        console.error(
+            '[INDEX DEBUG] First rows returned by Google Sheets:',
+            rows.slice(0, 10).map((row, index) => ({
+                row: index + 1,
+                cells: row.slice(0, 8),
+            })),
+        )
         throw new Error(`[INDEX] Could not find the edition header row or its data rows in "${INDEX_SHEET_TAB}".`)
     }
 
