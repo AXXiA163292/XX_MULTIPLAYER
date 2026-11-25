@@ -766,6 +766,16 @@ export class Room extends DurableObject<Env> {
         })
     }
 
+        async closeForOwner(ownerId: string): Promise<void> {
+        const currentOwner = this.st.configured
+            ? this.st.hostId
+            : this.st.reserved?.hostId
+
+        if (!currentOwner || currentOwner !== ownerId) return
+
+        await this.expireAndDestroy('replaced by a newer room')
+        }
+
     async reserve(name: string, reservation: Reservation): Promise<void> {
         this.st = {
             ...fresh(),
