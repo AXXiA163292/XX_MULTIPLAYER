@@ -132,7 +132,10 @@ const fresh = (): RoomState => ({
     levelInfo: null,
     levelOptions: [],
     suggestions: [],
-    members: [],
+        members: [],
+    ultimateParticipants: [],
+    ultimateRoundIndex: 0,
+    ultimatePicksSaved: false,
     statuses: {},
     round: null,
     results: {},
@@ -169,6 +172,7 @@ function buildRoundLabel(
     kind: RoundKind,
     priorHistory: RoundRecord[],
     isOpen: boolean,
+    ultimateRounds: SheetChart[] = [],
 ): string {
     if (isOpen) {
         return `Round ${priorHistory.length + 1}`
@@ -253,6 +257,11 @@ function suggestionsFromCharts(
             name: chart.name,
         },
     }))
+}
+
+function randomChart(charts: SheetChart[]): SheetChart {
+    if (!charts.length) throw new Error('Ultimate seasonal pool is empty.')
+    return charts[Math.floor(Math.random() * charts.length)]!
 }
 
 async function songPoolSuggestions(
@@ -850,33 +859,71 @@ export class Room extends DurableObject<Env> {
             settings.title = defaultCustomRoomTitle(host.name)
         }
 
-        let editionData: EditionData | null = null
+                let editionData: EditionData | null = null
+        let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
+        let ultimatePicks: UltimatePicks | null = null
+        let hadSavedUltimatePicks = false
+        let poolCharts: SheetChart[] = []
 
         try {
-            editionData = await getEditionData()
+            if (settings.type === 'ultimateEdition') {
+                ultimateData = await getUltimateEditionData()
+                ultimatePicks = await getSavedUltimatePicks(this.env, ultimateData.edition)
+                hadSavedUltimatePicks = !!ultimatePicks
+
+                if (!ultimatePicks) {
+                    ultimatePicks = {
+                        winter: randomChart(ultimateData.seasons.winter),
+                        spring: randomChart(ultimateData.seasons.spring),
+                        summer: randomChart(ultimateData.seasons.summer),
+                        fall: randomChart(ultimateData.seasons.fall),
+                    }
+                }
+
+                poolCharts = [
+                    ultimatePicks.winter,
+                    ultimatePicks.spring,
+                    ultimatePicks.summer,
+                    ultimatePicks.fall,
+                    ultimateData.contestWinner,
+                    ultimateData.ultimate,
+                ]
+            } else {
+                editionData = await getEditionData()
+                poolCharts = chartsForType(editionData, settings.type)
+            }
         } catch (error) {
             console.error('Could not load edition sheet while configuring room:', error)
+            return false
         }
 
-        const poolCharts = editionData
-            ? chartsForType(editionData, settings.type)
-            : []
-
-        if (editionData) {
+        if (ultimateData && ultimatePicks) {
+            this.st.edition = ultimateData.edition
+            this.st.divisions = {}
+            this.st.ultimateParticipants = ultimateData.participants
+            this.st.ultimateRoundIndex = 0
+            this.st.ultimatePicksSaved = hadSavedUltimatePicks
+            this.st.poolCharts = poolCharts
+            this.st.suggestions = []
+        } else if (editionData) {
             this.st.edition = editionData.edition
             this.st.divisions = cleanDivisions(editionData.divisions)
+            this.st.ultimateParticipants = []
+            this.st.ultimateRoundIndex = 0
+            this.st.ultimatePicksSaved = false
             this.st.poolCharts = poolCharts
             this.st.suggestions = suggestionsFromCharts(poolCharts, host.id)
         } else {
             this.st.edition ||= 'Final'
             this.st.divisions = {}
+            this.st.ultimateParticipants = []
+            this.st.ultimateRoundIndex = 0
+            this.st.ultimatePicksSaved = false
             this.st.poolCharts = []
             this.st.suggestions = await songPoolSuggestions(settings.type, host.id)
         }
 
-        const firstPoolChart = !isOpenType(settings.type)
-            ? (poolCharts[0] ?? null)
-            : null
+        const firstPoolChart = !isOpenType(settings.type) ? (poolCharts[0] ?? null) : null
 
         this.st.createdAt = Date.now()
         this.st.configured = true
@@ -1050,6 +1097,7 @@ export class Room extends DurableObject<Env> {
         }
 
         this.pushScoreboard()
+        await this.maybeSaveUltimatePicks()
 
         this.send(server, {
             type: 'updateTitle',
@@ -1720,7 +1768,7 @@ export class Room extends DurableObject<Env> {
 
             this.pushScoreboard()
             this.diag('status-playing', { readyCount: readyMembers.length, kind, label })
-        }         } else if (current === 'playing' && next === 'selecting') {
+        }         }         } else if (current === 'playing' && next === 'selecting') {
             let completedRound: RoundRecord | null = null
 
             if (Object.keys(state.results).length > 0) {
@@ -1738,10 +1786,7 @@ export class Room extends DurableObject<Env> {
                 this.sendAll({ type: 'updateLevel', level: null })
             }
 
-            if (
-                state.settings.type === 'ultimateEdition' &&
-                completedRound?.roundKind === 'tournament'
-            ) {
+            if (state.settings.type === 'ultimateEdition' && completedRound?.roundKind === 'tournament') {
                 const completedIndex = state.poolCharts.findIndex(
                     (chart) => sameLevel(completedRound!.level, chart),
                 )
@@ -1751,10 +1796,7 @@ export class Room extends DurableObject<Env> {
 
                     if (state.ultimateRoundIndex < 6) {
                         const nextChart = state.poolCharts[state.ultimateRoundIndex]!
-                        state.level = {
-                            address: nextChart.address,
-                            name: nextChart.name,
-                        }
+                        state.level = { address: nextChart.address, name: nextChart.name }
                         state.levelInfo = await fetchLevelInfo(state.level)
                         state.levelOptions = []
                         this.sendLevel()
@@ -1764,33 +1806,15 @@ export class Room extends DurableObject<Env> {
                 }
             }
 
-            this.sendAll({
-                type: 'updateStatus',
-                status: 'selecting',
-            })
-
+            this.sendAll({ type: 'updateStatus', status: 'selecting' })
             this.pushScoreboard()
             await this.applyRandomLevel(true)
 
             for (const member of state.members) {
-                if (this.socketsOf(member.id).length > 0) {
-                    this.resync(member.id)
-                }
+                if (this.socketsOf(member.id).length > 0) this.resync(member.id)
             }
 
             this.diag('status-selecting-from-playing')
-
-            for (const member of state.members) {
-                if (this.socketsOf(member.id).length > 0) {
-                    this.resync(member.id)
-                }
-            }
-
-            this.diag('status-selecting-from-playing')
-        } else {
-            return this.resync(uid)
-        }
-    }
 
     private makeRoundRecord(priorHistory: RoundRecord[] = this.st.history): RoundRecord {
         const info = this.st.levelInfo
@@ -1829,6 +1853,33 @@ export class Room extends DurableObject<Env> {
 
     private canSee(_uid: string): boolean {
         return true
+    }
+
+    private async maybeSaveUltimatePicks(): Promise<void> {
+        const state = this.st
+
+        if (state.settings.type !== 'ultimateEdition' || state.ultimateRoundIndex < 6 || state.ultimatePicksSaved || state.poolCharts.length < 6) return
+
+        const assignedPresent = state.members.some(
+            (member) => state.ultimateParticipants.includes(member.handle) && this.socketsOf(member.id).length > 0,
+        )
+
+        if (!assignedPresent) return
+
+        const picks: UltimatePicks = {
+            winter: state.poolCharts[0]!,
+            spring: state.poolCharts[1]!,
+            summer: state.poolCharts[2]!,
+            fall: state.poolCharts[3]!,
+        }
+
+        try {
+            await saveUltimatePicks(this.env, state.edition, picks)
+            state.ultimatePicksSaved = true
+            await this.save()
+        } catch (error) {
+            console.error('[Ultimate] Could not save completed picks:', error)
+        }
     }
 
     private sendLevel(): void {
@@ -2131,7 +2182,7 @@ export class Room extends DurableObject<Env> {
                 const kind = round.roundKind ?? 'tournament'
                 const baseLabel =
                     round.roundLabel ||
-                    buildRoundLabel(round.level, kind, priorHistory, open)
+                    buildRoundLabel(round.level, kind, priorHistory, open, state.settings.type === 'ultimateEdition' ? state.poolCharts : [])
                 const label = isLive ? `${baseLabel} (live)` : baseLabel
                 const song = round.levelTitle || round.level?.name
                 const title = song
