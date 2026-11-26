@@ -2092,12 +2092,12 @@ export default {
             const isHost = session?.user.handle === TOURNAMENT_HOST_HANDLE
 
             let availableEditions: string[]
-            try {
-                availableEditions = await getAvailableEditions()
-            } catch (error) {
-                console.error('[ROOMS] Could not load editions:', error)
-                availableEditions = [await getCurrentEdition()]
-            }
+try {
+    availableEditions = await getAvailableEditions()
+} catch (error) {
+    console.error('[ROOMS] Could not load editions:', error)
+    availableEditions = []
+}
 
             return json({
                 creates: session ? roomForms(isHost, availableEditions, getLiveEdition()) : [],
