@@ -2145,11 +2145,12 @@ export class Room extends DurableObject<Env> {
             scoreboardDescription: '',
             scoreboardSections: this.canSee(uid) ? this.sections() : [],
             results: Object.entries(state.results)
-                .filter(([id]) => this.canSee(uid) || id === uid)
-                .map(([userId, result]) => ({
-                    userId,
-                    result: sanitizeWireResult(result),
-                })),
+    .filter(([id]) => activeMembers.some((member) => member.id === id))
+    .filter(([id]) => this.canSee(uid) || id === uid)
+    .map(([userId, result]) => ({
+        userId,
+        result: sanitizeWireResult(result),
+    })),
             users: activeMembers.map((member) => member.roomUser),
             userStatuses: activeMembers.map((member) => ({
                 userId: member.id,
@@ -2279,11 +2280,12 @@ export class Room extends DurableObject<Env> {
                     : label
 
                 const scores = Object.entries(round.results)
-                    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
-                    .map(([userId, result]) => ({
-                        userId,
-                        value: fmtDetail(result, mode, round),
-                    }))
+    .filter(([userId]) => present.has(userId))
+    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
+    .map(([userId, result]) => ({
+        userId,
+        value: fmtDetail(result, mode, round),
+    }))
 
                 output.push({ title, scores })
             }
