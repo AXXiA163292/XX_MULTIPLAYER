@@ -15,6 +15,7 @@ import {
     normalizeRoundMode,
     parseSettings,
     roomFormsForType,
+    resolvePreselectedEdition,
     serializeSettings,
     type RoomSettings,
 } from './forms.ts'
@@ -929,11 +930,30 @@ export class Room extends DurableObject<Env> {
             settings.title = defaultCustomRoomTitle(host.name)
         }
 
+                const editionOptions = await getAvailableEditions().catch((error) => {
+            console.error('[ROOM CONFIG] Could not load edition options:', error)
+            return []
+        })
+
+        this.st.editionOptions = editionOptions
+
         if (!isOpenType(settings.type)) {
-            settings.edition = (settings.edition || getLiveEdition()).trim().toUpperCase()
+            const requestedEdition = (
+                settings.edition || getLiveEdition()
+            ).trim().toUpperCase()
+
+            settings.edition = resolvePreselectedEdition(
+                editionOptions,
+                requestedEdition,
+            )
+
             settings.group = (settings.group ?? '').trim()
 
-            // Ultimate editions cannot have a group phase selected; refuse to open
+            if (!settings.edition) {
+                console.error('[ROOM CONFIG] No valid edition available in Sheets.')
+                return false
+            }
+
             if (isUltimateEdition(settings.edition) && settings.group.length > 0) {
                 console.error('[ROOM CONFIG] Ultimate edition cannot have a group phase:', {
                     edition: settings.edition,
@@ -942,14 +962,7 @@ export class Room extends DurableObject<Env> {
                 return false
             }
         }
-
-        const editionOptions = await getAvailableEditions().catch((error) => {
-            console.error('[ROOM CONFIG] Could not load edition options:', error)
-            return [settings.edition || getLiveEdition()]
-        })
-
-        this.st.editionOptions = editionOptions
-
+        
         let editionData: EditionData | null = null
         let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
         let hadSavedUltimatePicks = false
