@@ -107,6 +107,7 @@ type RoomState = {
     statuses: Record<string, UserStatus>
     round: { state: string; seed: number; kind: RoundKind; label: string } | null
     results: Record<string, GameplayResult>
+    resultsByRound: Record<number, Record<string, GameplayResult>>
     history: RoundRecord[]
 }
 
@@ -147,6 +148,7 @@ const fresh = (): RoomState => ({
     statuses: {},
     round: null,
     results: {},
+    resultsByRound: {},
     history: [],
 })
 
@@ -645,6 +647,9 @@ export class Room extends DurableObject<Env> {
                         ),
                     )
                     : {},
+                resultsByRound: saved?.resultsByRound && typeof saved.resultsByRound === 'object'
+                    ? saved.resultsByRound
+                    : {},
                 history: Array.isArray(saved?.history) ? saved.history : [],
                 round: saved?.round &&
                     typeof saved.round.state === 'string' &&
@@ -930,7 +935,7 @@ export class Room extends DurableObject<Env> {
             settings.title = defaultCustomRoomTitle(host.name)
         }
 
-                const editionOptions = await getAvailableEditions().catch((error) => {
+        const editionOptions = await getAvailableEditions().catch((error) => {
             console.error('[ROOM CONFIG] Could not load edition options:', error)
             return []
         })
@@ -962,7 +967,7 @@ export class Room extends DurableObject<Env> {
                 return false
             }
         }
-        
+
         let editionData: EditionData | null = null
         let ultimateData: Awaited<ReturnType<typeof getUltimateEditionData>> | null = null
         let hadSavedUltimatePicks = false
@@ -1051,6 +1056,7 @@ export class Room extends DurableObject<Env> {
         this.st.levelOptions = []
         this.st.round = null
         this.st.results = {}
+        this.st.resultsByRound = {}
         this.st.history = []
 
         await this.save()
@@ -1448,6 +1454,7 @@ export class Room extends DurableObject<Env> {
 
                 state.history = []
                 state.results = {}
+                state.resultsByRound = {}
                 this.pushScoreboard()
                 return
             }
@@ -1876,6 +1883,10 @@ export class Room extends DurableObject<Env> {
             let completedRound: RoundRecord | null = null
 
             if (Object.keys(state.results).length > 0) {
+                const roundIdx = state.history.length
+                state.resultsByRound[roundIdx] = Object.fromEntries(
+                    Object.entries(state.results).map(([k, v]) => [k, sanitizeWireResult(v)]),
+                )
                 completedRound = this.makeRoundRecord(state.history)
                 state.history.push(completedRound)
             }
@@ -2158,12 +2169,12 @@ export class Room extends DurableObject<Env> {
             scoreboardDescription: '',
             scoreboardSections: this.canSee(uid) ? this.sections() : [],
             results: Object.entries(state.results)
-    .filter(([id]) => activeMembers.some((member) => member.id === id))
-    .filter(([id]) => this.canSee(uid) || id === uid)
-    .map(([userId, result]) => ({
-        userId,
-        result: sanitizeWireResult(result),
-    })),
+                .filter(([id]) => activeMembers.some((member) => member.id === id))
+                .filter(([id]) => this.canSee(uid) || id === uid)
+                .map(([userId, result]) => ({
+                    userId,
+                    result: sanitizeWireResult(result),
+                })),
             users: activeMembers.map((member) => member.roomUser),
             userStatuses: activeMembers.map((member) => ({
                 userId: member.id,
@@ -2293,12 +2304,12 @@ export class Room extends DurableObject<Env> {
                     : label
 
                 const scores = Object.entries(round.results)
-    .filter(([userId]) => present.has(userId))
-    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
-    .map(([userId, result]) => ({
-        userId,
-        value: fmtDetail(result, mode, round),
-    }))
+                    .filter(([userId]) => present.has(userId))
+                    .sort(([, a], [, b]) => compareResults(a, b, mode, round))
+                    .map(([userId, result]) => ({
+                        userId,
+                        value: fmtDetail(result, mode, round),
+                    }))
 
                 output.push({ title, scores })
             }
