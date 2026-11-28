@@ -1,3 +1,4 @@
+
 import type { EditionData, SheetChart } from './sheets.ts'
 
 export const GROUP_ORDER = [
@@ -92,8 +93,9 @@ export const DEFAULT_OPEN_SCORING: ScoringMode = 'rankedMatch'
 export const SERVER_TITLE = 'XX!'
 export const SERVER_DESCRIPTION = "https://discord.gg/xxsrG9G6f\n\nAXX!A's server!"
 
-/** Empty/unjoined rooms expire after 3 minutes; active rooms stay open up to 4 hours. */
+/** Empty tournament rooms expire after 30 minutes. Other empty rooms expire after 3 minutes. */
 export const EMPTY_ROOM_TTL_MS = 3 * 60 * 1000
+export const TOURNAMENT_EMPTY_ROOM_TTL_MS = 30 * 60 * 1000
 export const RESERVED_ROOM_TTL_MS = 3 * 60 * 1000
 export const MAX_ROOM_LIFESPAN_MS = 4 * 60 * 60 * 1000
 
